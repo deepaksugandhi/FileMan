@@ -13,14 +13,24 @@ pub struct FileManApp {
     last_size: egui::Vec2,
 }
 
+/// Ensures the given panes vector has exactly two entries, padding with fresh
+/// panes rooted at C:\ if there are fewer than two, truncating if there are
+/// more (shouldn't happen given the session schema, but be safe), and
+/// clamping `active_pane` into the resulting valid range.
+fn ensure_two_panes(mut panes: Vec<Pane>, active_pane: usize) -> (Vec<Pane>, usize) {
+    while panes.len() < 2 {
+        panes.push(Pane::new(PathBuf::from("C:\\")));
+    }
+    panes.truncate(2);
+    let active_pane = active_pane.min(panes.len().saturating_sub(1));
+    (panes, active_pane)
+}
+
 impl FileManApp {
     pub fn new(conn: Connection, loaded: Option<session::LoadedSession>) -> Self {
         let (panes, active_pane) = match loaded {
-            Some(s) if !s.panes.is_empty() => (s.panes, s.active_pane),
-            _ => (
-                vec![Pane::new(PathBuf::from("C:\\")), Pane::new(PathBuf::from("C:\\"))],
-                0,
-            ),
+            Some(s) if !s.panes.is_empty() => ensure_two_panes(s.panes, s.active_pane),
+            _ => ensure_two_panes(Vec::new(), 0),
         };
         FileManApp {
             conn,
@@ -152,5 +162,63 @@ impl eframe::App for FileManApp {
             self.persist();
             self.dirty = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_two_panes_pads_a_single_pane_up_to_two() {
+        let panes = vec![Pane::new(PathBuf::from("D:\\one"))];
+        let (panes, active_pane) = ensure_two_panes(panes, 0);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].tabs[0].path, PathBuf::from("D:\\one"));
+        assert_eq!(panes[1].tabs[0].path, PathBuf::from("C:\\"));
+        assert_eq!(active_pane, 0);
+    }
+
+    #[test]
+    fn ensure_two_panes_creates_two_fresh_panes_from_empty() {
+        let (panes, active_pane) = ensure_two_panes(Vec::new(), 0);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].tabs[0].path, PathBuf::from("C:\\"));
+        assert_eq!(panes[1].tabs[0].path, PathBuf::from("C:\\"));
+        assert_eq!(active_pane, 0);
+    }
+
+    #[test]
+    fn ensure_two_panes_leaves_a_valid_two_pane_vector_unchanged() {
+        let panes = vec![
+            Pane::new(PathBuf::from("D:\\left")),
+            Pane::new(PathBuf::from("E:\\right")),
+        ];
+        let (panes, active_pane) = ensure_two_panes(panes, 1);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].tabs[0].path, PathBuf::from("D:\\left"));
+        assert_eq!(panes[1].tabs[0].path, PathBuf::from("E:\\right"));
+        assert_eq!(active_pane, 1);
+    }
+
+    #[test]
+    fn ensure_two_panes_truncates_more_than_two_panes() {
+        let panes = vec![
+            Pane::new(PathBuf::from("D:\\one")),
+            Pane::new(PathBuf::from("E:\\two")),
+            Pane::new(PathBuf::from("F:\\three")),
+        ];
+        let (panes, _) = ensure_two_panes(panes, 0);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].tabs[0].path, PathBuf::from("D:\\one"));
+        assert_eq!(panes[1].tabs[0].path, PathBuf::from("E:\\two"));
+    }
+
+    #[test]
+    fn ensure_two_panes_clamps_out_of_range_active_pane() {
+        let panes = vec![Pane::new(PathBuf::from("C:\\"))];
+        let (panes, active_pane) = ensure_two_panes(panes, 99);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(active_pane, 1);
     }
 }
