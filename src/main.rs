@@ -3,6 +3,7 @@ use eframe::egui;
 mod fs_entry;
 mod pane;
 mod tab;
+mod tree;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
