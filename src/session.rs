@@ -23,17 +23,19 @@ pub fn save_session(
     panes: &[Pane],
     active_pane: usize,
 ) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+
+    tx.execute(
         "INSERT INTO window_state (id, width, height, pos_x, pos_y, monitor_name)
          VALUES (1, ?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(id) DO UPDATE SET width=?1, height=?2, pos_x=?3, pos_y=?4, monitor_name=?5",
         params![window.width, window.height, window.pos_x, window.pos_y, window.monitor_name],
     )?;
 
-    conn.execute("DELETE FROM panes", [])?;
+    tx.execute("DELETE FROM panes", [])?;
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO panes (pane_index, tab_index, path, is_active_tab)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -46,12 +48,13 @@ pub fn save_session(
         }
     }
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO app_state (id, active_pane) VALUES (1, ?1)
          ON CONFLICT(id) DO UPDATE SET active_pane=?1",
         params![active_pane as i64],
     )?;
 
+    tx.commit()?;
     Ok(())
 }
 
@@ -108,6 +111,7 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
             row.get::<_, i64>(0)
         })
         .unwrap_or(0) as usize;
+    let active_pane = active_pane.min(panes.len().saturating_sub(1));
 
     Ok(Some(LoadedSession {
         window,
@@ -156,5 +160,25 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         assert!(load_session(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_session_clamps_out_of_range_active_pane() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Save with only 1 pane, but manually corrupt active_pane to be out of range.
+        let pane0 = Pane::new(PathBuf::from("C:\\"));
+        save_session(
+            &conn,
+            &WindowGeometry { width: 800.0, height: 600.0, pos_x: None, pos_y: None, monitor_name: None },
+            &[pane0],
+            0,
+        )
+        .unwrap();
+        conn.execute("UPDATE app_state SET active_pane = 5 WHERE id = 1", []).unwrap();
+
+        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        assert_eq!(loaded.active_pane, 0); // clamped to the only valid index
     }
 }
