@@ -1,6 +1,7 @@
 use eframe::egui;
 
 mod fs_entry;
+mod tab;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
