@@ -3,6 +3,7 @@ use eframe::egui;
 mod db;
 mod fs_entry;
 mod pane;
+mod session;
 mod tab;
 mod tree;
 
