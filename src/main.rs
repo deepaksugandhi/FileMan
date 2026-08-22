@@ -1,5 +1,6 @@
 use eframe::egui;
 
+mod db;
 mod fs_entry;
 mod pane;
 mod tab;
