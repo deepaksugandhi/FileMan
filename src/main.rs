@@ -1,6 +1,7 @@
 use eframe::egui;
 
 mod fs_entry;
+mod pane;
 mod tab;
 
 fn main() -> eframe::Result<()> {
