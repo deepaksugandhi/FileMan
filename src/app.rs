@@ -1,3 +1,4 @@
+use crate::fs_ops::{self, ClipboardOp};
 use crate::pane::Pane;
 use crate::session::{self, WindowGeometry};
 use crate::tree;
@@ -5,12 +6,24 @@ use eframe::egui;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
+/// Modal dialog state (only one open at a time).
+#[derive(Debug, Clone)]
+enum Dialog {
+    Rename { path: PathBuf, name: String },
+    NewFolder { name: String },
+    NewFile { name: String },
+}
+
 pub struct FileManApp {
     conn: Connection,
     panes: Vec<Pane>,
     active_pane: usize,
     dirty: bool,
     last_size: egui::Vec2,
+    clipboard: Vec<PathBuf>,
+    clipboard_op: Option<ClipboardOp>,
+    dialog: Option<Dialog>,
+    status: String,
 }
 
 /// Ensures the given panes vector has exactly two entries, padding with fresh
@@ -38,6 +51,10 @@ impl FileManApp {
             active_pane,
             dirty: false,
             last_size: egui::vec2(1200.0, 800.0),
+            clipboard: Vec::new(),
+            clipboard_op: None,
+            dialog: None,
+            status: String::new(),
         }
     }
 
@@ -54,6 +71,126 @@ impl FileManApp {
             monitor_name: None,
         };
         let _ = session::save_session(&self.conn, &window, &self.panes, self.active_pane);
+    }
+
+    fn active_tab_dir(&self) -> PathBuf {
+        self.panes[self.active_pane].active_tab().path.clone()
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let tab = self.panes[self.active_pane].active_tab();
+        tab.selected
+            .iter()
+            .map(|name| tab.path.join(name))
+            .collect()
+    }
+
+    fn copy_selection(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "Nothing selected".into();
+            return;
+        }
+        self.clipboard = paths;
+        self.clipboard_op = Some(ClipboardOp::Copy);
+        self.status = format!("Copied {} item(s)", self.clipboard.len());
+    }
+
+    fn cut_selection(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "Nothing selected".into();
+            return;
+        }
+        self.clipboard = paths;
+        self.clipboard_op = Some(ClipboardOp::Cut);
+        self.status = format!("Cut {} item(s)", self.clipboard.len());
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            self.status = "Clipboard is empty".into();
+            return;
+        }
+        let dest = self.active_tab_dir();
+        let mut errors = Vec::new();
+        for src in &self.clipboard {
+            // Cutting into the same folder the items already live in: no-op.
+            if self.clipboard_op == Some(ClipboardOp::Cut) && src.parent() == Some(dest.as_path()) {
+                continue;
+            }
+            let result = match self.clipboard_op {
+                Some(ClipboardOp::Copy) => fs_ops::copy_item(src, &dest).map(|_| ()),
+                _ => fs_ops::move_item(src, &dest),
+            };
+            if let Err(err) = result {
+                errors.push(format!("{}: {err}", src.display()));
+            }
+        }
+        if self.clipboard_op == Some(ClipboardOp::Cut) {
+            self.clipboard.clear();
+            self.panes[self.active_pane]
+                .active_tab_mut()
+                .clear_selection();
+        }
+        self.status = if errors.is_empty() {
+            format!("Pasted into {}", dest.display())
+        } else {
+            errors.join("\n")
+        };
+    }
+
+    fn delete_selection(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "Nothing selected".into();
+            return;
+        }
+        match fs_ops::delete_to_trash(&paths) {
+            Ok(()) => {
+                self.status = format!("Sent {} item(s) to Recycle Bin", paths.len());
+                self.panes[self.active_pane]
+                    .active_tab_mut()
+                    .clear_selection();
+            }
+            Err(err) => self.status = format!("Delete failed: {err}"),
+        }
+    }
+
+    fn begin_rename(&mut self) {
+        let tab = self.panes[self.active_pane].active_tab();
+        if tab.selected.len() != 1 {
+            self.status = "Select exactly one item to rename".into();
+            return;
+        }
+        let name = tab.selected.iter().next().unwrap().clone();
+        self.dialog = Some(Dialog::Rename {
+            path: tab.path.join(&name),
+            name,
+        });
+    }
+
+    /// Runs the pending dialog's filesystem action and closes it.
+    fn commit_dialog(&mut self) {
+        let Some(dialog) = self.dialog.take() else {
+            return;
+        };
+        let parent = self.active_tab_dir();
+        let result = match &dialog {
+            Dialog::Rename { path, name } => fs_ops::rename_item(path, name)
+                .map(|_| format!("Renamed to {name}"))
+                .map_err(|err| format!("Rename failed: {err}")),
+            Dialog::NewFolder { name } => fs_ops::create_folder(&parent, name)
+                .map(|_| format!("Created folder {name}"))
+                .map_err(|err| format!("Create folder failed: {err}")),
+            Dialog::NewFile { name } => fs_ops::create_file(&parent, name)
+                .map(|_| format!("Created file {name}"))
+                .map_err(|err| format!("Create file failed: {err}")),
+        };
+        self.status = match result {
+            Ok(msg) => msg,
+            Err(msg) => msg,
+        };
     }
 }
 
@@ -93,6 +230,66 @@ impl eframe::App for FileManApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    self.copy_selection();
+                }
+                if ui.button("Cut").clicked() {
+                    self.cut_selection();
+                }
+                if ui.button("Paste").clicked() {
+                    self.paste_clipboard();
+                }
+                if ui.button("Delete").clicked() {
+                    self.delete_selection();
+                }
+                if ui.button("Rename").clicked() {
+                    self.begin_rename();
+                }
+                if ui.button("New Folder").clicked() {
+                    self.dialog = Some(Dialog::NewFolder {
+                        name: String::new(),
+                    });
+                }
+                if ui.button("New File").clicked() {
+                    self.dialog = Some(Dialog::NewFile {
+                        name: String::new(),
+                    });
+                }
+            });
+            if !self.status.is_empty() {
+                ui.label(&self.status);
+            }
+
+            // Modal dialogs (rename / new folder / new file).
+            let mut commit = false;
+            let mut cancel = false;
+            if let Some(dialog) = &mut self.dialog {
+                let (title, name) = match dialog {
+                    Dialog::Rename { name, .. } => ("Rename", name),
+                    Dialog::NewFolder { name } => ("New Folder", name),
+                    Dialog::NewFile { name } => ("New File", name),
+                };
+                egui::Window::new(title).show(&ctx, |ui| {
+                    let edit = ui.text_edit_singleline(name);
+                    edit.request_focus();
+                    commit = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            commit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            }
+            if cancel {
+                self.dialog = None;
+            } else if commit {
+                self.commit_dialog();
+            }
+
             ui.columns(2, |columns| {
                 for pane_idx in 0..2 {
                     let is_active = pane_idx == self.active_pane;
@@ -147,7 +344,8 @@ impl eframe::App for FileManApp {
                             if ui.button("Back").clicked() && pane.active_tab_mut().go_back() {
                                 self.dirty = true;
                             }
-                            if ui.button("Forward").clicked() && pane.active_tab_mut().go_forward() {
+                            if ui.button("Forward").clicked() && pane.active_tab_mut().go_forward()
+                            {
                                 self.dirty = true;
                             }
                             if ui.button("Up").clicked() {
@@ -161,16 +359,39 @@ impl eframe::App for FileManApp {
                         match crate::fs_entry::list_dir(&current_path) {
                             Ok(entries) => {
                                 egui::ScrollArea::vertical().show(ui, |ui| {
+                                    let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                    let mut select_name: Option<String> = None;
+                                    let mut nav_target: Option<PathBuf> = None;
                                     for entry in entries {
+                                        let is_selected =
+                                            pane.active_tab().selected.contains(&entry.name);
                                         let label = if entry.is_dir {
-                                            format!("[dir] {}", entry.name)
+                                            format!("{} {}", entry.name, "[dir]")
                                         } else {
                                             format!("{} ({} bytes)", entry.name, entry.size)
                                         };
-                                        if ui.button(label).clicked() && entry.is_dir {
-                                            pane.active_tab_mut().navigate_to(entry.path.clone());
-                                            self.dirty = true;
+                                        let resp = ui.selectable_label(is_selected, label);
+                                        if resp.clicked() && ctrl {
+                                            select_name = Some(entry.name.clone());
                                         }
+                                        if resp.double_clicked() && entry.is_dir {
+                                            nav_target = Some(entry.path.clone());
+                                        } else if resp.clicked() {
+                                            select_name = Some(entry.name.clone());
+                                        }
+                                    }
+                                    if let Some(name) = select_name {
+                                        if ctrl {
+                                            pane.active_tab_mut().toggle_select(&name);
+                                        } else {
+                                            pane.active_tab_mut().select_only(&name);
+                                        }
+                                        self.active_pane = pane_idx;
+                                    }
+                                    if let Some(target) = nav_target {
+                                        pane.active_tab_mut().navigate_to(target);
+                                        self.active_pane = pane_idx;
+                                        self.dirty = true;
                                     }
                                 });
                             }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +16,8 @@ pub struct Tab {
     pub sort_col: String,
     pub sort_asc: bool,
     pub view_mode: ViewMode,
+    /// Names (not full paths) of selected entries in the current directory.
+    pub selected: HashSet<String>,
 }
 
 impl Tab {
@@ -26,6 +29,7 @@ impl Tab {
             sort_col: "name".to_string(),
             sort_asc: true,
             view_mode: ViewMode::Details,
+            selected: HashSet::new(),
         }
     }
 
@@ -33,12 +37,14 @@ impl Tab {
         self.history_back.push(self.path.clone());
         self.history_forward.clear();
         self.path = new_path;
+        self.clear_selection();
     }
 
     pub fn go_back(&mut self) -> bool {
         if let Some(prev) = self.history_back.pop() {
             self.history_forward.push(self.path.clone());
             self.path = prev;
+            self.clear_selection();
             true
         } else {
             false
@@ -49,10 +55,26 @@ impl Tab {
         if let Some(next) = self.history_forward.pop() {
             self.history_back.push(self.path.clone());
             self.path = next;
+            self.clear_selection();
             true
         } else {
             false
         }
+    }
+
+    pub fn toggle_select(&mut self, name: &str) {
+        if !self.selected.insert(name.to_string()) {
+            self.selected.remove(name);
+        }
+    }
+
+    pub fn select_only(&mut self, name: &str) {
+        self.selected.clear();
+        self.selected.insert(name.to_string());
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
     }
 }
 
@@ -98,5 +120,40 @@ mod tests {
         tab.go_back();
         tab.navigate_to(PathBuf::from("C:\\a\\c"));
         assert!(!tab.go_forward());
+    }
+
+    #[test]
+    fn toggle_select_adds_then_removes() {
+        let mut tab = Tab::new(PathBuf::from("C:\\a"));
+        tab.toggle_select("x.txt");
+        assert!(tab.selected.contains("x.txt"));
+        tab.toggle_select("y.txt");
+        assert_eq!(tab.selected.len(), 2);
+        tab.toggle_select("x.txt");
+        assert!(tab.selected.contains("y.txt"));
+        assert!(!tab.selected.contains("x.txt"));
+    }
+
+    #[test]
+    fn select_only_replaces_selection() {
+        let mut tab = Tab::new(PathBuf::from("C:\\a"));
+        tab.select_only("a.txt");
+        tab.select_only("b.txt");
+        assert_eq!(
+            tab.selected,
+            ["b.txt"].into_iter().map(String::from).collect()
+        );
+    }
+
+    #[test]
+    fn navigation_clears_selection() {
+        let mut tab = Tab::new(PathBuf::from("C:\\a"));
+        tab.select_only("a.txt");
+        tab.navigate_to(PathBuf::from("C:\\a\\b"));
+        assert!(tab.selected.is_empty());
+
+        tab.select_only("c.txt");
+        tab.go_back();
+        assert!(tab.selected.is_empty());
     }
 }

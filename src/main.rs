@@ -1,6 +1,7 @@
 mod app;
 mod db;
 mod fs_entry;
+mod fs_ops;
 mod pane;
 mod session;
 mod tab;
