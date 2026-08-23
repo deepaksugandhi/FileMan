@@ -1,7 +1,26 @@
 use crate::pane::Pane;
 use crate::tab::Tab;
 use rusqlite::{params, Connection, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Returns `path` unchanged if it exists, otherwise walks up the ancestor
+/// chain until it finds one that does, falling back to the drive root (or
+/// whatever the topmost ancestor is) if nothing along the way exists either.
+///
+/// Used when restoring a saved session: a saved path may point at a deleted
+/// folder or an unmounted drive, per FileMan_SPEC.md §4.
+pub fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => return current.to_path_buf(), // reached the root; return it even if it doesn't exist (nothing else to fall back to)
+        }
+    }
+}
 
 pub struct WindowGeometry {
     pub width: f32,
@@ -95,7 +114,8 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
             tabs: Vec::new(),
             active_tab: 0,
         });
-        pane.tabs.push(Tab::new(PathBuf::from(path)));
+        let resolved_path = nearest_existing_ancestor(&PathBuf::from(path));
+        pane.tabs.push(Tab::new(resolved_path));
         if is_active {
             pane.active_tab = pane.tabs.len() - 1;
         }
@@ -160,6 +180,45 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         assert!(load_session(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_returns_path_unchanged_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = nearest_existing_ancestor(dir.path());
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_falls_back_to_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing_subfolder");
+        let resolved = nearest_existing_ancestor(&missing);
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_falls_back_several_levels_to_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("a").join("b").join("c");
+        let resolved = nearest_existing_ancestor(&missing);
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_terminates_on_a_fully_nonexistent_path() {
+        // Don't assume any particular real drive letter is absent (drive
+        // presence varies by machine). Instead exercise the "no parent"
+        // termination case directly with a relative, synthetic path that
+        // certainly doesn't exist as given: a relative path's ancestor chain
+        // bottoms out at "" (whose parent is itself), so this proves the
+        // loop terminates via the `parent != current` guard rather than
+        // hanging, matching how a nonexistent drive root would behave.
+        let path = PathBuf::from("definitely_missing_xyz/also_missing/leaf");
+        let resolved = nearest_existing_ancestor(&path);
+        // Must terminate and return *something* rather than looping forever.
+        // It should be an ancestor of (or equal to) the original path.
+        assert!(path.starts_with(&resolved) || resolved == path);
     }
 
     #[test]

@@ -104,6 +104,8 @@ impl eframe::App for FileManApp {
 
                         let pane = &mut self.panes[pane_idx];
                         let mut tab_clicked = None;
+                        let mut tab_closed = None;
+                        let mut tab_opened = false;
                         ui.horizontal(|ui| {
                             for (tab_idx, tab) in pane.tabs.iter().enumerate() {
                                 let label = tab
@@ -117,21 +119,44 @@ impl eframe::App for FileManApp {
                                 {
                                     tab_clicked = Some(tab_idx);
                                 }
+                                if ui.small_button("x").clicked() {
+                                    tab_closed = Some(tab_idx);
+                                }
+                            }
+                            if ui.button("+").clicked() {
+                                tab_opened = true;
                             }
                         });
                         if let Some(idx) = tab_clicked {
                             pane.active_tab = idx;
                         }
+                        if let Some(idx) = tab_closed {
+                            pane.close_tab(idx);
+                            self.dirty = true;
+                        }
+                        if tab_opened {
+                            let current_path = pane.active_tab().path.clone();
+                            pane.open_tab(current_path);
+                            self.dirty = true;
+                        }
 
                         let current_path = pane.active_tab().path.clone();
                         ui.label(current_path.display().to_string());
 
-                        if ui.button("Up").clicked() {
-                            if let Some(parent) = current_path.parent() {
-                                pane.active_tab_mut().navigate_to(parent.to_path_buf());
+                        ui.horizontal(|ui| {
+                            if ui.button("Back").clicked() && pane.active_tab_mut().go_back() {
                                 self.dirty = true;
                             }
-                        }
+                            if ui.button("Forward").clicked() && pane.active_tab_mut().go_forward() {
+                                self.dirty = true;
+                            }
+                            if ui.button("Up").clicked() {
+                                if let Some(parent) = current_path.parent() {
+                                    pane.active_tab_mut().navigate_to(parent.to_path_buf());
+                                    self.dirty = true;
+                                }
+                            }
+                        });
 
                         match crate::fs_entry::list_dir(&current_path) {
                             Ok(entries) => {
