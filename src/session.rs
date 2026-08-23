@@ -36,6 +36,27 @@ pub struct LoadedSession {
     pub active_pane: usize,
 }
 
+/// Serializes column widths as space-separated floats for DB storage.
+fn format_col_widths(widths: &[f32; 4]) -> String {
+    widths
+        .iter()
+        .map(|w| format!("{w:.1}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parses the stored column-widths string, falling back to defaults on any
+/// malformed or missing data.
+fn parse_col_widths(raw: &str) -> [f32; 4] {
+    let mut out = crate::tab::DEFAULT_COL_WIDTHS;
+    for (slot, part) in out.iter_mut().zip(raw.split_whitespace()) {
+        if let Ok(w) = part.parse::<f32>() {
+            *slot = w.clamp(20.0, 4000.0);
+        }
+    }
+    out
+}
+
 pub fn save_session(
     conn: &Connection,
     window: &WindowGeometry,
@@ -61,15 +82,16 @@ pub fn save_session(
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab, sort_col, sort_asc)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     pane_idx as i64,
                     tab_idx as i64,
                     tab.path.to_string_lossy(),
                     (tab_idx == pane.active_tab) as i64,
                     tab.sort_col,
-                    tab.sort_asc as i64
+                    tab.sort_asc as i64,
+                    format_col_widths(&tab.col_widths),
                 ],
             )?;
         }
@@ -103,10 +125,10 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         .ok();
 
     let mut stmt = conn.prepare(
-        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc
+        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths
          FROM panes ORDER BY pane_index, tab_index",
     )?;
-    let rows: Vec<(i64, String, bool, String, bool)> = stmt
+    let rows: Vec<(i64, String, bool, String, bool, String)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -114,6 +136,7 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
                 row.get::<_, i64>(2)? == 1,
                 row.get(3)?,
                 row.get::<_, i64>(4)? == 1,
+                row.get(5)?,
             ))
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -122,10 +145,15 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         return Ok(None);
     }
 
-    let pane_count = rows.iter().map(|(idx, _, _, _, _)| *idx).max().unwrap() as usize + 1;
+    let pane_count = rows
+        .iter()
+        .map(|(idx, ..)| *idx)
+        .max()
+        .unwrap() as usize
+        + 1;
     let mut panes: Vec<Option<Pane>> = (0..pane_count).map(|_| None).collect();
 
-    for (pane_idx, path, is_active, sort_col, sort_asc) in rows {
+    for (pane_idx, path, is_active, sort_col, sort_asc, col_widths) in rows {
         let pane_idx = pane_idx as usize;
         let pane = panes[pane_idx].get_or_insert_with(|| Pane {
             tabs: Vec::new(),
@@ -135,6 +163,7 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         let mut tab = Tab::new(resolved_path);
         tab.sort_col = sort_col;
         tab.sort_asc = sort_asc;
+        tab.col_widths = parse_col_widths(&col_widths);
         pane.tabs.push(tab);
         if is_active {
             pane.active_tab = pane.tabs.len() - 1;
@@ -230,6 +259,45 @@ mod tests {
         let loaded = load_session(&conn).unwrap().expect("session should exist");
         assert_eq!(loaded.panes[0].tabs[0].sort_col, "size");
         assert!(!loaded.panes[0].tabs[0].sort_asc);
+    }
+
+    #[test]
+    fn round_trips_column_widths() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut pane0 = Pane::new(PathBuf::from("C:\\Users"));
+        pane0.tabs[0].col_widths = [300.5, 120.0, 80.0, 45.0];
+
+        save_session(
+            &conn,
+            &WindowGeometry {
+                width: 1000.0,
+                height: 700.0,
+                pos_x: None,
+                pos_y: None,
+                monitor_name: None,
+            },
+            &[pane0],
+            0,
+        )
+        .unwrap();
+
+        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        assert_eq!(loaded.panes[0].tabs[0].col_widths, [300.5, 120.0, 80.0, 45.0]);
+    }
+
+    #[test]
+    fn parse_col_widths_falls_back_to_defaults_on_garbage() {
+        assert_eq!(
+            super::parse_col_widths("not numbers at all"),
+            crate::tab::DEFAULT_COL_WIDTHS
+        );
+        // Partial garbage keeps the valid prefix and defaults the rest.
+        let parsed = super::parse_col_widths("100 oops 50");
+        assert_eq!(parsed[0], 100.0);
+        assert_eq!(parsed[2], 50.0);
+        assert_eq!(parsed[3], crate::tab::DEFAULT_COL_WIDTHS[3]);
     }
 
     #[test]

@@ -411,23 +411,40 @@ impl eframe::App for FileManApp {
                                 };
                                 crate::fs_entry::sort_entries(&mut entries, &sort_col, sort_asc);
                                 let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                let col_w = pane.active_tab().col_widths;
 
                                 let mut select_name: Option<String> = None;
                                 let mut nav_target: Option<PathBuf> = None;
                                 let mut sort_clicked: Option<String> = None;
+                                let mut live_widths: Option<Vec<f32>> = None;
 
                                 egui_extras::TableBuilder::new(ui)
                                     .id_salt(format!("file_table_pane_{pane_idx}"))
                                     .striped(true)
                                     .column(
-                                        egui_extras::Column::auto()
+                                        egui_extras::Column::initial(col_w[0])
                                             .resizable(true)
                                             .clip(true)
-                                            .at_least(120.0),
+                                            .range(40.0..=2000.0),
                                     )
-                                    .column(egui_extras::Column::auto().resizable(true))
-                                    .column(egui_extras::Column::auto().resizable(true))
-                                    .column(egui_extras::Column::remainder())
+                                    .column(
+                                        egui_extras::Column::initial(col_w[1])
+                                            .resizable(true)
+                                            .clip(true)
+                                            .range(40.0..=2000.0),
+                                    )
+                                    .column(
+                                        egui_extras::Column::initial(col_w[2])
+                                            .resizable(true)
+                                            .clip(true)
+                                            .range(30.0..=2000.0),
+                                    )
+                                    .column(
+                                        egui_extras::Column::initial(col_w[3])
+                                            .resizable(true)
+                                            .clip(true)
+                                            .range(20.0..=500.0),
+                                    )
                                     .header(20.0, |mut header| {
                                         header.col(|ui| {
                                             sort_header(ui, "Name", "name", &sort_col, sort_asc, &mut sort_clicked);
@@ -442,7 +459,8 @@ impl eframe::App for FileManApp {
                                             sort_header(ui, "Archive", "archive", &sort_col, sort_asc, &mut sort_clicked);
                                         });
                                     })
-                                    .body(|mut body| {
+                                    .body(|body| {
+                                        live_widths = Some(body.widths().to_vec());
                                         body.rows(18.0, entries.len(), |mut row| {
                                             let entry = &entries[row.index()];
                                             let is_selected = pane
@@ -488,6 +506,22 @@ impl eframe::App for FileManApp {
                                         });
                                     });
 
+                                if let Some(widths) = live_widths {
+                                    let w: [f32; 4] = [
+                                        widths.first().copied().unwrap_or(col_w[0]),
+                                        widths.get(1).copied().unwrap_or(col_w[1]),
+                                        widths.get(2).copied().unwrap_or(col_w[2]),
+                                        widths.get(3).copied().unwrap_or(col_w[3]),
+                                    ];
+                                    if (w[0] - col_w[0]).abs() > 0.5
+                                        || (w[1] - col_w[1]).abs() > 0.5
+                                        || (w[2] - col_w[2]).abs() > 0.5
+                                        || (w[3] - col_w[3]).abs() > 0.5
+                                    {
+                                        pane.active_tab_mut().col_widths = w;
+                                        self.dirty = true;
+                                    }
+                                }
                                 if let Some(col) = sort_clicked {
                                     let tab = pane.active_tab_mut();
                                     if tab.sort_col == col {

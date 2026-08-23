@@ -18,7 +18,11 @@ pub struct Tab {
     pub view_mode: ViewMode,
     /// Names (not full paths) of selected entries in the current directory.
     pub selected: HashSet<String>,
+    /// Resizable file-table column widths (name, modified, size, archive).
+    pub col_widths: [f32; 4],
 }
+
+pub const DEFAULT_COL_WIDTHS: [f32; 4] = [220.0, 140.0, 90.0, 60.0];
 
 impl Tab {
     pub fn new(path: PathBuf) -> Self {
@@ -30,6 +34,7 @@ impl Tab {
             sort_asc: true,
             view_mode: ViewMode::Details,
             selected: HashSet::new(),
+            col_widths: DEFAULT_COL_WIDTHS,
         }
     }
 

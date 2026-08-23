@@ -18,6 +18,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             is_active_tab INTEGER NOT NULL DEFAULT 0,
             sort_col TEXT NOT NULL DEFAULT 'name',
             sort_asc INTEGER NOT NULL DEFAULT 1,
+            col_widths TEXT NOT NULL DEFAULT '220 140 90 60',
             PRIMARY KEY (pane_index, tab_index)
         );
         CREATE TABLE IF NOT EXISTS app_state (
@@ -34,6 +35,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE panes ADD COLUMN sort_asc INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE panes ADD COLUMN col_widths TEXT NOT NULL DEFAULT '220 140 90 60'",
         [],
     );
     Ok(())
