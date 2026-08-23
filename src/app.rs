@@ -24,6 +24,24 @@ pub struct FileManApp {
     clipboard_op: Option<ClipboardOp>,
     dialog: Option<Dialog>,
     status: String,
+    theme_pref: egui::ThemePreference,
+    show_settings: bool,
+}
+
+fn parse_theme_pref(raw: &str) -> egui::ThemePreference {
+    match raw {
+        "dark" => egui::ThemePreference::Dark,
+        "light" => egui::ThemePreference::Light,
+        _ => egui::ThemePreference::System,
+    }
+}
+
+fn theme_pref_str(pref: egui::ThemePreference) -> &'static str {
+    match pref {
+        egui::ThemePreference::Dark => "dark",
+        egui::ThemePreference::Light => "light",
+        egui::ThemePreference::System => "system",
+    }
 }
 
 /// Ensures the given panes vector has exactly two entries, padding with fresh
@@ -45,6 +63,9 @@ impl FileManApp {
             Some(s) if !s.panes.is_empty() => ensure_two_panes(s.panes, s.active_pane),
             _ => ensure_two_panes(Vec::new(), 0),
         };
+        let theme_pref = crate::db::get_theme(&conn)
+            .map(|raw| parse_theme_pref(&raw))
+            .unwrap_or_default();
         FileManApp {
             conn,
             panes,
@@ -55,6 +76,8 @@ impl FileManApp {
             clipboard_op: None,
             dialog: None,
             status: String::new(),
+            theme_pref,
+            show_settings: false,
         }
     }
 
@@ -99,6 +122,9 @@ impl FileManApp {
             header = header.open(Some(true));
         }
         let response = header.show(ui, |ui| {
+            if is_active {
+                ui.colored_label(egui::Color32::from_rgb(80, 160, 255), "●");
+            }
             if let Ok(subdirs) = crate::fs_entry::list_subdirs(dir) {
                 for subdir in subdirs {
                     self.show_dir_node(ui, &subdir, active_path);
@@ -246,6 +272,13 @@ impl FileManApp {
 impl eframe::App for FileManApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ctx.set_theme(self.theme_pref);
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(theme, |style| {
+                style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+                style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            });
+        }
 
         let screen = ctx.input(|i| i.viewport_rect()).size();
         if (screen - self.last_size).length() > 1.0 {
@@ -278,35 +311,92 @@ impl eframe::App for FileManApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Copy").clicked() {
+                if ui
+                    .button("📋 Copy")
+                    .on_hover_text("Copy selection (Ctrl+C)")
+                    .clicked()
+                {
                     self.copy_selection();
                 }
-                if ui.button("Cut").clicked() {
+                if ui
+                    .button("Cut")
+                    .on_hover_text("Cut selection (Ctrl+X)")
+                    .clicked()
+                {
                     self.cut_selection();
                 }
-                if ui.button("Paste").clicked() {
+                if ui
+                    .button("Paste")
+                    .on_hover_text("Paste clipboard (Ctrl+V)")
+                    .clicked()
+                {
                     self.paste_clipboard();
                 }
-                if ui.button("Delete").clicked() {
+                ui.separator();
+                if ui
+                    .button("🗑 Delete")
+                    .on_hover_text("Send selection to Recycle Bin")
+                    .clicked()
+                {
                     self.delete_selection();
                 }
-                if ui.button("Rename").clicked() {
+                if ui
+                    .button("Rename")
+                    .on_hover_text("Rename the selected item")
+                    .clicked()
+                {
                     self.begin_rename();
                 }
-                if ui.button("New Folder").clicked() {
+                ui.separator();
+                if ui
+                    .button("🗀 New Folder")
+                    .on_hover_text("Create a new folder here")
+                    .clicked()
+                {
                     self.dialog = Some(Dialog::NewFolder {
                         name: String::new(),
                     });
                 }
-                if ui.button("New File").clicked() {
+                if ui
+                    .button("🗋 New File")
+                    .on_hover_text("Create a new file here")
+                    .clicked()
+                {
                     self.dialog = Some(Dialog::NewFile {
                         name: String::new(),
                     });
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("⚙ Settings")
+                        .on_hover_text("Preferences")
+                        .clicked()
+                    {
+                        self.show_settings = true;
+                    }
+                });
             });
             if !self.status.is_empty() {
-                ui.label(&self.status);
+                ui.label(egui::RichText::new(&self.status).weak());
             }
+
+            let mut settings_open = self.show_settings;
+            if settings_open {
+                egui::Window::new("Settings")
+                    .open(&mut settings_open)
+                    .resizable(false)
+                    .show(&ctx, |ui| {
+                        ui.label(egui::RichText::new("Theme").strong());
+                        let mut pref = self.theme_pref;
+                        pref.radio_buttons(ui);
+                        if pref != self.theme_pref {
+                            self.theme_pref = pref;
+                            let _ = crate::db::set_theme(&self.conn, theme_pref_str(pref));
+                        }
+                    });
+            }
+            self.show_settings = settings_open;
 
             // Modal dialogs (rename / new folder / new file).
             let mut commit = false;
@@ -388,14 +478,23 @@ impl eframe::App for FileManApp {
                         ui.label(current_path.display().to_string());
 
                         ui.horizontal(|ui| {
-                            if ui.button("Back").clicked() && pane.active_tab_mut().go_back() {
-                                self.dirty = true;
-                            }
-                            if ui.button("Forward").clicked() && pane.active_tab_mut().go_forward()
+                            if ui
+                                .button("⬅")
+                                .on_hover_text("Back")
+                                .clicked()
+                                && pane.active_tab_mut().go_back()
                             {
                                 self.dirty = true;
                             }
-                            if ui.button("Up").clicked() {
+                            if ui
+                                .button("➡")
+                                .on_hover_text("Forward")
+                                .clicked()
+                                && pane.active_tab_mut().go_forward()
+                            {
+                                self.dirty = true;
+                            }
+                            if ui.button("⬆").on_hover_text("Up").clicked() {
                                 if let Some(parent) = current_path.parent() {
                                     pane.active_tab_mut().navigate_to(parent.to_path_buf());
                                     self.dirty = true;
@@ -421,6 +520,7 @@ impl eframe::App for FileManApp {
                                 egui_extras::TableBuilder::new(ui)
                                     .id_salt(format!("file_table_pane_{pane_idx}"))
                                     .striped(true)
+                                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                                     .column(
                                         egui_extras::Column::initial(col_w[0])
                                             .resizable(true)

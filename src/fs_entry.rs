@@ -40,21 +40,28 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     Ok(entries)
 }
 
-/// Sorts entries in place. Directories always come before files; within
-/// each group the entries are ordered by the requested column.
+/// Sorts entries in place. Directories always come first, sorted
+/// alphabetically by name (case-insensitive) regardless of the requested
+/// sort column. Files follow the user's chosen sort column.
 /// Recognized columns: "name", "modified", "size", "archive".
 pub fn sort_entries(entries: &mut [FsEntry], sort_col: &str, asc: bool) {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
             .then_with(|| {
-                let ord = match sort_col {
-                    "modified" => a.modified.cmp(&b.modified),
-                    "size" => a.size.cmp(&b.size),
-                    "archive" => a.archive.cmp(&b.archive),
-                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                };
-                if asc { ord } else { ord.reverse() }
+                if a.is_dir {
+                    // Dirs always sorted alphabetically, always ascending.
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                } else {
+                    // Files sorted by the requested column.
+                    let ord = match sort_col {
+                        "modified" => a.modified.cmp(&b.modified),
+                        "size" => a.size.cmp(&b.size),
+                        "archive" => a.archive.cmp(&b.archive),
+                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    };
+                    if asc { ord } else { ord.reverse() }
+                }
             })
     });
 }
