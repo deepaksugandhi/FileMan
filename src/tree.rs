@@ -7,11 +7,7 @@ pub fn list_drives() -> Vec<PathBuf> {
     (b'A'..=b'Z')
         .filter_map(|letter| {
             let path = PathBuf::from(format!("{}:\\", letter as char));
-            if path.exists() {
-                Some(path)
-            } else {
-                None
-            }
+            if path.exists() { Some(path) } else { None }
         })
         .collect()
 }

@@ -4,6 +4,7 @@ use crate::session::{self, WindowGeometry};
 use crate::tree;
 use eframe::egui;
 use rusqlite::Connection;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Modal dialog state (only one open at a time).
@@ -12,6 +13,10 @@ enum Dialog {
     Rename { path: PathBuf, name: String },
     NewFolder { name: String },
     NewFile { name: String },
+    /// Shown when a copy/paste hits a name collision; user enters a new name.
+    DuplicateName { src: PathBuf, dest_dir: PathBuf, suggested: String },
+    /// Tab context menu: right-click on a tab to duplicate or close it.
+    TabContext { pane_idx: usize, tab_idx: usize },
 }
 
 pub struct FileManApp {
@@ -26,6 +31,8 @@ pub struct FileManApp {
     status: String,
     theme_pref: egui::ThemePreference,
     show_settings: bool,
+    /// Which tab is being hovered (pane_idx, tab_idx) for showing the close "×" button.
+    tab_hover: Option<(usize, usize)>,
 }
 
 fn parse_theme_pref(raw: &str) -> egui::ThemePreference {
@@ -78,6 +85,7 @@ impl FileManApp {
             status: String::new(),
             theme_pref,
             show_settings: false,
+            tab_hover: None,
         }
     }
 
@@ -111,15 +119,19 @@ impl FileManApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
         let is_active = dir == active_path;
+        let is_ancestor = active_path.starts_with(dir);
         let mut header = egui::CollapsingHeader::new(if is_active {
             egui::RichText::new(label).strong()
         } else {
             egui::RichText::new(label)
         })
         .id_salt(format!("tree_{}", dir.display()));
-        if active_path.starts_with(dir) {
+        if is_ancestor {
             // Auto-expand every ancestor of the active folder (and itself).
             header = header.open(Some(true));
+        } else if dir != active_path {
+            // Collapse nodes that aren't ancestors of the active path.
+            header = header.open(Some(false));
         }
         let response = header.show(ui, |ui| {
             if let Ok(subdirs) = crate::fs_entry::list_subdirs(dir) {
@@ -211,7 +223,6 @@ impl FileManApp {
         let dest = self.active_tab_dir();
         let mut errors = Vec::new();
         for src in &self.clipboard {
-            // Cutting into the same folder the items already live in: no-op.
             if self.clipboard_op == Some(ClipboardOp::Cut) && src.parent() == Some(dest.as_path()) {
                 continue;
             }
@@ -219,8 +230,31 @@ impl FileManApp {
                 Some(ClipboardOp::Copy) => fs_ops::copy_item(src, &dest).map(|_| ()),
                 _ => fs_ops::move_item(src, &dest),
             };
-            if let Err(err) = result {
-                errors.push(format!("{}: {err}", src.display()));
+            match result {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    // Prompt user for a new name for this item.
+                    let stem = src
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Copy".to_string());
+                    let ext = src
+                        .extension()
+                        .map(|e| {
+                            let e = e.to_string_lossy();
+                            format!(".{e}")
+                        })
+                        .unwrap_or_default();
+                    self.dialog = Some(Dialog::DuplicateName {
+                        src: src.clone(),
+                        dest_dir: dest.clone(),
+                        suggested: format!("{stem} (copy){ext}"),
+                    });
+                    return;
+                }
+                Err(err) => {
+                    errors.push(format!("{}: {err}", src.display()));
+                }
             }
         }
         if self.clipboard_op == Some(ClipboardOp::Cut) {
@@ -282,11 +316,46 @@ impl FileManApp {
             Dialog::NewFile { name } => fs_ops::create_file(&parent, name)
                 .map(|_| format!("Created file {name}"))
                 .map_err(|err| format!("Create file failed: {err}")),
+            Dialog::DuplicateName { src, dest_dir, suggested } => {
+                let dest = dest_dir.join(suggested);
+                match fs_ops::copy_item_to(src, &dest) {
+                    Ok(()) => Ok(format!("Copied to {}", dest.display())),
+                    Err(err) => Err(format!("Copy failed: {err}")),
+                }
+            }
+            Dialog::TabContext { .. } => Ok(String::new()),
         };
         self.status = match result {
+            Ok(msg) if msg.is_empty() => self.status.clone(),
             Ok(msg) => msg,
             Err(msg) => msg,
         };
+    }
+
+    fn show_tab_context_menu(&mut self, ctx: &egui::Context) {
+        if let Some(Dialog::TabContext { pane_idx, tab_idx }) = self.dialog.take() {
+            let path = self.panes[pane_idx].tabs[tab_idx].path.clone();
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            egui::Window::new(&label)
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .show(&ctx, |ui| {
+                    if ui.button("Duplicate Tab").clicked() {
+                        self.panes[pane_idx].open_tab(path.clone());
+                        self.dirty = true;
+                        self.dialog = None;
+                    }
+                    if ui.button("Close Tab").clicked() {
+                        self.panes[pane_idx].close_tab(tab_idx);
+                        self.dirty = true;
+                        self.dialog = None;
+                    }
+                });
+        }
     }
 }
 
@@ -447,33 +516,55 @@ impl eframe::App for FileManApp {
             }
             self.show_settings = settings_open;
 
-            // Modal dialogs (rename / new folder / new file).
-            let mut commit = false;
-            let mut cancel = false;
-            if let Some(dialog) = &mut self.dialog {
-                let (title, name) = match dialog {
-                    Dialog::Rename { name, .. } => ("Rename", name),
-                    Dialog::NewFolder { name } => ("New Folder", name),
-                    Dialog::NewFile { name } => ("New File", name),
-                };
-                egui::Window::new(title).show(&ctx, |ui| {
-                    let edit = ui.text_edit_singleline(name);
-                    edit.request_focus();
-                    commit = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() {
-                            commit = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
+            // Handle tab context menu separately (non-modal, not a text-dialog).
+            if matches!(&self.dialog, Some(Dialog::TabContext { .. })) {
+                self.show_tab_context_menu(&ctx);
             }
-            if cancel {
-                self.dialog = None;
-            } else if commit {
-                self.commit_dialog();
+
+            // Modal dialogs (rename / new folder / new file / duplicate name).
+            if !matches!(&self.dialog, Some(Dialog::TabContext { .. })) {
+                let mut commit = false;
+                let mut cancel = false;
+                if let Some(dialog) = &mut self.dialog {
+                    // Extract src filename before borrowing dialog further.
+                    let src_label: Option<String> = if let Dialog::DuplicateName { src, .. } = dialog {
+                        src.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
+                    let (title, name) = match dialog {
+                        Dialog::Rename { name, .. } => ("Rename", name),
+                        Dialog::NewFolder { name } => ("New Folder", name),
+                        Dialog::NewFile { name } => ("New File", name),
+                        Dialog::DuplicateName { suggested, .. } => {
+                            ("Duplicate Name", suggested)
+                        }
+                        Dialog::TabContext { .. } => unreachable!(),
+                    };
+                    egui::Window::new(title).show(&ctx, |ui| {
+                        if let Some(ref label) = src_label {
+                            ui.label(label.as_str());
+                        }
+                        let edit = ui.text_edit_singleline(name);
+                        edit.request_focus();
+                        commit = edit.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                commit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                }
+                if cancel {
+                    self.dialog = None;
+                } else if commit {
+                    self.commit_dialog();
+                }
             }
 
             ui.columns(2, |columns| {
@@ -489,6 +580,7 @@ impl eframe::App for FileManApp {
                         let mut tab_clicked = None;
                         let mut tab_closed = None;
                         let mut tab_opened = false;
+                        let mut tab_context_menu: Option<usize> = None;
                         ui.horizontal(|ui| {
                             for (tab_idx, tab) in pane.tabs.iter().enumerate() {
                                 let label = tab
@@ -496,20 +588,35 @@ impl eframe::App for FileManApp {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| tab.path.display().to_string());
-                                if ui
-                                    .selectable_label(tab_idx == pane.active_tab, label)
-                                    .clicked()
-                                {
+                                let tab_resp = ui
+                                    .selectable_label(tab_idx == pane.active_tab, label);
+                                if tab_resp.clicked() {
                                     tab_clicked = Some(tab_idx);
                                 }
-                                if ui.small_button("x").clicked() {
-                                    tab_closed = Some(tab_idx);
+                                // Right-click on tab for context menu
+                                if tab_resp.secondary_clicked() {
+                                    tab_context_menu = Some(tab_idx);
+                                }
+                                // Track hover for close button
+                                if tab_resp.contains_pointer() {
+                                    self.tab_hover = Some((pane_idx, tab_idx));
+                                }
+                                // Show × close button only when this tab is hovered
+                                let is_hovered = self.tab_hover == Some((pane_idx, tab_idx));
+                                if is_hovered {
+                                    if ui.small_button("×").on_hover_text("Close tab").clicked() {
+                                        tab_closed = Some(tab_idx);
+                                    }
                                 }
                             }
                             if ui.button("+").clicked() {
                                 tab_opened = true;
                             }
                         });
+                        // Show tab context menu via dialog
+                        if let Some(idx) = tab_context_menu {
+                            self.dialog = Some(Dialog::TabContext { pane_idx, tab_idx: idx });
+                        }
                         if let Some(idx) = tab_clicked {
                             pane.active_tab = idx;
                         }
@@ -563,6 +670,7 @@ impl eframe::App for FileManApp {
 
                                 let mut select_name: Option<String> = None;
                                 let mut nav_target: Option<PathBuf> = None;
+                                let mut context_menu_name: Option<String> = None;
                                 let mut sort_clicked: Option<String> = None;
                                 let mut live_widths: Option<Vec<f32>> = None;
 
@@ -629,6 +737,10 @@ impl eframe::App for FileManApp {
                                                     &mut select_name,
                                                     &mut nav_target,
                                                 );
+                                                if resp.secondary_clicked() {
+                                                    context_menu_name = Some(entry.name.clone());
+                                                    self.active_pane = pane_idx;
+                                                }
                                             });
                                             row.col(|ui| {
                                                 let text = entry
@@ -695,6 +807,72 @@ impl eframe::App for FileManApp {
                                     pane.active_tab_mut().navigate_to(target);
                                     self.active_pane = pane_idx;
                                     self.dirty = true;
+                                }
+                                if let Some(_name) = context_menu_name {
+                                    let paths: Vec<PathBuf> = pane
+                                        .active_tab()
+                                        .selected
+                                        .iter()
+                                        .map(|n| current_path.join(n))
+                                        .collect();
+                                    let is_single = paths.len() <= 1;
+                                    let ctx = ui.ctx().clone();
+                                    egui::Area::new(egui::Id::new(("ctx_menu", pane_idx)))
+                                        .fixed_pos(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
+                                        .show(&ctx, |ui| {
+                                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                                ui.set_min_width(140.0);
+                                                if ui.button("Copy").clicked() {
+                                                    self.copy_selection();
+                                                    self.dialog = None;
+                                                }
+                                                if ui.button("Cut").clicked() {
+                                                    self.cut_selection();
+                                                    self.dialog = None;
+                                                }
+                                                if ui.button("Paste").clicked() {
+                                                    self.paste_clipboard();
+                                                    self.dialog = None;
+                                                }
+                                                ui.separator();
+                                                if is_single {
+                                                    if ui.button("Rename").clicked() {
+                                                        self.begin_rename();
+                                                        self.dialog = None;
+                                                    }
+                                                }
+                                                if ui.button("Delete").clicked() {
+                                                    self.delete_selection();
+                                                    self.dialog = None;
+                                                }
+                                                ui.separator();
+                                                if ui.button("New Folder").clicked() {
+                                                    self.dialog = Some(Dialog::NewFolder {
+                                                        name: String::new(),
+                                                    });
+                                                }
+                                                if ui.button("New File").clicked() {
+                                                    self.dialog = Some(Dialog::NewFile {
+                                                        name: String::new(),
+                                                    });
+                                                }
+                                                ui.separator();
+                                                if ui.button("Copy Filename").clicked() {
+                                                    if let Some(first) = paths.first() {
+                                                        let name = first
+                                                            .file_name()
+                                                            .map(|n| n.to_string_lossy().into_owned())
+                                                            .unwrap_or_default();
+                                                        ctx.copy_text(name);
+                                                    }
+                                                    self.dialog = None;
+                                                }
+                                                if ui.button("Copy Folder Path").clicked() {
+                                                    ctx.copy_text(current_path.display().to_string());
+                                                    self.dialog = None;
+                                                }
+                                            });
+                                        });
                                 }
                             }
                             Err(err) => {

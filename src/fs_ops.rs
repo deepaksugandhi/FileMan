@@ -101,6 +101,21 @@ fn validate_name(name: &str) -> io::Result<&str> {
     Ok(name)
 }
 
+/// Copies `src` (file or directory) directly to `dest` (an exact path, not a
+/// parent directory). Creates intermediate directories as needed. Will NOT
+/// overwrite an existing `dest`.
+pub fn copy_item_to(src: &Path, dest: &Path) -> io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if src.is_dir() {
+        copy_dir_recursive(src, dest)?;
+    } else {
+        copy_file(src, dest)?;
+    }
+    Ok(())
+}
+
 fn new_path_in(parent: &Path, raw_name: &str) -> io::Result<PathBuf> {
     let name = validate_name(raw_name)?;
     let path = parent.join(name);

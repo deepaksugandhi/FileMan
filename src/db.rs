@@ -41,6 +41,29 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE panes ADD COLUMN col_widths TEXT NOT NULL DEFAULT '220 140 90 60'",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE app_state ADD COLUMN theme TEXT NOT NULL DEFAULT 'system'",
+        [],
+    );
+    Ok(())
+}
+
+/// Reads the saved theme preference ("dark" / "light" / "system"), if any.
+pub fn get_theme(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT theme FROM app_state WHERE id = 1", [], |row| {
+        row.get(0)
+    })
+    .ok()
+}
+
+/// Persists the theme preference, creating the app_state row if it doesn't
+/// exist yet (this can be called before the first session save).
+pub fn set_theme(conn: &Connection, theme: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_state (id, active_pane, theme) VALUES (1, 0, ?1)
+         ON CONFLICT(id) DO UPDATE SET theme=?1",
+        rusqlite::params![theme],
+    )?;
     Ok(())
 }
 
