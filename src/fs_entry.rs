@@ -33,6 +33,19 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     Ok(entries)
 }
 
+/// Lists only the immediate subdirectories of `dir`, sorted by name.
+pub fn list_subdirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    dirs.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+    Ok(dirs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +72,17 @@ mod tests {
     fn errors_on_missing_dir() {
         let result = list_dir(Path::new("Z:\\definitely_missing_path_xyz"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_subdirs_returns_only_directories_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("f.txt")).unwrap();
+        fs::create_dir(dir.path().join("b")).unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+
+        let subdirs = list_subdirs(dir.path()).unwrap();
+
+        assert_eq!(subdirs, vec![dir.path().join("a"), dir.path().join("b")]);
     }
 }

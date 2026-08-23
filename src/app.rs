@@ -4,7 +4,7 @@ use crate::session::{self, WindowGeometry};
 use crate::tree;
 use eframe::egui;
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Modal dialog state (only one open at a time).
 #[derive(Debug, Clone)]
@@ -75,6 +75,42 @@ impl FileManApp {
 
     fn active_tab_dir(&self) -> PathBuf {
         self.panes[self.active_pane].active_tab().path.clone()
+    }
+
+    /// Renders one node of the sidebar folder tree: a collapsing header that
+    /// lazily lists its subdirectories when expanded. Ancestor folders of
+    /// `active_path` are forced open so the tree stays in sync with (and
+    /// highlights) the active pane's current directory. Clicking a header
+    /// navigates the active pane to that folder.
+    fn show_dir_node(&mut self, ui: &mut egui::Ui, dir: &Path, active_path: &Path) {
+        let label = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        let is_active = dir == active_path;
+        let mut header = egui::CollapsingHeader::new(if is_active {
+            egui::RichText::new(label).strong()
+        } else {
+            egui::RichText::new(label)
+        })
+        .id_salt(format!("tree_{}", dir.display()));
+        if active_path.starts_with(dir) {
+            // Auto-expand every ancestor of the active folder (and itself).
+            header = header.open(Some(true));
+        }
+        let response = header.show(ui, |ui| {
+            if let Ok(subdirs) = crate::fs_entry::list_subdirs(dir) {
+                for subdir in subdirs {
+                    self.show_dir_node(ui, &subdir, active_path);
+                }
+            }
+        });
+        if response.header_response.clicked() {
+            self.panes[self.active_pane]
+                .active_tab_mut()
+                .navigate_to(dir.to_path_buf());
+            self.dirty = true;
+        }
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -217,15 +253,26 @@ impl eframe::App for FileManApp {
             self.dirty = true;
         }
 
+        // Global shortcuts (disabled while a modal dialog is open so typing
+        // in the name field doesn't trigger them).
+        if self.dialog.is_none() {
+            ctx.input(|i| {
+                let ctrl = i.modifiers.ctrl;
+                if ctrl && i.key_pressed(egui::Key::X) {
+                    self.cut_selection();
+                } else if ctrl && i.key_pressed(egui::Key::C) {
+                    self.copy_selection();
+                } else if ctrl && i.key_pressed(egui::Key::V) {
+                    self.paste_clipboard();
+                }
+            });
+        }
+
         egui::Panel::left("folder_tree").show(ui, |ui| {
             ui.heading("Folders");
+            let active_path = self.panes[self.active_pane].active_tab().path.clone();
             for drive in tree::list_drives() {
-                if ui.button(drive.display().to_string()).clicked() {
-                    self.panes[self.active_pane]
-                        .active_tab_mut()
-                        .navigate_to(drive.clone());
-                    self.dirty = true;
-                }
+                self.show_dir_node(ui, &drive, &active_path);
             }
         });
 
