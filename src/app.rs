@@ -404,45 +404,113 @@ impl eframe::App for FileManApp {
                         });
 
                         match crate::fs_entry::list_dir(&current_path) {
-                            Ok(entries) => {
-                                egui::ScrollArea::vertical()
-                                    .id_salt(format!("file_list_pane_{pane_idx}"))
-                                    .show(ui, |ui| {
-                                    let ctrl = ui.input(|i| i.modifiers.ctrl);
-                                    let mut select_name: Option<String> = None;
-                                    let mut nav_target: Option<PathBuf> = None;
-                                    for entry in entries {
-                                        let is_selected =
-                                            pane.active_tab().selected.contains(&entry.name);
-                                        let label = if entry.is_dir {
-                                            format!("{} {}", entry.name, "[dir]")
-                                        } else {
-                                            format!("{} ({} bytes)", entry.name, entry.size)
-                                        };
-                                        let resp = ui.selectable_label(is_selected, label);
-                                        if resp.clicked() && ctrl {
-                                            select_name = Some(entry.name.clone());
-                                        }
-                                        if resp.double_clicked() && entry.is_dir {
-                                            nav_target = Some(entry.path.clone());
-                                        } else if resp.clicked() {
-                                            select_name = Some(entry.name.clone());
-                                        }
+                            Ok(mut entries) => {
+                                let (sort_col, sort_asc) = {
+                                    let tab = pane.active_tab();
+                                    (tab.sort_col.clone(), tab.sort_asc)
+                                };
+                                crate::fs_entry::sort_entries(&mut entries, &sort_col, sort_asc);
+                                let ctrl = ui.input(|i| i.modifiers.ctrl);
+
+                                let mut select_name: Option<String> = None;
+                                let mut nav_target: Option<PathBuf> = None;
+                                let mut sort_clicked: Option<String> = None;
+
+                                egui_extras::TableBuilder::new(ui)
+                                    .id_salt(format!("file_table_pane_{pane_idx}"))
+                                    .striped(true)
+                                    .column(
+                                        egui_extras::Column::auto()
+                                            .resizable(true)
+                                            .clip(true)
+                                            .at_least(120.0),
+                                    )
+                                    .column(egui_extras::Column::auto().resizable(true))
+                                    .column(egui_extras::Column::auto().resizable(true))
+                                    .column(egui_extras::Column::remainder())
+                                    .header(20.0, |mut header| {
+                                        header.col(|ui| {
+                                            sort_header(ui, "Name", "name", &sort_col, sort_asc, &mut sort_clicked);
+                                        });
+                                        header.col(|ui| {
+                                            sort_header(ui, "Modified", "modified", &sort_col, sort_asc, &mut sort_clicked);
+                                        });
+                                        header.col(|ui| {
+                                            sort_header(ui, "Size", "size", &sort_col, sort_asc, &mut sort_clicked);
+                                        });
+                                        header.col(|ui| {
+                                            sort_header(ui, "Archive", "archive", &sort_col, sort_asc, &mut sort_clicked);
+                                        });
+                                    })
+                                    .body(|mut body| {
+                                        body.rows(18.0, entries.len(), |mut row| {
+                                            let entry = &entries[row.index()];
+                                            let is_selected = pane
+                                                .active_tab()
+                                                .selected
+                                                .contains(&entry.name);
+
+                                            row.col(|ui| {
+                                                let resp = ui.selectable_label(
+                                                    is_selected,
+                                                    &entry.name,
+                                                );
+                                                register_entry_click(
+                                                    &resp, entry,
+                                                    &mut select_name,
+                                                    &mut nav_target,
+                                                );
+                                            });
+                                            row.col(|ui| {
+                                                let text = entry
+                                                    .modified
+                                                    .map(|t| {
+                                                        chrono::DateTime::<chrono::Local>::from(t)
+                                                            .format("%Y-%m-%d %H:%M")
+                                                            .to_string()
+                                                    })
+                                                    .unwrap_or_default();
+                                                ui.label(text);
+                                            });
+                                            row.col(|ui| {
+                                                let size_text = if entry.is_dir {
+                                                    String::new()
+                                                } else {
+                                                    format!("{}", entry.size)
+                                                };
+                                                ui.label(size_text);
+                                            });
+                                            row.col(|ui| {
+                                                if entry.archive {
+                                                    ui.label("A");
+                                                }
+                                            });
+                                        });
+                                    });
+
+                                if let Some(col) = sort_clicked {
+                                    let tab = pane.active_tab_mut();
+                                    if tab.sort_col == col {
+                                        tab.sort_asc = !tab.sort_asc;
+                                    } else {
+                                        tab.sort_col = col;
+                                        tab.sort_asc = true;
                                     }
-                                    if let Some(name) = select_name {
-                                        if ctrl {
-                                            pane.active_tab_mut().toggle_select(&name);
-                                        } else {
-                                            pane.active_tab_mut().select_only(&name);
-                                        }
-                                        self.active_pane = pane_idx;
+                                    self.dirty = true;
+                                }
+                                if let Some(name) = select_name {
+                                    if ctrl {
+                                        pane.active_tab_mut().toggle_select(&name);
+                                    } else {
+                                        pane.active_tab_mut().select_only(&name);
                                     }
-                                    if let Some(target) = nav_target {
-                                        pane.active_tab_mut().navigate_to(target);
-                                        self.active_pane = pane_idx;
-                                        self.dirty = true;
-                                    }
-                                });
+                                    self.active_pane = pane_idx;
+                                }
+                                if let Some(target) = nav_target {
+                                    pane.active_tab_mut().navigate_to(target);
+                                    self.active_pane = pane_idx;
+                                    self.dirty = true;
+                                }
                             }
                             Err(err) => {
                                 ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
@@ -457,6 +525,42 @@ impl eframe::App for FileManApp {
             self.persist();
             self.dirty = false;
         }
+    }
+}
+
+/// Clickable column header that shows a sort-direction arrow when its
+/// column is the active sort column.
+fn sort_header(
+    ui: &mut egui::Ui,
+    label: &str,
+    col: &str,
+    current_col: &str,
+    asc: bool,
+    clicked: &mut Option<String>,
+) {
+    let arrow = if current_col == col {
+        if asc { " ▲" } else { " ▼" }
+    } else {
+        ""
+    };
+    if ui
+        .selectable_label(current_col == col, format!("{label}{arrow}"))
+        .clicked()
+    {
+        *clicked = Some(col.to_string());
+    }
+}
+
+fn register_entry_click(
+    resp: &egui::Response,
+    entry: &crate::fs_entry::FsEntry,
+    select_name: &mut Option<String>,
+    nav_target: &mut Option<PathBuf>,
+) {
+    if resp.double_clicked() && entry.is_dir {
+        *nav_target = Some(entry.path.clone());
+    } else if resp.clicked() {
+        *select_name = Some(entry.name.clone());
     }
 }
 

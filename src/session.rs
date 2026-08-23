@@ -1,6 +1,6 @@
 use crate::pane::Pane;
 use crate::tab::Tab;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::path::{Path, PathBuf};
 
 /// Returns `path` unchanged if it exists, otherwise walks up the ancestor
@@ -48,20 +48,28 @@ pub fn save_session(
         "INSERT INTO window_state (id, width, height, pos_x, pos_y, monitor_name)
          VALUES (1, ?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(id) DO UPDATE SET width=?1, height=?2, pos_x=?3, pos_y=?4, monitor_name=?5",
-        params![window.width, window.height, window.pos_x, window.pos_y, window.monitor_name],
+        params![
+            window.width,
+            window.height,
+            window.pos_x,
+            window.pos_y,
+            window.monitor_name
+        ],
     )?;
 
     tx.execute("DELETE FROM panes", [])?;
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab, sort_col, sort_asc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     pane_idx as i64,
                     tab_idx as i64,
                     tab.path.to_string_lossy(),
-                    (tab_idx == pane.active_tab) as i64
+                    (tab_idx == pane.active_tab) as i64,
+                    tab.sort_col,
+                    tab.sort_asc as i64
                 ],
             )?;
         }
@@ -95,27 +103,39 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         .ok();
 
     let mut stmt = conn.prepare(
-        "SELECT pane_index, path, is_active_tab FROM panes ORDER BY pane_index, tab_index",
+        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc
+         FROM panes ORDER BY pane_index, tab_index",
     )?;
-    let rows: Vec<(i64, String, bool)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? == 1)))?
+    let rows: Vec<(i64, String, bool, String, bool)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)? == 1,
+                row.get(3)?,
+                row.get::<_, i64>(4)? == 1,
+            ))
+        })?
         .collect::<Result<Vec<_>>>()?;
 
     if rows.is_empty() {
         return Ok(None);
     }
 
-    let pane_count = rows.iter().map(|(idx, _, _)| *idx).max().unwrap() as usize + 1;
+    let pane_count = rows.iter().map(|(idx, _, _, _, _)| *idx).max().unwrap() as usize + 1;
     let mut panes: Vec<Option<Pane>> = (0..pane_count).map(|_| None).collect();
 
-    for (pane_idx, path, is_active) in rows {
+    for (pane_idx, path, is_active, sort_col, sort_asc) in rows {
         let pane_idx = pane_idx as usize;
         let pane = panes[pane_idx].get_or_insert_with(|| Pane {
             tabs: Vec::new(),
             active_tab: 0,
         });
         let resolved_path = nearest_existing_ancestor(&PathBuf::from(path));
-        pane.tabs.push(Tab::new(resolved_path));
+        let mut tab = Tab::new(resolved_path);
+        tab.sort_col = sort_col;
+        tab.sort_asc = sort_asc;
+        pane.tabs.push(tab);
         if is_active {
             pane.active_tab = pane.tabs.len() - 1;
         }
@@ -127,9 +147,11 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         .collect();
 
     let active_pane = conn
-        .query_row("SELECT active_pane FROM app_state WHERE id = 1", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT active_pane FROM app_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .unwrap_or(0) as usize;
     let active_pane = active_pane.min(panes.len().saturating_sub(1));
 
@@ -183,6 +205,34 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_per_tab_sort_settings() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut pane0 = Pane::new(PathBuf::from("C:\\Users"));
+        pane0.tabs[0].sort_col = "size".to_string();
+        pane0.tabs[0].sort_asc = false;
+
+        save_session(
+            &conn,
+            &WindowGeometry {
+                width: 1000.0,
+                height: 700.0,
+                pos_x: None,
+                pos_y: None,
+                monitor_name: None,
+            },
+            &[pane0],
+            0,
+        )
+        .unwrap();
+
+        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        assert_eq!(loaded.panes[0].tabs[0].sort_col, "size");
+        assert!(!loaded.panes[0].tabs[0].sort_asc);
+    }
+
+    #[test]
     fn nearest_existing_ancestor_returns_path_unchanged_when_it_exists() {
         let dir = tempfile::tempdir().unwrap();
         let resolved = nearest_existing_ancestor(dir.path());
@@ -230,12 +280,19 @@ mod tests {
         let pane0 = Pane::new(PathBuf::from("C:\\"));
         save_session(
             &conn,
-            &WindowGeometry { width: 800.0, height: 600.0, pos_x: None, pos_y: None, monitor_name: None },
+            &WindowGeometry {
+                width: 800.0,
+                height: 600.0,
+                pos_x: None,
+                pos_y: None,
+                monitor_name: None,
+            },
             &[pane0],
             0,
         )
         .unwrap();
-        conn.execute("UPDATE app_state SET active_pane = 5 WHERE id = 1", []).unwrap();
+        conn.execute("UPDATE app_state SET active_pane = 5 WHERE id = 1", [])
+            .unwrap();
 
         let loaded = load_session(&conn).unwrap().expect("session should exist");
         assert_eq!(loaded.active_pane, 0); // clamped to the only valid index

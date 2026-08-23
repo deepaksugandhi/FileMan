@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10,27 +12,51 @@ pub struct FsEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// Windows FILE_ATTRIBUTE_ARCHIVE (0x20).
+    pub archive: bool,
 }
+
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 
 pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let metadata = entry.metadata()?;
+        #[cfg(windows)]
+        let archive = metadata.file_attributes() & FILE_ATTRIBUTE_ARCHIVE != 0;
+        #[cfg(not(windows))]
+        let archive = false;
         entries.push(FsEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry.path(),
             is_dir: metadata.is_dir(),
             size: metadata.len(),
             modified: metadata.modified().ok(),
+            archive,
         });
     }
+    sort_entries(&mut entries, "name", true);
+    Ok(entries)
+}
+
+/// Sorts entries in place. Directories always come before files; within
+/// each group the entries are ordered by the requested column.
+/// Recognized columns: "name", "modified", "size", "archive".
+pub fn sort_entries(entries: &mut [FsEntry], sort_col: &str, asc: bool) {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| {
+                let ord = match sort_col {
+                    "modified" => a.modified.cmp(&b.modified),
+                    "size" => a.size.cmp(&b.size),
+                    "archive" => a.archive.cmp(&b.archive),
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                };
+                if asc { ord } else { ord.reverse() }
+            })
     });
-    Ok(entries)
 }
 
 /// Lists only the immediate subdirectories of `dir`, sorted by name.
@@ -84,5 +110,78 @@ mod tests {
         let subdirs = list_subdirs(dir.path()).unwrap();
 
         assert_eq!(subdirs, vec![dir.path().join("a"), dir.path().join("b")]);
+    }
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: Option<SystemTime>) -> FsEntry {
+        FsEntry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            is_dir,
+            size,
+            modified,
+            archive: false,
+        }
+    }
+
+    #[test]
+    fn sort_by_size_ascending_and_descending() {
+        let mut entries = vec![
+            entry("c.txt", false, 30, None),
+            entry("a.txt", false, 10, None),
+            entry("b.txt", false, 20, None),
+        ];
+
+        sort_entries(&mut entries, "size", true);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt", "c.txt"]);
+
+        sort_entries(&mut entries, "size", false);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["c.txt", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn sort_by_modified_treats_missing_time_as_oldest() {
+        let t1 = SystemTime::UNIX_EPOCH;
+        let t2 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let mut entries = vec![
+            entry("none.txt", false, 0, None),
+            entry("old.txt", false, 0, Some(t1)),
+            entry("new.txt", false, 0, Some(t2)),
+        ];
+
+        sort_entries(&mut entries, "modified", true);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["none.txt", "old.txt", "new.txt"]);
+    }
+
+    #[test]
+    fn sort_keeps_directories_first_regardless_of_column() {
+        let mut entries = vec![
+            entry("zfile.txt", false, 999, None),
+            entry("afolder", true, 0, None),
+        ];
+
+        sort_entries(&mut entries, "name", true);
+        assert!(entries[0].is_dir);
+
+        sort_entries(&mut entries, "size", true);
+        assert!(entries[0].is_dir);
+    }
+
+    #[test]
+    fn sort_by_archive_flag() {
+        let mut clean = entry("clean.bin", false, 0, None);
+        clean.archive = false;
+        let mut dirty = entry("dirty.bin", false, 0, None);
+        dirty.archive = true;
+        let mut entries = vec![clean, dirty];
+
+        sort_entries(&mut entries, "archive", true);
+        assert!(!entries[0].archive);
+        assert!(entries[1].archive);
+
+        sort_entries(&mut entries, "archive", false);
+        assert!(entries[0].archive);
     }
 }
