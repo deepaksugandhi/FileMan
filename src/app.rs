@@ -358,7 +358,9 @@ impl eframe::App for FileManApp {
 
                         match crate::fs_entry::list_dir(&current_path) {
                             Ok(entries) => {
-                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt(format!("file_list_pane_{pane_idx}"))
+                                    .show(ui, |ui| {
                                     let ctrl = ui.input(|i| i.modifiers.ctrl);
                                     let mut select_name: Option<String> = None;
                                     let mut nav_target: Option<PathBuf> = None;
