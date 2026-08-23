@@ -4,11 +4,14 @@ use std::path::PathBuf;
 pub struct Pane {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// Editable address bar text for this pane.
+    pub address_bar: String,
 }
 
 impl Pane {
     pub fn new(initial_path: PathBuf) -> Self {
         Pane {
+            address_bar: initial_path.display().to_string(),
             tabs: vec![Tab::new(initial_path)],
             active_tab: 0,
         }

@@ -1,8 +1,11 @@
 mod app;
+mod archive;
 mod db;
 mod fs_entry;
 mod fs_ops;
 mod pane;
+mod progress;
+mod search;
 mod session;
 mod tab;
 mod tree;
@@ -24,6 +27,9 @@ fn main() -> eframe::Result<()> {
     if let Some(loaded) = &loaded {
         if let Some(window) = &loaded.window {
             viewport = viewport.with_inner_size([window.width, window.height]);
+            if let (Some(x), Some(y)) = (window.pos_x, window.pos_y) {
+                viewport = viewport.with_position([x, y]);
+            }
         }
     }
 
@@ -32,6 +38,10 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // Font loading (embedded default + any saved system-font preference) is
+    // applied reactively from FileManApp::ui on the first frame — see
+    // app::apply_fonts — since the font family can also change at runtime
+    // via Settings.
     eframe::run_native(
         "Speed FileMan",
         options,

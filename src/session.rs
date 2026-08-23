@@ -82,8 +82,8 @@ pub fn save_session(
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     pane_idx as i64,
                     tab_idx as i64,
@@ -92,6 +92,7 @@ pub fn save_session(
                     tab.sort_col,
                     tab.sort_asc as i64,
                     format_col_widths(&tab.col_widths),
+                    tab.view_mode.as_str(),
                 ],
             )?;
         }
@@ -125,10 +126,10 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         .ok();
 
     let mut stmt = conn.prepare(
-        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths
+        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode
          FROM panes ORDER BY pane_index, tab_index",
     )?;
-    let rows: Vec<(i64, String, bool, String, bool, String)> = stmt
+    let rows: Vec<(i64, String, bool, String, bool, String, String)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -137,6 +138,7 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
                 row.get(3)?,
                 row.get::<_, i64>(4)? == 1,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -153,20 +155,31 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
         + 1;
     let mut panes: Vec<Option<Pane>> = (0..pane_count).map(|_| None).collect();
 
-    for (pane_idx, path, is_active, sort_col, sort_asc, col_widths) in rows {
+    for (pane_idx, path, is_active, sort_col, sort_asc, col_widths, view_mode) in rows {
         let pane_idx = pane_idx as usize;
         let pane = panes[pane_idx].get_or_insert_with(|| Pane {
             tabs: Vec::new(),
             active_tab: 0,
+            address_bar: String::new(),
         });
         let resolved_path = nearest_existing_ancestor(&PathBuf::from(path));
         let mut tab = Tab::new(resolved_path);
         tab.sort_col = sort_col;
         tab.sort_asc = sort_asc;
         tab.col_widths = parse_col_widths(&col_widths);
+        tab.view_mode = crate::tab::ViewMode::from_str(&view_mode);
         pane.tabs.push(tab);
         if is_active {
             pane.active_tab = pane.tabs.len() - 1;
+        }
+    }
+
+    // Set each pane's address bar to its active tab's path
+    for pane_opt in &mut panes {
+        if let Some(pane) = pane_opt {
+            if let Some(active_tab) = pane.tabs.get(pane.active_tab) {
+                pane.address_bar = active_tab.path.display().to_string();
+            }
         }
     }
 

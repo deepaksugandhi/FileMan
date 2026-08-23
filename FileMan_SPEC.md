@@ -233,3 +233,233 @@ Deferred rather than silently dropped — revisit before/if they become blocking
 | 5. Common folder tree per pane/tab | §3, §6, §10 |
 | 6. Global vs. per-user configs | §6 |
 | 7. Configurable shortcuts & buttons | §7 |
+
+## 15. Next Implementation Plan (Phase 2)
+
+Snapshot as of 2026-08-23. Implemented so far: dual-pane/tabs, session persistence
+(window size/position, tabs, sort, column widths, per-tab view mode), copy/cut/
+paste/delete/rename/new, sidebar folder tree, dark/light/system theming, a
+Settings window (theme + font size/family), a tab context menu, a persistent
+right-click file context menu, a duplicate-name-on-paste prompt, and List/
+Details/Icons view modes.
+
+Grouped by priority — earlier tiers unblock or de-risk later ones.
+
+### Bug-fix pass — done (2026-08-23)
+
+The six bugs/regressions found reviewing the previous change are resolved,
+except the one flagged as deliberate:
+
+1. ✅ **Font-family picker** — `apply_fonts` (app.rs) now reads the matching
+   `.ttf` from `%WINDIR%\Fonts` (Segoe UI, Arial, Times New Roman, Courier
+   New) at runtime and swaps it into the egui font atlas; falls back to the
+   embedded Inter with a status message if the file isn't found. Re-applied
+   reactively (once per family change), not hardcoded at startup in
+   `main.rs` anymore.
+2. ✅ **Right-click file context menu vanishing** — replaced the hand-rolled
+   `egui::Area` (driven by a one-frame-only flag) with egui's built-in
+   `Response::context_menu`, which owns its own open/close state across
+   frames. Right-clicking an unselected entry now also selects it first, so
+   the menu acts on the right item.
+   *(Not in scope for this pass: full per-item action menu on the sidebar folder tree.)*
+3. ⛔ **Skipped, deliberate.** The orange-fill / black-text active-tab
+   highlight is an intentional visual choice, not a bug — left as-is.
+4. ✅ **Per-tab view mode reinstated** — `ViewMode::{Details,List,Icons}` is
+   back on `Tab`, with a real toggle row per pane and three genuinely
+   different renderers (table / plain list / wrapped icon grid), all sharing
+   the same selection, navigation, and context-menu plumbing. Persisted via
+   a new `panes.view_mode` column.
+5. ✅ **Ctrl+scroll zoom** — now calls egui's native `Context::set_zoom_factor`
+   via `InputState::zoom_delta()` instead of hand-editing `font_size`. This
+   scales the *whole* UI (spacing, row heights, icons) together, so nothing
+   clips, and egui already excludes ctrl-held wheel events from
+   `smooth_scroll_delta`, so there's no more double-scroll. Table row/header
+   height are now also derived from the font-size setting
+   (`(font_size * 1.3).max(18.0)`), so the Settings dialog's font-size
+   slider can't cause clipping either.
+6. ✅ **Window position persistence** — `persist()` now captures
+   `ViewportInfo::outer_rect` each frame it changes and writes real
+   `pos_x`/`pos_y`; `main.rs` applies them via `ViewportBuilder::with_position`
+   on restore. `monitor_name` and monitor-aware clamping/fallback are **not**
+   included — egui 0.36's `ViewportInfo` has no stable monitor identifier, so
+   that piece stays as its own P0 task below (needs raw `winit`/Win32 access).
+
+### Bug-fix pass 2 — done (2026-08-23)
+
+Found reviewing the P2 file-operation-depth additions (`archive.rs`,
+`search.rs`, `progress.rs`):
+
+1. ✅ **`extract_here()` had a leftover, buggy branch** that spawned a
+   background copy of the archive onto itself (same source and destination
+   folder) and immediately discarded the handle before falling back to a
+   synchronous `extract_archive` call anyway. Removed; extraction is
+   synchronous (archives are typically small; revisit if that stops holding).
+2. ✅ **Background copy/move/delete are now actually wired up.**
+   `paste_clipboard`/`delete_selection` used to call the old synchronous
+   `fs_ops::copy_item`/`move_item`/`delete_to_trash` directly, so the
+   progress modal never appeared for a real user action. They now go through
+   new `progress::copy_items_bg`/`move_items_bg`/`delete_to_trash_bg`
+   (batch versions, one background op for the whole paste/delete). The
+   one-collision-at-a-time `DuplicateName` dialog UX is preserved by a cheap
+   `Path::exists` pre-check before handing the batch to the background
+   thread — no recursive walk needed for that part.
+3. ⛔ **Skipped, deliberate** (from pass 1) — orange/black active-tab
+   highlight, unchanged.
+4. ✅ **Per-pane search filter is now per-tab.** Was a single
+   `FileManApp::search_query` field shared by both panes' text fields — typing
+   in one pane's filter overwrote the other's. Moved to `Tab::filter`,
+   alongside `sort_col`/`view_mode`; cleared on navigation like the
+   selection is.
+5. ✅ **Background op file-counting moved off the caller thread.** The old
+   `copy_item_bg`/`move_item_bg` called `count_item` (a recursive directory
+   walk) synchronously before spawning — for a large tree this just moved
+   the UI freeze earlier instead of removing it. The new batch functions
+   count inside the spawned thread and start by reporting a "Counting…"
+   state.
+6. ✅ **`is_archive` no longer accepts a bare `.gz`.** It matched any `.gz`
+   extension, but `extract_archive` only handles `.tar.gz`/`.tgz` — a plain
+   single-file gzip would show as extractable in the UI and then fail with a
+   decode error. Now only `.zip`, `.tar`, `.tar.gz`, `.tgz` are recognized.
+   (The "keep all folders visible while filtering" behavior in
+   `filter_entries` was flagged as a design question, not a bug — left
+   unchanged pending confirmation.)
+
+Also fixed while in `progress.rs`: `copy_item_recursive`'s per-file copy
+didn't check for an existing destination file the way the original
+`fs_ops::copy_file` did, so a nested name collision partway through a
+background directory copy would silently overwrite instead of erroring —
+added the same `AlreadyExists` check back.
+
+### P0 — Fix before building on top of them
+
+1. **Non-blocking, cached directory listing.**
+   - Problem: `crate::fs_entry::list_dir(&current_path)` (app.rs, inside the
+     per-pane render block) runs synchronously on the UI thread on *every
+     frame*, for both panes, even when nothing changed.
+   - Plan: add a `listing: Vec<FsEntry>` + `listing_dirty: bool` cache to
+     `Tab` (or a sibling struct held by `Pane`). Re-run `list_dir` only when
+     `listing_dirty` is set (on `navigate_to`/`go_back`/`go_forward`, on app
+     start, after any `fs_ops` call that touches the tab's directory, and on
+     an explicit refresh action/hotkey — e.g. F5).
+   - For the "must not block the UI thread" half of SPEC §12: move the actual
+     read to a background thread using `std::sync::mpsc` (or a small
+     `std::thread::spawn` + channel per request), poll the channel each frame
+     in `ui()`, and show a lightweight "Loading…" state in the pane while
+     waiting. Cancel/ignore a stale in-flight read if the user navigates
+     again before it completes (tag each request with a generation counter).
+   - Touches: `tab.rs` (or a new `listing.rs`), `pane.rs`, `app.rs`.
+
+2. **Resizable pane split** (SPEC §3).
+   - Replace `ui.columns(2, |columns| { ... })` with a manually laid-out pair
+     of rects plus a thin draggable divider `Sense::drag()` widget between
+     them (egui has no built-in split-pane container in 0.36).
+   - Add `split_ratio: f32` (default 0.5) to `FileManApp`, clamp to e.g.
+     `0.15..=0.85` while dragging, persist it (new `app_state.split_ratio`
+     column + `db::get/set_split_ratio`, same pattern as `theme`/`font_size`).
+   - Touches: `app.rs`, `db.rs`.
+
+3. **Monitor-aware window position** (SPEC §4, the part not covered by the
+   bug-fix pass above).
+   - egui/eframe 0.36 doesn't expose a stable per-monitor device name, so
+     this needs `winit`'s `Window::available_monitors()` /
+     `Window::current_monitor()` via `eframe::Frame`'s raw window handle (or
+     add `winit` as a direct dependency and call the Win32
+     `EnumDisplayMonitors`/`GetMonitorInfo` APIs directly, matching the SPEC's
+     original suggestion).
+   - Persist a monitor identifier string alongside `pos_x`/`pos_y`
+     (`window_state.monitor_name`, already in the schema). On restore: if
+     that monitor is still connected, use the saved position relative to its
+     work area; otherwise fall back to a centered position on the primary
+     monitor. Clamp on-screen if the saved position would be mostly
+     off-monitor (e.g. after a resolution change).
+   - Touches: `main.rs`, `session.rs`.
+
+### P1 — Core PRD items not yet started
+
+1. **Multi-user profiles** (SPEC §5).
+   - New `users` table (`id`, `name`, `created_at`, `is_default`); seed a
+     default profile on first run in `db::init_db`.
+   - Add `user_id` to `window_state`, `panes`, `app_state` (or split
+     `app_state` into a per-user table) — all keyed by the active user.
+   - Add a user switcher (combo box in the top toolbar, next to Settings).
+     Switching: persist the current user's state, load the target user's
+     saved session/config, replace `self.panes`/`self.active_pane`/theme/font
+     wholesale.
+   - Touches: `db.rs`, `session.rs`, `app.rs`; a new `user.rs` is reasonable
+     once this grows past a couple of functions.
+
+2. **Two-tier config** (SPEC §6) — depends on (1).
+   - Split the existing single-row `app_state` (theme/font) into
+     `global_settings(key, value)` and `user_settings(user_id, key, value)`.
+   - Resolution: read `user_settings` first, fall back to `global_settings`,
+     fall back to the hardcoded default. Wrap in a small `config::get(conn,
+     user_id, key)` / `config::set(conn, scope, key, value)` helper so
+     Settings-dialog code doesn't special-case every key.
+   - Touches: `db.rs` (new tables + migration), a new `config.rs`, `app.rs`
+     (Settings window reads/writes through the new helper instead of the
+     current `get_theme`/`set_theme`-style one-off functions).
+
+3. **Configurable shortcuts & action buttons** (SPEC §7).
+   - Define an `Action` enum (Copy, Cut, Paste, Rename, Delete, NewFolder,
+     NewFile, CopyPath, GoBack, GoForward, GoUp, NewTab, CloseTab, SwitchPane,
+     OpenWith(PathBuf), ...) — this becomes the single source of truth
+     replacing today's scattered `if ctrl && i.key_pressed(...)` checks.
+   - `bindings` table: `scope` ('global' or a `user_id`), `key_combo` (stored
+     as e.g. `"Ctrl+X"`), `action_id`. Load into an in-memory
+     `HashMap<KeyboardShortcut, Action>` per active user (user bindings
+     override global for the same action; conflict = same combo bound twice
+     in one scope, rejected at bind time with a status message).
+   - Rebind UI: a new Settings tab/section listing every `Action` with its
+     current shortcut and a "press a new combo" capture field.
+   - Toolbar/context-menu buttons become data-driven off the same `Action`
+     enum instead of hardcoded `if ui.button("Copy").clicked() {
+     self.copy_selection() }` call sites, so a custom action button
+     (including "open with `<app>`" launching `std::process::Command`) can be
+     added without new match arms elsewhere.
+   - Touches: new `actions.rs`, `db.rs`, `app.rs` (toolbar/menu construction
+     + global shortcut handling both move to go through the registry).
+
+### P2 — File-operation depth (SPEC §8) — done, with gaps noted
+
+- ✅ **Archive extraction**: `.zip` (`zip` crate) and `.tar`/`.tar.gz`/`.tgz`
+  (`tar` + `flate2`) via `archive.rs`. Toolbar and context-menu actions
+  ("Extract Here" / "Extract to…", the latter via `rfd`), enabled only when
+  the selection is a single supported archive. Runs synchronously — fine for
+  typical archive sizes; revisit (background + progress, same pattern as
+  copy/move) if that stops holding.
+- ✅ **Search/filter**: `search::filter_entries` does an in-memory,
+  case-insensitive substring match on `name`, per-tab (`Tab::filter`).
+  Directories are always kept regardless of the filter so navigation still
+  works — confirm this is the desired behavior; Explorer-style filtering
+  usually hides non-matching folders too.
+  - **Not yet wired up**: `search::recursive_search`/`walk_recursive` exist
+    (background-thread recursive search infrastructure) but have no caller
+    or UI toggle yet — still open.
+- ✅ **Progress indicator**: `progress::copy_items_bg`/`move_items_bg`/
+  `delete_to_trash_bg` run copy/cut-paste/delete on a background thread with
+  a live progress modal (`egui::ProgressBar`), file-counting included on the
+  background thread so it doesn't block the UI either. Wired into
+  `paste_clipboard`/`delete_selection`.
+  - **Not yet covered**: `rename_item`/`create_folder`/`create_file` and
+    archive extraction still run synchronously — fine at their typical
+    scale (single item / one archive), but worth background-izing later if
+    that changes.
+
+### P3 — Advanced features (SPEC §9, §11)
+
+- **Batch rename**: pattern editor (find/replace, sequential numbering, case
+  change) operating on the current multi-selection, with a live preview
+  table (old name → new name) before committing via `fs_ops::rename_item`
+  in a loop.
+- **Metadata-only preview pane**: a collapsible side panel showing size,
+  created/modified/accessed timestamps, attributes, and full path for the
+  current single-item selection — no new dependency, `std::fs::metadata`
+  covers all of it.
+- **Checksum/compare**: MD5/SHA-256 (via the `sha2`/`md5` crates already
+  named in §2) computed on a background thread for one or two selected
+  files, with a match/mismatch result shown once both hashes are ready.
+- **Multi-window + taskbar badge** (§11): requires each `eframe`/`egui`
+  window to own its own native HWND (multiple `eframe::run_native` /
+  viewport-per-window rather than the current single-viewport app), then
+  `ITaskbarList3::SetOverlayIcon` via the `windows` crate's COM bindings to
+  paint a colored dot per window in open-order.

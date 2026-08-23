@@ -1,11 +1,30 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
-    List,
+    #[default]
     Details,
+    List,
     Icons,
+}
+
+impl ViewMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ViewMode::Details => "details",
+            ViewMode::List => "list",
+            ViewMode::Icons => "icons",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Self {
+        match raw {
+            "list" => ViewMode::List,
+            "icons" => ViewMode::Icons,
+            _ => ViewMode::Details,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +39,10 @@ pub struct Tab {
     pub selected: HashSet<String>,
     /// Resizable file-table column widths (name, modified, size, archive).
     pub col_widths: [f32; 4],
+    /// Name-filter text for this tab's listing. Per-tab (not shared across
+    /// panes/tabs) and not persisted across sessions — resets to empty on
+    /// navigation, same as the selection.
+    pub filter: String,
 }
 
 pub const DEFAULT_COL_WIDTHS: [f32; 4] = [220.0, 140.0, 90.0, 60.0];
@@ -35,6 +58,7 @@ impl Tab {
             view_mode: ViewMode::Details,
             selected: HashSet::new(),
             col_widths: DEFAULT_COL_WIDTHS,
+            filter: String::new(),
         }
     }
 
@@ -43,6 +67,7 @@ impl Tab {
         self.history_forward.clear();
         self.path = new_path;
         self.clear_selection();
+        self.filter.clear();
     }
 
     pub fn go_back(&mut self) -> bool {
@@ -50,6 +75,7 @@ impl Tab {
             self.history_forward.push(self.path.clone());
             self.path = prev;
             self.clear_selection();
+            self.filter.clear();
             true
         } else {
             false
@@ -61,6 +87,7 @@ impl Tab {
             self.history_back.push(self.path.clone());
             self.path = next;
             self.clear_selection();
+            self.filter.clear();
             true
         } else {
             false
@@ -80,6 +107,14 @@ impl Tab {
 
     pub fn clear_selection(&mut self) {
         self.selected.clear();
+    }
+
+    /// Selects all items in the given range (inclusive) by name.
+    /// Used for Shift+click range selection.
+    pub fn select_range(&mut self, names: &[String]) {
+        for name in names {
+            self.selected.insert(name.clone());
+        }
     }
 }
 
@@ -148,6 +183,17 @@ mod tests {
             tab.selected,
             ["b.txt"].into_iter().map(String::from).collect()
         );
+    }
+
+    #[test]
+    fn filter_is_per_tab_and_clears_on_navigation() {
+        let mut a = Tab::new(PathBuf::from("C:\\a"));
+        let mut b = Tab::new(PathBuf::from("C:\\b"));
+        a.filter = "readme".to_string();
+        assert!(b.filter.is_empty(), "each tab has its own independent filter");
+
+        a.navigate_to(PathBuf::from("C:\\a\\sub"));
+        assert!(a.filter.is_empty(), "navigating clears the stale filter");
     }
 
     #[test]

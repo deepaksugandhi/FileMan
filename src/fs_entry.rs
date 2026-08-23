@@ -67,12 +67,24 @@ pub fn sort_entries(entries: &mut [FsEntry], sort_col: &str, asc: bool) {
 }
 
 /// Lists only the immediate subdirectories of `dir`, sorted by name.
+/// Returns an empty list on errors (e.g. permission denied on network shares)
+/// so the sidebar tree can still render the node even if subdirectories
+/// can't be enumerated.
 pub fn list_subdirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            dirs.push(entry.path());
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(dirs), // graceful degradation
+    };
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                dirs.push(entry.path());
+            }
         }
     }
     dirs.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));

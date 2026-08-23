@@ -25,6 +25,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             active_pane INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS favourites (
+            path TEXT PRIMARY KEY,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
         ",
     )?;
     // Migration for DBs created before sort settings existed. Errors are
@@ -43,6 +47,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE app_state ADD COLUMN theme TEXT NOT NULL DEFAULT 'system'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE app_state ADD COLUMN font_size REAL NOT NULL DEFAULT 14.0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE app_state ADD COLUMN font_family TEXT NOT NULL DEFAULT 'Inter'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE panes ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'details'",
         [],
     );
     Ok(())
@@ -65,6 +81,86 @@ pub fn set_theme(conn: &Connection, theme: &str) -> Result<()> {
         rusqlite::params![theme],
     )?;
     Ok(())
+}
+
+/// Reads the saved font size, if any.
+pub fn get_font_size(conn: &Connection) -> Option<f32> {
+    conn.query_row("SELECT font_size FROM app_state WHERE id = 1", [], |row| {
+        row.get(0)
+    })
+    .ok()
+}
+
+/// Persists the font size preference.
+pub fn set_font_size(conn: &Connection, size: f32) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_state (id, active_pane, theme, font_size, font_family) VALUES (1, 0, 'system', ?1, 'Inter')
+         ON CONFLICT(id) DO UPDATE SET font_size=?1",
+        rusqlite::params![size],
+    )?;
+    Ok(())
+}
+
+/// Reads the saved font family, if any.
+pub fn get_font_family(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT font_family FROM app_state WHERE id = 1", [], |row| {
+        row.get(0)
+    })
+    .ok()
+}
+
+/// Persists the font family preference.
+pub fn set_font_family(conn: &Connection, family: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_state (id, active_pane, theme, font_size, font_family) VALUES (1, 0, 'system', 14.0, ?1)
+         ON CONFLICT(id) DO UPDATE SET font_family=?1",
+        rusqlite::params![family],
+    )?;
+    Ok(())
+}
+
+/// Returns all favourite folder paths, ordered by sort_order.
+pub fn get_favourites(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT path FROM favourites ORDER BY sort_order")
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+}
+
+/// Adds a path to favourites if not already present.
+pub fn add_favourite(conn: &Connection, path: &str) -> Result<()> {
+    let max_order: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM favourites",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR IGNORE INTO favourites (path, sort_order) VALUES (?1, ?2)",
+        rusqlite::params![path, max_order + 1],
+    )?;
+    Ok(())
+}
+
+/// Removes a path from favourites.
+pub fn remove_favourite(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute("DELETE FROM favourites WHERE path = ?1", rusqlite::params![path])?;
+    Ok(())
+}
+
+/// Returns true if the given path is in favourites.
+pub fn is_favourite(conn: &Connection, path: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM favourites WHERE path = ?1",
+        rusqlite::params![path],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
 }
 
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {
