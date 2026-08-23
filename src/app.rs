@@ -122,15 +122,20 @@ impl FileManApp {
             header = header.open(Some(true));
         }
         let response = header.show(ui, |ui| {
-            if is_active {
-                ui.colored_label(egui::Color32::from_rgb(80, 160, 255), "●");
-            }
             if let Ok(subdirs) = crate::fs_entry::list_subdirs(dir) {
                 for subdir in subdirs {
                     self.show_dir_node(ui, &subdir, active_path);
                 }
             }
         });
+        if is_active {
+            let rect = response.header_response.rect;
+            ui.painter().rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_rgba_premultiplied(80, 160, 255, 40),
+            );
+        }
         if response.header_response.clicked() {
             self.panes[self.active_pane]
                 .active_tab_mut()
@@ -156,6 +161,35 @@ impl FileManApp {
         self.clipboard = paths;
         self.clipboard_op = Some(ClipboardOp::Copy);
         self.status = format!("Copied {} item(s)", self.clipboard.len());
+    }
+
+    /// Copies the full path of the selected file/folder to the system clipboard.
+    fn copy_filename(&mut self, ctx: &egui::Context) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.status = "Nothing selected".into();
+            return;
+        }
+        let text = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::set_clipboard_text(ctx, &text);
+        self.status = format!("Copied {} path(s)", paths.len());
+    }
+
+    /// Copies the current folder path to the system clipboard.
+    fn copy_folder_path(&mut self, ctx: &egui::Context) {
+        let dir = self.active_tab_dir();
+        let text = dir.to_string_lossy();
+        Self::set_clipboard_text(ctx, &text);
+        self.status = format!("Copied folder path: {text}");
+    }
+
+    /// Writes text to the OS clipboard via egui's output.
+    fn set_clipboard_text(ctx: &egui::Context, text: &str) {
+        ctx.copy_text(text.to_string());
     }
 
     fn cut_selection(&mut self) {
@@ -346,6 +380,21 @@ impl eframe::App for FileManApp {
                     .clicked()
                 {
                     self.begin_rename();
+                }
+                ui.separator();
+                if ui
+                    .button("Copy Filename")
+                    .on_hover_text("Copy full path of selected file")
+                    .clicked()
+                {
+                    self.copy_filename(&ctx);
+                }
+                if ui
+                    .button("Copy Folder Path")
+                    .on_hover_text("Copy current folder path")
+                    .clicked()
+                {
+                    self.copy_folder_path(&ctx);
                 }
                 ui.separator();
                 if ui
@@ -567,6 +616,8 @@ impl eframe::App for FileManApp {
                                                 .active_tab()
                                                 .selected
                                                 .contains(&entry.name);
+
+                                            row.set_selected(is_selected);
 
                                             row.col(|ui| {
                                                 let resp = ui.selectable_label(
