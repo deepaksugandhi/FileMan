@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf, Prefix};
 
 // ponytail: brute-force A-Z scan (26 stat calls) instead of the
 // GetLogicalDrives Win32 bitmask API — simple and fast enough for a one-shot
@@ -93,6 +93,24 @@ pub fn list_network_servers() -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         Vec::new()
+    }
+}
+
+/// Returns the UNC share root (`\\server\share\`) that `path` lives under,
+/// or `None` if `path` isn't a UNC path. `list_network_servers`'s
+/// network-neighborhood browsing is best-effort and often finds nothing on
+/// modern SMB networks (NetBIOS browsing is deprecated), so a path the user
+/// actually navigated to (e.g. via the address bar) may never appear as a
+/// discovered server. This lets the sidebar tree show/expand to it anyway.
+pub fn unc_share_root(path: &Path) -> Option<PathBuf> {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    match prefix.kind() {
+        Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
+            Some(PathBuf::from(format!("{}\\", prefix.as_os_str().to_string_lossy())))
+        }
+        _ => None,
     }
 }
 

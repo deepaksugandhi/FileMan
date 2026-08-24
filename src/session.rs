@@ -59,6 +59,7 @@ fn parse_col_widths(raw: &str) -> [f32; 4] {
 
 pub fn save_session(
     conn: &Connection,
+    user_id: i64,
     window: &WindowGeometry,
     panes: &[Pane],
     active_pane: usize,
@@ -66,10 +67,11 @@ pub fn save_session(
     let tx = conn.unchecked_transaction()?;
 
     tx.execute(
-        "INSERT INTO window_state (id, width, height, pos_x, pos_y, monitor_name)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(id) DO UPDATE SET width=?1, height=?2, pos_x=?3, pos_y=?4, monitor_name=?5",
+        "INSERT INTO window_state (user_id, width, height, pos_x, pos_y, monitor_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(user_id) DO UPDATE SET width=?2, height=?3, pos_x=?4, pos_y=?5, monitor_name=?6",
         params![
+            user_id,
             window.width,
             window.height,
             window.pos_x,
@@ -78,13 +80,14 @@ pub fn save_session(
         ],
     )?;
 
-    tx.execute("DELETE FROM panes", [])?;
+    tx.execute("DELETE FROM panes WHERE user_id = ?1", params![user_id])?;
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO panes (pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
+                    user_id,
                     pane_idx as i64,
                     tab_idx as i64,
                     tab.path.to_string_lossy(),
@@ -99,20 +102,20 @@ pub fn save_session(
     }
 
     tx.execute(
-        "INSERT INTO app_state (id, active_pane) VALUES (1, ?1)
-         ON CONFLICT(id) DO UPDATE SET active_pane=?1",
-        params![active_pane as i64],
+        "INSERT INTO app_state (user_id, active_pane) VALUES (?1, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET active_pane=?2",
+        params![user_id, active_pane as i64],
     )?;
 
     tx.commit()?;
     Ok(())
 }
 
-pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
+pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSession>> {
     let window = conn
         .query_row(
-            "SELECT width, height, pos_x, pos_y, monitor_name FROM window_state WHERE id = 1",
-            [],
+            "SELECT width, height, pos_x, pos_y, monitor_name FROM window_state WHERE user_id = ?1",
+            params![user_id],
             |row| {
                 Ok(WindowGeometry {
                     width: row.get(0)?,
@@ -127,10 +130,10 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
 
     let mut stmt = conn.prepare(
         "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode
-         FROM panes ORDER BY pane_index, tab_index",
+         FROM panes WHERE user_id = ?1 ORDER BY pane_index, tab_index",
     )?;
     let rows: Vec<(i64, String, bool, String, bool, String, String)> = stmt
-        .query_map([], |row| {
+        .query_map(params![user_id], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -190,8 +193,8 @@ pub fn load_session(conn: &Connection) -> Result<Option<LoadedSession>> {
 
     let active_pane = conn
         .query_row(
-            "SELECT active_pane FROM app_state WHERE id = 1",
-            [],
+            "SELECT active_pane FROM app_state WHERE user_id = ?1",
+            params![user_id],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0) as usize;
@@ -226,9 +229,9 @@ mod tests {
             monitor_name: Some("\\\\.\\DISPLAY1".to_string()),
         };
 
-        save_session(&conn, &window, &[pane0, pane1], 1).unwrap();
+        save_session(&conn, 1, &window, &[pane0, pane1], 1).unwrap();
 
-        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
 
         assert_eq!(loaded.panes.len(), 2);
         assert_eq!(loaded.panes[0].tabs.len(), 2);
@@ -243,7 +246,7 @@ mod tests {
     fn returns_none_when_no_session_saved() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        assert!(load_session(&conn).unwrap().is_none());
+        assert!(load_session(&conn, 1).unwrap().is_none());
     }
 
     #[test]
@@ -257,6 +260,7 @@ mod tests {
 
         save_session(
             &conn,
+            1,
             &WindowGeometry {
                 width: 1000.0,
                 height: 700.0,
@@ -269,7 +273,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
         assert_eq!(loaded.panes[0].tabs[0].sort_col, "size");
         assert!(!loaded.panes[0].tabs[0].sort_asc);
     }
@@ -284,6 +288,7 @@ mod tests {
 
         save_session(
             &conn,
+            1,
             &WindowGeometry {
                 width: 1000.0,
                 height: 700.0,
@@ -296,7 +301,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
         assert_eq!(loaded.panes[0].tabs[0].col_widths, [300.5, 120.0, 80.0, 45.0]);
     }
 
@@ -353,6 +358,38 @@ mod tests {
     }
 
     #[test]
+    fn two_users_sessions_round_trip_without_cross_contamination() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, created_at) VALUES (2, 'Alice', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        // Use real existing directories: load_session resolves a saved path
+        // that no longer exists to its nearest existing ancestor, so a
+        // fictitious path wouldn't round-trip exactly.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let window = WindowGeometry {
+            width: 1000.0,
+            height: 700.0,
+            pos_x: None,
+            pos_y: None,
+            monitor_name: None,
+        };
+        save_session(&conn, 1, &window, &[Pane::new(dir1.path().to_path_buf())], 0).unwrap();
+        save_session(&conn, 2, &window, &[Pane::new(dir2.path().to_path_buf())], 0).unwrap();
+
+        let loaded1 = load_session(&conn, 1).unwrap().expect("user 1 session");
+        let loaded2 = load_session(&conn, 2).unwrap().expect("user 2 session");
+        assert_eq!(loaded1.panes[0].tabs[0].path, dir1.path());
+        assert_eq!(loaded2.panes[0].tabs[0].path, dir2.path());
+    }
+
+    #[test]
     fn load_session_clamps_out_of_range_active_pane() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -361,6 +398,7 @@ mod tests {
         let pane0 = Pane::new(PathBuf::from("C:\\"));
         save_session(
             &conn,
+            1,
             &WindowGeometry {
                 width: 800.0,
                 height: 600.0,
@@ -372,10 +410,10 @@ mod tests {
             0,
         )
         .unwrap();
-        conn.execute("UPDATE app_state SET active_pane = 5 WHERE id = 1", [])
+        conn.execute("UPDATE app_state SET active_pane = 5 WHERE user_id = 1", [])
             .unwrap();
 
-        let loaded = load_session(&conn).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
         assert_eq!(loaded.active_pane, 0); // clamped to the only valid index
     }
 }

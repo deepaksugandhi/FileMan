@@ -1,3 +1,4 @@
+use crate::fs_entry::FsEntry;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -43,6 +44,15 @@ pub struct Tab {
     /// panes/tabs) and not persisted across sessions — resets to empty on
     /// navigation, same as the selection.
     pub filter: String,
+    /// Cached directory listing, refreshed on a background thread. Not
+    /// persisted — reloaded via `listing_dirty` on session restore.
+    pub listing: Vec<FsEntry>,
+    /// True when `listing` is stale (fresh tab, navigation, or an external
+    /// mutation) and needs to be reloaded via a background listing job.
+    pub listing_dirty: bool,
+    /// Set when the last background listing job for this tab's path failed
+    /// (e.g. permission denied). Cleared on the next successful listing.
+    pub listing_error: Option<String>,
 }
 
 pub const DEFAULT_COL_WIDTHS: [f32; 4] = [220.0, 140.0, 90.0, 60.0];
@@ -59,6 +69,9 @@ impl Tab {
             selected: HashSet::new(),
             col_widths: DEFAULT_COL_WIDTHS,
             filter: String::new(),
+            listing: Vec::new(),
+            listing_dirty: true,
+            listing_error: None,
         }
     }
 
@@ -68,6 +81,7 @@ impl Tab {
         self.path = new_path;
         self.clear_selection();
         self.filter.clear();
+        self.listing_dirty = true;
     }
 
     pub fn go_back(&mut self) -> bool {
@@ -76,6 +90,7 @@ impl Tab {
             self.path = prev;
             self.clear_selection();
             self.filter.clear();
+            self.listing_dirty = true;
             true
         } else {
             false
@@ -88,6 +103,7 @@ impl Tab {
             self.path = next;
             self.clear_selection();
             self.filter.clear();
+            self.listing_dirty = true;
             true
         } else {
             false
@@ -188,12 +204,27 @@ mod tests {
     #[test]
     fn filter_is_per_tab_and_clears_on_navigation() {
         let mut a = Tab::new(PathBuf::from("C:\\a"));
-        let mut b = Tab::new(PathBuf::from("C:\\b"));
+        let b = Tab::new(PathBuf::from("C:\\b"));
         a.filter = "readme".to_string();
         assert!(b.filter.is_empty(), "each tab has its own independent filter");
 
         a.navigate_to(PathBuf::from("C:\\a\\sub"));
         assert!(a.filter.is_empty(), "navigating clears the stale filter");
+    }
+
+    #[test]
+    fn listing_dirty_starts_true_and_is_set_by_navigation() {
+        let mut tab = Tab::new(PathBuf::from("C:\\a"));
+        assert!(tab.listing_dirty);
+        tab.listing_dirty = false;
+        tab.navigate_to(PathBuf::from("C:\\a\\b"));
+        assert!(tab.listing_dirty);
+        tab.listing_dirty = false;
+        tab.go_back();
+        assert!(tab.listing_dirty);
+        tab.listing_dirty = false;
+        tab.go_forward();
+        assert!(tab.listing_dirty);
     }
 
     #[test]

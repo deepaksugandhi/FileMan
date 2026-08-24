@@ -1,5 +1,106 @@
 use rusqlite::{Connection, Result};
 
+/// True if `table` already has a column named `column` (used to make each
+/// migration below idempotent — skip it if a previous run already applied
+/// it).
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    names.iter().any(|n| n == column)
+}
+
+/// One-time migration folding `user_id` into each per-user table's primary
+/// key, so two users' rows (e.g. both `pane_index=0,tab_index=0`) don't
+/// collide. All pre-existing data becomes user 1's, matching the seeded
+/// default user. Idempotent via `has_column`.
+fn migrate_to_multi_user(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "window_state", "user_id") {
+        conn.execute_batch(
+            "
+            ALTER TABLE window_state RENAME TO window_state_old;
+            CREATE TABLE window_state (
+                user_id INTEGER PRIMARY KEY,
+                width REAL NOT NULL,
+                height REAL NOT NULL,
+                pos_x REAL,
+                pos_y REAL,
+                monitor_name TEXT
+            );
+            INSERT INTO window_state (user_id, width, height, pos_x, pos_y, monitor_name)
+                SELECT 1, width, height, pos_x, pos_y, monitor_name FROM window_state_old;
+            DROP TABLE window_state_old;
+            ",
+        )?;
+    }
+
+    if !has_column(conn, "panes", "user_id") {
+        conn.execute_batch(
+            "
+            ALTER TABLE panes RENAME TO panes_old;
+            CREATE TABLE panes (
+                user_id INTEGER NOT NULL,
+                pane_index INTEGER NOT NULL,
+                tab_index INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                is_active_tab INTEGER NOT NULL DEFAULT 0,
+                sort_col TEXT NOT NULL DEFAULT 'name',
+                sort_asc INTEGER NOT NULL DEFAULT 1,
+                col_widths TEXT NOT NULL DEFAULT '220 140 90 60',
+                view_mode TEXT NOT NULL DEFAULT 'details',
+                PRIMARY KEY (user_id, pane_index, tab_index)
+            );
+            INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode)
+                SELECT 1, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode FROM panes_old;
+            DROP TABLE panes_old;
+            ",
+        )?;
+    }
+
+    if !has_column(conn, "app_state", "user_id") {
+        conn.execute_batch(
+            "
+            ALTER TABLE app_state RENAME TO app_state_old;
+            CREATE TABLE app_state (
+                user_id INTEGER PRIMARY KEY,
+                active_pane INTEGER NOT NULL DEFAULT 0,
+                theme TEXT NOT NULL DEFAULT 'system',
+                font_size REAL NOT NULL DEFAULT 14.0,
+                font_family TEXT NOT NULL DEFAULT 'Inter',
+                split_ratio REAL NOT NULL DEFAULT 0.5
+            );
+            INSERT INTO app_state (user_id, active_pane, theme, font_size, font_family, split_ratio)
+                SELECT 1, active_pane, theme, font_size, font_family, split_ratio FROM app_state_old;
+            DROP TABLE app_state_old;
+            ",
+        )?;
+    }
+
+    if !has_column(conn, "favourites", "user_id") {
+        conn.execute_batch(
+            "
+            ALTER TABLE favourites RENAME TO favourites_old;
+            CREATE TABLE favourites (
+                user_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, path)
+            );
+            INSERT INTO favourites (user_id, path, sort_order)
+                SELECT 1, path, sort_order FROM favourites_old;
+            DROP TABLE favourites_old;
+            ",
+        )?;
+    }
+
+    Ok(())
+}
+
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -61,102 +162,140 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE panes ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'details'",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE app_state ADD COLUMN split_ratio REAL NOT NULL DEFAULT 0.5",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE app_state ADD COLUMN tree_width REAL NOT NULL DEFAULT 200.0",
+        [],
+    );
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+    migrate_to_multi_user(conn)?;
+    let user_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+    if user_count == 0 {
+        conn.execute(
+            "INSERT INTO users (id, name, created_at, is_default) VALUES (1, 'Default', datetime('now'), 1)",
+            [],
+        )?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS global_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            PRIMARY KEY (user_id, key)
+        );",
+    )?;
+    for (key, value) in [
+        ("theme", "system"),
+        ("font_size", "14.0"),
+        ("font_family", "Inter"),
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO global_settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+    }
+
     Ok(())
 }
 
-/// Reads the saved theme preference ("dark" / "light" / "system"), if any.
-pub fn get_theme(conn: &Connection) -> Option<String> {
-    conn.query_row("SELECT theme FROM app_state WHERE id = 1", [], |row| {
-        row.get(0)
-    })
+/// Reads the saved pane-split ratio (fraction of width given to the left
+/// pane), if any.
+pub fn get_split_ratio(conn: &Connection, user_id: i64) -> Option<f32> {
+    conn.query_row(
+        "SELECT split_ratio FROM app_state WHERE user_id = ?1",
+        rusqlite::params![user_id],
+        |row| row.get(0),
+    )
     .ok()
 }
 
-/// Persists the theme preference, creating the app_state row if it doesn't
-/// exist yet (this can be called before the first session save).
-pub fn set_theme(conn: &Connection, theme: &str) -> Result<()> {
+/// Persists the pane-split ratio, creating the app_state row if needed.
+pub fn set_split_ratio(conn: &Connection, user_id: i64, ratio: f32) -> Result<()> {
     conn.execute(
-        "INSERT INTO app_state (id, active_pane, theme) VALUES (1, 0, ?1)
-         ON CONFLICT(id) DO UPDATE SET theme=?1",
-        rusqlite::params![theme],
+        "INSERT INTO app_state (user_id, active_pane, split_ratio) VALUES (?1, 0, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET split_ratio=?2",
+        rusqlite::params![user_id, ratio],
     )?;
     Ok(())
 }
 
-/// Reads the saved font size, if any.
-pub fn get_font_size(conn: &Connection) -> Option<f32> {
-    conn.query_row("SELECT font_size FROM app_state WHERE id = 1", [], |row| {
-        row.get(0)
-    })
+/// Reads the saved folder-tree panel width, if any.
+pub fn get_tree_width(conn: &Connection, user_id: i64) -> Option<f32> {
+    conn.query_row(
+        "SELECT tree_width FROM app_state WHERE user_id = ?1",
+        rusqlite::params![user_id],
+        |row| row.get(0),
+    )
     .ok()
 }
 
-/// Persists the font size preference.
-pub fn set_font_size(conn: &Connection, size: f32) -> Result<()> {
+/// Persists the folder-tree panel width, creating the app_state row if needed.
+pub fn set_tree_width(conn: &Connection, user_id: i64, width: f32) -> Result<()> {
     conn.execute(
-        "INSERT INTO app_state (id, active_pane, theme, font_size, font_family) VALUES (1, 0, 'system', ?1, 'Inter')
-         ON CONFLICT(id) DO UPDATE SET font_size=?1",
-        rusqlite::params![size],
+        "INSERT INTO app_state (user_id, active_pane, tree_width) VALUES (?1, 0, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET tree_width=?2",
+        rusqlite::params![user_id, width],
     )?;
     Ok(())
 }
 
-/// Reads the saved font family, if any.
-pub fn get_font_family(conn: &Connection) -> Option<String> {
-    conn.query_row("SELECT font_family FROM app_state WHERE id = 1", [], |row| {
-        row.get(0)
-    })
-    .ok()
-}
-
-/// Persists the font family preference.
-pub fn set_font_family(conn: &Connection, family: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO app_state (id, active_pane, theme, font_size, font_family) VALUES (1, 0, 'system', 14.0, ?1)
-         ON CONFLICT(id) DO UPDATE SET font_family=?1",
-        rusqlite::params![family],
-    )?;
-    Ok(())
-}
-
-/// Returns all favourite folder paths, ordered by sort_order.
-pub fn get_favourites(conn: &Connection) -> Vec<String> {
+/// Returns all favourite folder paths for `user_id`, ordered by sort_order.
+pub fn get_favourites(conn: &Connection, user_id: i64) -> Vec<String> {
     let mut stmt = conn
-        .prepare("SELECT path FROM favourites ORDER BY sort_order")
+        .prepare("SELECT path FROM favourites WHERE user_id = ?1 ORDER BY sort_order")
         .unwrap();
-    stmt.query_map([], |row| row.get(0))
+    stmt.query_map(rusqlite::params![user_id], |row| row.get(0))
         .unwrap()
         .filter_map(|r| r.ok())
         .collect()
 }
 
 /// Adds a path to favourites if not already present.
-pub fn add_favourite(conn: &Connection, path: &str) -> Result<()> {
+pub fn add_favourite(conn: &Connection, user_id: i64, path: &str) -> Result<()> {
     let max_order: i64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(sort_order), 0) FROM favourites",
-            [],
+            "SELECT COALESCE(MAX(sort_order), 0) FROM favourites WHERE user_id = ?1",
+            rusqlite::params![user_id],
             |row| row.get(0),
         )
         .unwrap_or(0);
     conn.execute(
-        "INSERT OR IGNORE INTO favourites (path, sort_order) VALUES (?1, ?2)",
-        rusqlite::params![path, max_order + 1],
+        "INSERT OR IGNORE INTO favourites (user_id, path, sort_order) VALUES (?1, ?2, ?3)",
+        rusqlite::params![user_id, path, max_order + 1],
     )?;
     Ok(())
 }
 
 /// Removes a path from favourites.
-pub fn remove_favourite(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute("DELETE FROM favourites WHERE path = ?1", rusqlite::params![path])?;
+pub fn remove_favourite(conn: &Connection, user_id: i64, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM favourites WHERE user_id = ?1 AND path = ?2",
+        rusqlite::params![user_id, path],
+    )?;
     Ok(())
 }
 
 /// Returns true if the given path is in favourites.
-pub fn is_favourite(conn: &Connection, path: &str) -> bool {
+pub fn is_favourite(conn: &Connection, user_id: i64, path: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM favourites WHERE path = ?1",
-        rusqlite::params![path],
+        "SELECT COUNT(*) FROM favourites WHERE user_id = ?1 AND path = ?2",
+        rusqlite::params![user_id, path],
         |row| row.get::<_, i64>(0),
     )
     .unwrap_or(0)
@@ -190,6 +329,7 @@ mod tests {
         assert!(names.contains(&"window_state".to_string()));
         assert!(names.contains(&"panes".to_string()));
         assert!(names.contains(&"app_state".to_string()));
+        assert!(names.contains(&"users".to_string()));
     }
 
     #[test]
@@ -211,18 +351,125 @@ mod tests {
 
         // The new columns must exist and defaults must apply.
         conn.execute(
-            "INSERT INTO panes (pane_index, tab_index, path) VALUES (0, 0, 'C:\\')",
+            "INSERT INTO panes (user_id, pane_index, tab_index, path) VALUES (1, 0, 0, 'C:\\')",
             [],
         )
         .unwrap();
         let (col, asc): (String, i64) = conn
             .query_row(
-                "SELECT sort_col, sort_asc FROM panes WHERE pane_index = 0",
+                "SELECT sort_col, sort_asc FROM panes WHERE user_id = 1 AND pane_index = 0",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(col, "name");
         assert_eq!(asc, 1);
+    }
+
+    #[test]
+    fn init_db_seeds_a_default_user() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (name, is_default): (String, i64) = conn
+            .query_row(
+                "SELECT name, is_default FROM users WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Default");
+        assert_eq!(is_default, 1);
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_single_user_data_to_user_1() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a pre-multi-user DB: create the old (no user_id) schema
+        // and populate it, then run init_db to migrate.
+        conn.execute_batch(
+            "CREATE TABLE window_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                width REAL NOT NULL,
+                height REAL NOT NULL,
+                pos_x REAL,
+                pos_y REAL,
+                monitor_name TEXT
+            );
+            CREATE TABLE panes (
+                pane_index INTEGER NOT NULL,
+                tab_index INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                is_active_tab INTEGER NOT NULL DEFAULT 0,
+                sort_col TEXT NOT NULL DEFAULT 'name',
+                sort_asc INTEGER NOT NULL DEFAULT 1,
+                col_widths TEXT NOT NULL DEFAULT '220 140 90 60',
+                view_mode TEXT NOT NULL DEFAULT 'details',
+                PRIMARY KEY (pane_index, tab_index)
+            );
+            CREATE TABLE app_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                active_pane INTEGER NOT NULL DEFAULT 0,
+                theme TEXT NOT NULL DEFAULT 'system',
+                font_size REAL NOT NULL DEFAULT 14.0,
+                font_family TEXT NOT NULL DEFAULT 'Inter',
+                split_ratio REAL NOT NULL DEFAULT 0.5
+            );
+            CREATE TABLE favourites (
+                path TEXT PRIMARY KEY,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO window_state (id, width, height, pos_x, pos_y, monitor_name)
+                VALUES (1, 1200.0, 800.0, 10.0, 20.0, '\\\\.\\DISPLAY1');
+            INSERT INTO panes (pane_index, tab_index, path) VALUES (0, 0, 'C:\\Users');
+            INSERT INTO app_state (id, active_pane, theme) VALUES (1, 1, 'dark');
+            INSERT INTO favourites (path) VALUES ('D:\\Projects');
+            ",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let width: f32 = conn
+            .query_row("SELECT width FROM window_state WHERE user_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(width, 1200.0);
+        let path: String = conn
+            .query_row("SELECT path FROM panes WHERE user_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(path, "C:\\Users");
+        let theme: String = conn
+            .query_row("SELECT theme FROM app_state WHERE user_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(theme, "dark");
+        let fav: String = conn
+            .query_row("SELECT path FROM favourites WHERE user_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fav, "D:\\Projects");
+    }
+
+    #[test]
+    fn favourites_are_scoped_per_user() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, created_at) VALUES (2, 'Alice', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        add_favourite(&conn, 1, "C:\\one").unwrap();
+        add_favourite(&conn, 2, "C:\\two").unwrap();
+        assert_eq!(get_favourites(&conn, 1), vec!["C:\\one".to_string()]);
+        assert_eq!(get_favourites(&conn, 2), vec!["C:\\two".to_string()]);
+    }
+
+    #[test]
+    fn init_db_seeds_global_setting_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let theme: String = conn
+            .query_row("SELECT value FROM global_settings WHERE key = 'theme'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(theme, "system");
     }
 }

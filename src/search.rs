@@ -11,38 +11,57 @@ pub fn filter_entries(entries: &mut Vec<FsEntry>, query: &str) {
     entries.retain(|e| e.name.to_lowercase().contains(&q));
 }
 
-/// Recursively walks `root` on a background thread, collecting entries whose
-/// names match the query. Returns the results via the provided channel.
+/// Recursively walks `root` on a background thread, sending every entry
+/// whose name matches the query through `tx` as soon as it is found, so the
+/// UI can show results progressively instead of waiting for the whole walk.
+/// The channel closing signals completion.
 pub fn recursive_search(
     root: PathBuf,
     query: String,
-    tx: std::sync::mpsc::Sender<Vec<FsEntry>>,
+    tx: std::sync::mpsc::Sender<FsEntry>,
 ) {
-    let results = walk_recursive(&root, &query);
-    let _ = tx.send(results);
+    walk_recursive(&root, &query, &tx);
 }
 
-fn walk_recursive(dir: &std::path::Path, query: &str) -> Vec<FsEntry> {
-    let mut results = Vec::new();
+fn walk_recursive(dir: &std::path::Path, query: &str, tx: &std::sync::mpsc::Sender<FsEntry>) {
     let q = query.to_lowercase();
     if let Ok(entries) = crate::fs_entry::list_dir(dir) {
-        for entry in &entries {
+        for entry in entries {
             if entry.is_dir {
                 if entry.name.to_lowercase().contains(&q) {
-                    results.push(entry.clone());
+                    let _ = tx.send(entry.clone());
                 }
-                results.extend(walk_recursive(&entry.path, query));
+                walk_recursive(&entry.path, query, tx);
             } else if entry.name.to_lowercase().contains(&q) {
-                results.push(entry.clone());
+                let _ = tx.send(entry);
             }
         }
     }
-    results
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn recursive_search_streams_matching_entries_from_nested_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("needle.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("sub").join("other_needle.log"), b"x").unwrap();
+        std::fs::write(dir.path().join("unrelated.bin"), b"x").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        recursive_search(dir.path().to_path_buf(), "needle".into(), tx);
+
+        let mut names: Vec<String> = Vec::new();
+        while let Ok(entry) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            names.push(entry.name);
+        }
+        names.sort();
+        assert_eq!(names, vec!["needle.txt", "other_needle.log"]);
+    }
 
     fn entry(name: &str, is_dir: bool) -> FsEntry {
         FsEntry {
