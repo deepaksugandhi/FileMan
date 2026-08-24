@@ -5,6 +5,8 @@ mod config;
 mod db;
 mod fs_entry;
 mod fs_ops;
+mod icon_cache;
+mod migrate;
 mod monitor;
 mod pane;
 mod progress;

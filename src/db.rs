@@ -53,10 +53,11 @@ fn migrate_to_multi_user(conn: &Connection) -> Result<()> {
                 sort_asc INTEGER NOT NULL DEFAULT 1,
                 col_widths TEXT NOT NULL DEFAULT '220 140 90 60',
                 view_mode TEXT NOT NULL DEFAULT 'details',
+                locked INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, pane_index, tab_index)
             );
-            INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode)
-                SELECT 1, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode FROM panes_old;
+            INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked)
+                SELECT 1, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked FROM panes_old;
             DROP TABLE panes_old;
             ",
         )?;
@@ -120,6 +121,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             sort_col TEXT NOT NULL DEFAULT 'name',
             sort_asc INTEGER NOT NULL DEFAULT 1,
             col_widths TEXT NOT NULL DEFAULT '220 140 90 60',
+            locked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (pane_index, tab_index)
         );
         CREATE TABLE IF NOT EXISTS app_state (
@@ -160,6 +162,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE panes ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'details'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE panes ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
         [],
     );
     let _ = conn.execute(

@@ -53,6 +53,8 @@ pub struct Tab {
     /// Set when the last background listing job for this tab's path failed
     /// (e.g. permission denied). Cleared on the next successful listing.
     pub listing_error: Option<String>,
+    /// Pinned tabs refuse to close or navigate away from their folder.
+    pub locked: bool,
 }
 
 pub const DEFAULT_COL_WIDTHS: [f32; 4] = [220.0, 140.0, 90.0, 60.0];
@@ -72,7 +74,19 @@ impl Tab {
             listing: Vec::new(),
             listing_dirty: true,
             listing_error: None,
+            locked: false,
         }
+    }
+
+    /// Navigates to `new_path` unless the tab is pinned (`locked`), in which
+    /// case it refuses and returns false. All folder-changing moves (tree,
+    /// address bar, double-click, up/back/forward) funnel through here.
+    pub fn try_navigate(&mut self, new_path: PathBuf) -> bool {
+        if self.locked {
+            return false;
+        }
+        self.navigate_to(new_path);
+        true
     }
 
     pub fn navigate_to(&mut self, new_path: PathBuf) {
@@ -85,6 +99,9 @@ impl Tab {
     }
 
     pub fn go_back(&mut self) -> bool {
+        if self.locked {
+            return false;
+        }
         if let Some(prev) = self.history_back.pop() {
             self.history_forward.push(self.path.clone());
             self.path = prev;
@@ -98,6 +115,9 @@ impl Tab {
     }
 
     pub fn go_forward(&mut self) -> bool {
+        if self.locked {
+            return false;
+        }
         if let Some(next) = self.history_forward.pop() {
             self.history_back.push(self.path.clone());
             self.path = next;
@@ -237,5 +257,28 @@ mod tests {
         tab.select_only("c.txt");
         tab.go_back();
         assert!(tab.selected.is_empty());
+    }
+
+    #[test]
+    fn locked_tab_refuses_navigation_and_history_moves() {
+        let mut tab = Tab::new(PathBuf::from("C:\\a"));
+        tab.navigate_to(PathBuf::from("C:\\b"));
+        tab.locked = true;
+
+        let target = PathBuf::from("C:\\c");
+        assert!(!tab.try_navigate(target.clone()), "locked tab must refuse");
+        assert_eq!(tab.path, PathBuf::from("C:\\b"), "path unchanged");
+
+        assert!(!tab.go_back(), "back blocked while locked");
+        assert!(!tab.go_forward(), "forward blocked while locked");
+        assert_eq!(tab.path, PathBuf::from("C:\\b"));
+        assert_eq!(target, PathBuf::from("C:\\c"));
+    }
+
+    #[test]
+    fn unlocked_tab_navigates_normally() {
+        let mut tab = Tab::new(PathBuf::from("C:\\a"));
+        assert!(tab.try_navigate(PathBuf::from("C:\\b")));
+        assert_eq!(tab.path, PathBuf::from("C:\\b"));
     }
 }

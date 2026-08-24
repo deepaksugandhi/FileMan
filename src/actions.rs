@@ -337,6 +337,12 @@ pub fn add_custom_action(conn: &Connection, user_id: i64, label: &str, exe_path:
     Ok(conn.last_insert_rowid())
 }
 
+/// Removes a custom action by row id.
+pub fn remove_custom_action(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM custom_actions WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
 /// Builds the effective shortcut map for `user_id`: each `Action`'s hardcoded
 /// default, overridden by any global binding, overridden by any per-user
 /// binding.
@@ -524,5 +530,8 @@ mod tests {
         let user2 = list_custom_actions(&conn, 2);
         assert_eq!(user1.len(), 1);
         assert_eq!(user2.len(), 0);
+
+        remove_custom_action(&conn, user1[0].id).unwrap();
+        assert!(list_custom_actions(&conn, 1).is_empty());
     }
 }
