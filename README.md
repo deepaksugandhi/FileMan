@@ -3,6 +3,11 @@
 A dual-pane file manager for Windows, built with Rust + [egui](https://github.com/emilk/egui).
 Restart the app with folder settings & locations from where you left. Multiple user profiles supported. Configure buttons to open files with alternate applications.
 
+## Download
+
+Don't want to build it yourself? Grab the latest Windows installer from the
+[Releases page](https://github.com/deepaksugandhi/FileMan/releases/latest).
+
 ## Requirements
 
 - Windows 8.1+ (x64)
