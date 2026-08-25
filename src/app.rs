@@ -57,6 +57,10 @@ enum Dialog {
     },
     /// Create a new user profile.
     NewUser { name: String },
+    /// Help / user manual.
+    Help,
+    /// Confirm delete: paths ready to be deleted, waiting for user confirmation.
+    ConfirmDelete { paths: Vec<PathBuf> },
 }
 
 pub struct FileManApp {
@@ -298,8 +302,8 @@ fn theme_pref_str(pref: egui::ThemePreference) -> &'static str {
 /// stacked one per line. Persisted per user as `tab_orientation`.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum TabOrientation {
-    #[default]
     Horizontal,
+    #[default]
     Vertical,
 }
 
@@ -327,6 +331,7 @@ enum SettingsPage {
     Shortcuts,
     Toolbar,
     CustomActions,
+    ViewMode,
     Advanced,
 }
 
@@ -571,8 +576,8 @@ impl FileManApp {
     fn dispatch(&mut self, ctx: &egui::Context, action_ref: ActionRef) {
         match action_ref {
             ActionRef::Builtin(action) => match action {
-                Action::Copy => self.copy_selection(),
-                Action::Cut => self.cut_selection(),
+                Action::Copy => self.copy_selection(ctx),
+                Action::Cut => self.cut_selection(ctx),
                 Action::Paste => self.paste_clipboard(),
                 Action::Delete => self.delete_selection(),
                 Action::Rename => self.begin_rename(),
@@ -774,7 +779,7 @@ impl FileManApp {
             .collect()
     }
 
-    fn copy_selection(&mut self) {
+    fn copy_selection(&mut self, ctx: &egui::Context) {
         let paths = self.selected_paths();
         if paths.is_empty() {
             self.status = "Nothing selected".into();
@@ -782,7 +787,24 @@ impl FileManApp {
         }
         self.clipboard = paths;
         self.clipboard_op = Some(ClipboardOp::Copy);
+        self.publish_clipboard_paths(ctx);
         self.status = format!("Copied {} item(s)", self.clipboard.len());
+    }
+
+    /// Publishes the current file clipboard as newline-joined path text on
+    /// the OS clipboard. Two reasons: users can paste the paths into other
+    /// apps, and egui-winit only emits `Event::Paste` (our Ctrl+V trigger)
+    /// when the OS clipboard holds non-empty text — without this, pasting
+    /// after an in-app copy would silently do nothing on an empty OS
+    /// clipboard.
+    fn publish_clipboard_paths(&self, ctx: &egui::Context) {
+        let text = self
+            .clipboard
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::set_clipboard_text(ctx, &text);
     }
 
     /// Copies the full path of the selected file/folder to the system clipboard.
@@ -798,7 +820,7 @@ impl FileManApp {
             .collect::<Vec<_>>()
             .join("\n");
         Self::set_clipboard_text(ctx, &text);
-        self.status = format!("Copied {} path(s)", paths.len());
+        self.status = "File path copied".into();
     }
 
     /// Copies the current folder path to the system clipboard.
@@ -806,7 +828,7 @@ impl FileManApp {
         let dir = self.active_tab_dir();
         let text = dir.to_string_lossy();
         Self::set_clipboard_text(ctx, &text);
-        self.status = format!("Copied folder path: {text}");
+        self.status = "Folder path copied".into();
     }
 
     /// Writes text to the OS clipboard via egui's output.
@@ -814,7 +836,7 @@ impl FileManApp {
         ctx.copy_text(text.to_string());
     }
 
-    fn cut_selection(&mut self) {
+    fn cut_selection(&mut self, ctx: &egui::Context) {
         let paths = self.selected_paths();
         if paths.is_empty() {
             self.status = "Nothing selected".into();
@@ -822,6 +844,7 @@ impl FileManApp {
         }
         self.clipboard = paths;
         self.clipboard_op = Some(ClipboardOp::Cut);
+        self.publish_clipboard_paths(ctx);
         self.status = format!("Cut {} item(s)", self.clipboard.len());
     }
 
@@ -905,12 +928,7 @@ impl FileManApp {
             self.status = "Nothing selected".into();
             return;
         }
-        self.panes[self.active_pane]
-            .active_tab_mut()
-            .clear_selection();
-        self.status = format!("Deleting {} item(s)…", paths.len());
-        self.background_op_dirs = vec![self.active_tab_dir()];
-        self.background_op = Some(progress::delete_to_trash_bg(paths));
+        self.dialog = Some(Dialog::ConfirmDelete { paths });
     }
 
     fn begin_rename(&mut self) {
@@ -1016,14 +1034,16 @@ impl FileManApp {
                     }
                 }
             }
-            Dialog::TabContext { .. } | Dialog::Find { .. } => Ok(String::new()),
+            Dialog::TabContext { .. } | Dialog::Find { .. } | Dialog::Help
+            | Dialog::ConfirmDelete { .. } => Ok(String::new()),
         };
         if result.is_ok() {
             dirty_dir = match &dialog {
                 Dialog::Rename { path, .. } => path.parent().map(|p| p.to_path_buf()),
                 Dialog::NewFolder { .. } | Dialog::NewFile { .. } => Some(parent.clone()),
                 Dialog::DuplicateName { dest_dir, .. } => Some(dest_dir.clone()),
-                Dialog::TabContext { .. } | Dialog::Find { .. } | Dialog::NewUser { .. } => None,
+                Dialog::TabContext { .. } | Dialog::Find { .. } | Dialog::NewUser { .. } | Dialog::Help
+                | Dialog::ConfirmDelete { .. } => None,
             };
         }
         if let Some(dir) = dirty_dir {
@@ -1364,6 +1384,32 @@ impl FileManApp {
         });
     }
 
+    /// Settings page: default listing view mode.
+    fn settings_page_view_mode(&mut self, ui: &mut egui::Ui) {
+        settings_group_label(ui, "Listing Layout");
+        ui.label(egui::RichText::new(
+            "Changes apply to the active tab immediately.",
+        )
+        .weak()
+        .small());
+        ui.add_space(6.0);
+        let current_mode = self.panes[self.active_pane].active_tab().view_mode;
+        ui.horizontal(|ui| {
+            for (label, vm) in [
+                ("Details", ViewMode::Details),
+                ("List", ViewMode::List),
+                ("Icons", ViewMode::Icons),
+            ] {
+                if ui.selectable_label(current_mode == vm, label).clicked()
+                    && current_mode != vm
+                {
+                    self.panes[self.active_pane].active_tab_mut().view_mode = vm;
+                    self.dirty = true;
+                }
+            }
+        });
+    }
+
     /// Settings page: system integration toggles.
     fn settings_page_advanced(&mut self, ui: &mut egui::Ui) {
         settings_group_label(ui, "Default Folder Explorer");
@@ -1513,6 +1559,7 @@ impl FileManApp {
                             (SettingsPage::Shortcuts, "Keyboard Shortcuts"),
                             (SettingsPage::Toolbar, "Toolbar"),
                             (SettingsPage::CustomActions, "Custom Actions"),
+                            (SettingsPage::ViewMode, "View"),
                             (SettingsPage::Advanced, "Advanced"),
                         ] {
                             let selected = self.settings_page == page;
@@ -1593,6 +1640,11 @@ impl FileManApp {
                                             settings_header(ui, "Custom Actions",
                                                 "Open files with your favourite applications.");
                                             self.settings_page_custom_actions(ctx, ui);
+                                        }
+                                        SettingsPage::ViewMode => {
+                                            settings_header(ui, "View",
+                                                "Choose the default listing layout.");
+                                            self.settings_page_view_mode(ui);
                                         }
                                         SettingsPage::Advanced => {
                                             settings_header(ui, "Advanced",
@@ -1982,44 +2034,6 @@ impl FileManApp {
                 });
             });
 
-        // Search/filter field — per-tab, so each pane/tab
-        // filters independently instead of sharing one query.
-        ui.horizontal(|ui| {
-            ui.label("🔍");
-            let tab = pane.active_tab_mut();
-            let filter_active = !tab.filter.is_empty();
-            let accent = ui.visuals().selection.bg_fill;
-            let mut text_edit = egui::TextEdit::singleline(&mut tab.filter)
-                .hint_text("Filter files...")
-                .desired_width(200.0);
-            if filter_active {
-                // Highlight the box while a filter is narrowing the
-                // listing, so it's obvious why entries are missing.
-                text_edit = text_edit
-                    .background_color(accent.gamma_multiply(0.18))
-                    .text_color(ui.visuals().strong_text_color());
-            }
-            let search_resp = ui.add(text_edit);
-            if filter_active {
-                let rect = search_resp.rect.expand(1.0);
-                ui.painter().rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(3),
-                    egui::Stroke::new(1.5, accent),
-                    egui::StrokeKind::Outside,
-                );
-            }
-            if search_resp.changed() {
-                // Clear selection when filter changes
-                tab.clear_selection();
-            }
-            if filter_active {
-                if ui.small_button("✕").on_hover_text("Clear filter").clicked() {
-                    tab.filter.clear();
-                }
-            }
-        });
-
         ui.horizontal(|ui| {
             if ui.button("⬅").on_hover_text("Back").clicked() {
                 if pane.active_tab().locked {
@@ -2046,17 +2060,34 @@ impl FileManApp {
             }
 
             ui.separator();
-            let current_mode = pane.active_tab().view_mode;
-            for (label, vm) in [
-                ("Details", ViewMode::Details),
-                ("List", ViewMode::List),
-                ("Icons", ViewMode::Icons),
-            ] {
-                if ui.selectable_label(current_mode == vm, label).clicked()
-                    && current_mode != vm
-                {
-                    pane.active_tab_mut().view_mode = vm;
-                    self.dirty = true;
+            let tab = pane.active_tab_mut();
+            let filter_active = !tab.filter.is_empty();
+            let accent = ui.visuals().selection.bg_fill;
+            let mut text_edit = egui::TextEdit::singleline(&mut tab.filter)
+                .id(egui::Id::new(("filter_input", pane_idx)))
+                .hint_text("Filter...")
+                .desired_width(160.0);
+            if filter_active {
+                text_edit = text_edit
+                    .background_color(accent.gamma_multiply(0.18))
+                    .text_color(ui.visuals().strong_text_color());
+            }
+            let search_resp = ui.add(text_edit);
+            if filter_active {
+                let rect = search_resp.rect.expand(1.0);
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(3),
+                    egui::Stroke::new(1.5, accent),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if search_resp.changed() {
+                tab.clear_selection();
+            }
+            if filter_active {
+                if ui.small_button(egui::RichText::new("×").color(egui::Color32::from_rgb(196, 43, 28))).on_hover_text("Clear filter").clicked() {
+                    tab.filter.clear();
                 }
             }
         });
@@ -2329,8 +2360,8 @@ impl FileManApp {
                 if let Some(action) = row_action {
                     self.active_pane = pane_idx;
                     match action {
-                        RowAction::Copy => self.copy_selection(),
-                        RowAction::Cut => self.cut_selection(),
+                        RowAction::Copy => self.copy_selection(ctx),
+                        RowAction::Cut => self.cut_selection(ctx),
                         RowAction::Paste => self.paste_clipboard(),
                         RowAction::Rename => self.begin_rename(),
                         RowAction::Delete => self.delete_selection(),
@@ -2375,6 +2406,27 @@ impl FileManApp {
             }
         }
     }
+}
+
+/// egui-winit intercepts Ctrl+C/X/V at the winit layer and converts them
+/// into `Event::Copy`/`Event::Cut`/`Event::Paste` — the underlying
+/// `Event::Key` for C/X/V is never emitted, so `KeyCombo::matches_input`
+/// can never see those presses. Map a clipboard event back to the combo of
+/// the currently-held modifiers plus C/X/V, so the shortcut map (and the
+/// rebind capture) treat them like any other key combination.
+fn clipboard_event_combo(i: &egui::InputState) -> Option<crate::actions::KeyCombo> {
+    let key = i.events.iter().rev().find_map(|e| match e {
+        egui::Event::Copy => Some(egui::Key::C),
+        egui::Event::Cut => Some(egui::Key::X),
+        egui::Event::Paste(_) => Some(egui::Key::V),
+        _ => None,
+    })?;
+    Some(crate::actions::KeyCombo::new(
+        i.modifiers.ctrl,
+        i.modifiers.shift,
+        i.modifiers.alt,
+        key,
+    ))
 }
 
 // ADAPTED for the actually-resolved eframe/egui 0.36.1 API, which differs from
@@ -2529,27 +2581,33 @@ impl eframe::App for FileManApp {
             let cancelled =
                 ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
             let combo = ctx.input(|i| {
-                i.events.iter().rev().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
-                        // Skip egui's synthesized command keys (Ctrl+C also
-                        // arrives as a separate `Key::Copy` event) so the
-                        // actual pressed key gets bound.
-                        let is_synthetic = matches!(
-                            key,
-                            egui::Key::Copy | egui::Key::Cut | egui::Key::Paste
-                        );
-                        if is_synthetic {
-                            None
-                        } else {
-                            Some(crate::actions::KeyCombo::new(
-                                modifiers.ctrl,
-                                modifiers.shift,
-                                modifiers.alt,
-                                *key,
-                            ))
+                // Ctrl+C/X/V never arrive as `Event::Key` — egui-winit
+                // converts them into clipboard events (see
+                // `clipboard_event_combo`) — so check those first,
+                // otherwise those combos could never be (re)bound.
+                clipboard_event_combo(i).or_else(|| {
+                    i.events.iter().rev().find_map(|e| match e {
+                        egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
+                            // `Key::Copy`/`Cut`/`Paste` only arrive from
+                            // dedicated hardware keys here — don't let them
+                            // shadow the actual key being pressed.
+                            let is_synthetic = matches!(
+                                key,
+                                egui::Key::Copy | egui::Key::Cut | egui::Key::Paste
+                            );
+                            if is_synthetic {
+                                None
+                            } else {
+                                Some(crate::actions::KeyCombo::new(
+                                    modifiers.ctrl,
+                                    modifiers.shift,
+                                    modifiers.alt,
+                                    *key,
+                                ))
+                            }
                         }
-                    }
-                    _ => None,
+                        _ => None,
+                    })
                 })
             });
             if cancelled {
@@ -2577,16 +2635,31 @@ impl eframe::App for FileManApp {
 
         // Global shortcuts, driven by the rebindable shortcut map (disabled
         // while a modal dialog is open so typing in the name field doesn't
-        // trigger them, or while capturing a new binding).
+        // trigger them, or while capturing a new binding, or while a text
+        // field has focus so typing doesn't trigger shortcuts).
+        let text_focused = ctx.memory(|m| {
+            m.focused().is_some_and(|id| {
+                id == egui::Id::new(("address_bar", self.active_pane))
+                    || id == egui::Id::new(("filter_input", self.active_pane))
+            })
+        });
         if self.dialog.is_none()
             && self.capturing_shortcut_for.is_none()
-            && !ctx.memory(|m| m.focused().is_some())
+            && !text_focused
         {
             let triggered = ctx.input(|i| {
                 self.shortcut_map
                     .iter()
                     .find(|(combo, _)| combo.matches_input(i))
                     .map(|(_, action)| *action)
+                    // Ctrl+C/X/V arrive as clipboard events, not key events
+                    // (see `clipboard_event_combo`) — resolve them through
+                    // the same map so the defaults and any user rebinds of
+                    // those combos keep working.
+                    .or_else(|| {
+                        clipboard_event_combo(i)
+                            .and_then(|combo| self.shortcut_map.get(&combo).copied())
+                    })
             });
             if let Some(action) = triggered {
                 self.dispatch(&ctx, action);
@@ -2760,6 +2833,13 @@ impl eframe::App for FileManApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
+                        .button("❓ Help")
+                        .on_hover_text("User Manual")
+                        .clicked()
+                    {
+                        self.dialog = Some(Dialog::Help);
+                    }
+                    if ui
                         .button("⚙ Settings")
                         .on_hover_text("Preferences")
                         .clicked()
@@ -2840,9 +2920,18 @@ impl eframe::App for FileManApp {
             }
 
             // Progress modal for background operations
+            let mut dismiss_op = false;
             if let Some(ref mut op) = self.background_op {
                 let still_running = op.poll();
-                let title = "Processing...";
+                let title = if still_running {
+                    "Processing..."
+                } else {
+                    match &op.status {
+                        OpStatus::Completed(_) => "Done",
+                        OpStatus::Failed(_) => "Error",
+                        _ => "Done",
+                    }
+                };
                 let progress_text = format!(
                     "{}/{} files — {}",
                     op.progress.files_done, op.progress.files_total, op.progress.current_file
@@ -2857,6 +2946,7 @@ impl eframe::App for FileManApp {
                     .title_bar(true)
                     .resizable(false)
                     .collapsible(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(&ctx, |ui| {
                         ui.label(&progress_text);
                         ui.add(egui::ProgressBar::new(fraction).animate(still_running));
@@ -2866,14 +2956,33 @@ impl eframe::App for FileManApp {
                                     self.status = msg.clone();
                                 }
                                 OpStatus::Failed(msg) => {
-                                    self.status = msg.clone();
+                                    ui.add_space(6.0);
+                                    ui.label(egui::RichText::new("Error:").strong());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("error_scroll")
+                                        .max_height(120.0)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(msg.as_str())
+                                                        .monospace(),
+                                                )
+                                                .selectable(true),
+                                            );
+                                        });
                                 }
                                 _ => {}
                             }
+                            ui.add_space(4.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    dismiss_op = true;
+                                }
+                            });
                         }
                     });
 
-                if !still_running {
+                if dismiss_op {
                     self.background_op = None;
                     self.dirty = true;
                     for dir in std::mem::take(&mut self.background_op_dirs) {
@@ -3196,8 +3305,105 @@ impl eframe::App for FileManApp {
                         ctx.request_repaint();
                     }
                 }
+                let is_help = matches!(&self.dialog, Some(Dialog::Help));
+                let is_confirm_delete = matches!(&self.dialog, Some(Dialog::ConfirmDelete { .. }));
+                if is_help {
+                    let mut close = false;
+                    // Handle Esc key to close.
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                    let avail = ctx.input(|i| i.viewport_rect());
+                    let size = egui::vec2(
+                        (avail.width() * 0.65).clamp(420.0, 720.0),
+                        (avail.height() * 0.78).clamp(360.0, 680.0),
+                    );
+                    egui::Window::new("Help")
+                        .id(egui::Id::new("help_window"))
+                        .title_bar(true)
+                        .resizable(true)
+                        .collapsible(false)
+                        .fixed_size(size)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(&ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("help_scroll")
+                                .auto_shrink(false)
+                                .show(ui, |ui| {
+                                    help_content(ui);
+                                });
+                            ui.separator();
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    if close {
+                        self.dialog = None;
+                    }
+                }
+                if is_confirm_delete {
+                    let mut close = false;
+                    let mut confirm = false;
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                    let count = if let Some(Dialog::ConfirmDelete { paths }) = &self.dialog {
+                        paths.len()
+                    } else {
+                        0
+                    };
+                    egui::Window::new("Confirm Delete")
+                        .id(egui::Id::new("confirm_delete_window"))
+                        .title_bar(true)
+                        .resizable(false)
+                        .collapsible(false)
+                        .fixed_size(egui::vec2(380.0, 0.0))
+                        // Modal-style placement: pinned to the screen centre
+                        // rather than egui's cascading default position.
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(&ctx, |ui| {
+                            ui.label(format!(
+                                "Are you sure you want to delete {count} item(s)?"
+                            ));
+                            ui.add_space(8.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    close = true;
+                                }
+                                let delete_resp = ui.button("Delete");
+                                if delete_resp.clicked() {
+                                    confirm = true;
+                                }
+                                // Default focus on the affirmative button so
+                                // Enter/Space confirm immediately (Esc still
+                                // cancels). Seed it only while nothing holds
+                                // focus, so Tab away stays respected.
+                                if ctx.memory(|m| m.focused().is_none()) {
+                                    delete_resp.request_focus();
+                                }
+                            });
+                        });
+                    if confirm {
+                        if let Some(Dialog::ConfirmDelete { paths }) = self.dialog.take() {
+                            self.panes[self.active_pane]
+                                .active_tab_mut()
+                                .clear_selection();
+                            self.status = format!("Deleting {} item(s)…", paths.len());
+                            self.background_op_dirs = vec![self.active_tab_dir()];
+                            self.background_op =
+                                Some(progress::delete_to_trash_bg(paths));
+                        }
+                    } else if close {
+                        self.dialog = None;
+                    }
+                }
                 let is_find = matches!(&self.dialog, Some(Dialog::Find { .. }));
-                if self.dialog.is_some() && !find_close && !is_find {
+                if self.dialog.is_some() && !find_close && !is_find && !is_help && !is_confirm_delete {
                     let mut commit = false;
                     let mut cancel = false;
                     if let Some(dialog) = &mut self.dialog {
@@ -3216,25 +3422,37 @@ impl eframe::App for FileManApp {
                                 ("Duplicate Name", suggested)
                             }
                             Dialog::NewUser { name } => ("New User", name),
-                            Dialog::Find { .. } | Dialog::TabContext { .. } => unreachable!(),
+                            Dialog::Find { .. } | Dialog::TabContext { .. } | Dialog::Help
+                            | Dialog::ConfirmDelete { .. } => unreachable!(),
                         };
-                        egui::Window::new(title).show(&ctx, |ui| {
-                            if let Some(ref label) = src_label {
-                                ui.label(label.as_str());
-                            }
-                            let edit = ui.text_edit_singleline(name);
-                            edit.request_focus();
-                            commit = edit.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            ui.horizontal(|ui| {
-                                if ui.button("OK").clicked() {
-                                    commit = true;
+                        egui::Window::new(title)
+                            // Modal-style placement: pinned to screen centre.
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(&ctx, |ui| {
+                                if let Some(ref label) = src_label {
+                                    ui.label(label.as_str());
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    cancel = true;
+                                let edit = ui.text_edit_singleline(name);
+                                // Default keyboard focus goes to the input
+                                // box — but seed it ONLY while nothing else
+                                // holds focus (i.e. on open). Re-requesting
+                                // every frame would fight egui's own Tab
+                                // navigation and focus could never reach
+                                // the OK/Cancel buttons.
+                                if ctx.memory(|m| m.focused().is_none()) {
+                                    edit.request_focus();
                                 }
+                                commit = edit.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                ui.horizontal(|ui| {
+                                    if ui.button("OK").clicked() {
+                                        commit = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        cancel = true;
+                                    }
+                                });
                             });
-                        });
                     }
                     if cancel {
                         self.dialog = None;
@@ -3338,15 +3556,15 @@ impl eframe::App for FileManApp {
                 let dark = ui.visuals().dark_mode;
                 let (fill, stroke, text) = if dark {
                     (
-                        egui::Color32::from_rgba_premultiplied(48, 48, 48, 242),
-                        egui::Color32::from_rgb(76, 194, 255),
-                        egui::Color32::from_rgb(240, 240, 240),
+                        egui::Color32::from_rgba_premultiplied(180, 50, 50, 242),
+                        egui::Color32::from_rgb(255, 120, 120),
+                        egui::Color32::from_rgb(255, 220, 220),
                     )
                 } else {
                     (
-                        egui::Color32::from_rgba_premultiplied(250, 250, 250, 248),
-                        egui::Color32::from_rgb(0, 120, 212),
-                        egui::Color32::BLACK,
+                        egui::Color32::from_rgba_premultiplied(255, 220, 220, 248),
+                        egui::Color32::from_rgb(200, 60, 60),
+                        egui::Color32::from_rgb(120, 0, 0),
                     )
                 };
                 let font =
@@ -3483,6 +3701,20 @@ fn paint_nav_icon(
                 p(0.72, 0.02),
             ];
             painter.add(egui::Shape::line(pts.to_vec(), stroke));
+        }
+        SettingsPage::ViewMode => {
+            // Three horizontal lines (list layout icon).
+            for (i, w) in [1.0f32, 0.75, 0.5].into_iter().enumerate() {
+                let y = r.top() + 3.0 + i as f32 * 4.6;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(r.left() + 2.0, y),
+                        egui::vec2((r.width() - 4.0) * w, 2.6),
+                    ),
+                    1.2,
+                    color,
+                );
+            }
         }
         SettingsPage::Advanced => {
             // Gear: ring + teeth stubs + hub.
@@ -4013,6 +4245,67 @@ fn show_entry_context_menu(
             ui.close();
         }
     }
+}
+
+fn help_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(text).strong().heading());
+    ui.add_space(2.0);
+}
+
+fn help_content(ui: &mut egui::Ui) {
+    let w = |ui: &mut egui::Ui, text: &str| {
+        ui.label(egui::RichText::new(text).weak());
+    };
+
+    help_heading(ui, "Getting Started");
+    w(ui, "FileMan is a dual-pane file manager. The left panel shows a folder tree with your Favourites at the top. The center area has two independent file browsers, each with tabs, an address bar, a filter, and navigation buttons.");
+    ui.add_space(4.0);
+    w(ui, "Switch users via the dropdown in the top-right corner. Each user has independent settings, favourites, toolbar layout, and shortcuts.");
+
+    help_heading(ui, "Navigation");
+    w(ui, "Address Bar — type a path and press Enter to navigate directly.");
+    w(ui, "Back (Alt+Left) — return to the previous folder.");
+    w(ui, "Forward (Alt+Right) — go forward after going back.");
+    w(ui, "Up (Backspace) — go to the parent folder.");
+    w(ui, "Tabs — each pane supports multiple tabs. Open a new tab with + Tab, or close one with the x on hover. Pinned tabs resist accidental navigation.");
+
+    help_heading(ui, "View Modes");
+    w(ui, "Switch between layouts via Settings > View:");
+    w(ui, "  Details — columns for name, date, type, size. Click headers to sort.");
+    w(ui, "  List — compact single-column list.");
+    w(ui, "  Icons — large icon grid for image-heavy folders.");
+    w(ui, "The filter box (next to the Up button) narrows visible files by name. Click the red x to clear.");
+
+    help_heading(ui, "File Operations");
+    w(ui, "Toolbar buttons provide quick access to Copy (Ctrl+C), Cut (Ctrl+X), Paste (Ctrl+V), Delete (Del), Rename (F2), New Folder, New File, Find (Ctrl+F), and Refresh (F5).");
+    w(ui, "Right-click any file or folder for the context menu with additional options: Extract, Copy Filename, Copy Folder Path, Open With, Open in Windows Explorer, and Add to Favourites.");
+
+    help_heading(ui, "Favourites");
+    w(ui, "Right-click a folder and select Add to Favourites to pin it to the Folder Tree. Right-click a favourite to remove it.");
+
+    help_heading(ui, "Custom Actions");
+    w(ui, "Custom actions let you open files with any application. Go to Settings > Custom Actions to add one. Each action shows as an icon button on the second toolbar row.");
+
+    help_heading(ui, "Settings");
+    w(ui, "Appearance — theme (Light/Dark), font family, font size, tab layout (horizontal/vertical).");
+    w(ui, "Keyboard Shortcuts — click Rebind next to any action, then press the new key combination.");
+    w(ui, "Toolbar — reorder or toggle which buttons appear on the main row.");
+    w(ui, "View — choose the default listing layout (Details, List, or Icons).");
+    w(ui, "Advanced — set FileMan as the default folder explorer, or export/import all settings via JSON.");
+
+    help_heading(ui, "Keyboard Shortcuts");
+    w(ui, "Ctrl+C Copy | Ctrl+X Cut | Ctrl+V Paste | Ctrl+F Find");
+    w(ui, "F2 Rename | F3 Copy Filename | F4 Copy Folder Path | F5 Refresh");
+    w(ui, "Backspace Go Up | Delete Delete | Alt+Left Back | Alt+Right Forward");
+    w(ui, "Enter Confirm | Escape Cancel / Close dialog");
+
+    help_heading(ui, "Tips");
+    w(ui, "- Pinned tabs won't navigate away when you double-click a folder.");
+    w(ui, "- The filter is per-tab, so each pane filters independently.");
+    w(ui, "- Drag the pane divider to resize left/right panes.");
+    w(ui, "- Press Esc to close any dialog including this Help window.");
+    w(ui, "- Use Export/Import in Advanced settings to transfer your setup to another machine.");
 }
 
 #[cfg(test)]

@@ -234,6 +234,7 @@ pub fn delete_to_trash_bg(paths: Vec<PathBuf>) -> BackgroundOp {
 
     thread::spawn(move || {
         let mut errors = Vec::new();
+        let mut permanent_count = 0u64;
         for (i, path) in paths.iter().enumerate() {
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let _ = progress_tx.send(ProgressUpdate {
@@ -241,8 +242,19 @@ pub fn delete_to_trash_bg(paths: Vec<PathBuf>) -> BackgroundOp {
                 files_total: total,
                 current_file: name,
             });
-            if let Err(e) = trash::delete(path) {
-                errors.push(format!("{}: {e}", path.display()));
+            match trash::delete(path) {
+                Ok(()) => {}
+                Err(_) => {
+                    // Fallback to permanent delete (network/UNC paths, etc.)
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {
+                            permanent_count += 1;
+                        }
+                        Err(e) => {
+                            errors.push(format!("{}: {e}", path.display()));
+                        }
+                    }
+                }
             }
         }
         let _ = progress_tx.send(ProgressUpdate {
@@ -251,7 +263,13 @@ pub fn delete_to_trash_bg(paths: Vec<PathBuf>) -> BackgroundOp {
             current_file: String::new(),
         });
         let _ = status_tx.send(if errors.is_empty() {
-            OpStatus::Completed("Sent to Recycle Bin".into())
+            if permanent_count > 0 {
+                OpStatus::Completed(format!(
+                    "Deleted {permanent_count} item(s) permanently (network drive)"
+                ))
+            } else {
+                OpStatus::Completed("Sent to Recycle Bin".into())
+            }
         } else {
             OpStatus::Failed(errors.join("\n"))
         });

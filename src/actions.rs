@@ -186,6 +186,9 @@ impl Action {
             Action::Refresh => Some(KeyCombo::plain(egui::Key::F5)),
             Action::GoUp => Some(KeyCombo::plain(egui::Key::Backspace)),
             Action::Rename => Some(KeyCombo::plain(egui::Key::F2)),
+            Action::CopyFilename => Some(KeyCombo::plain(egui::Key::F3)),
+            Action::CopyFolderPath => Some(KeyCombo::plain(egui::Key::F4)),
+            Action::Delete => Some(KeyCombo::plain(egui::Key::Delete)),
             _ => None,
         }
     }
