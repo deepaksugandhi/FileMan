@@ -10,6 +10,7 @@ mod fs_ops;
 mod icon_cache;
 mod migrate;
 mod monitor;
+mod native_drag;
 mod pane;
 mod progress;
 mod search;
@@ -34,6 +35,10 @@ fn main() -> eframe::Result<()> {
     // Must happen before the window is created so Windows doesn't group this
     // instance's taskbar button with other running instances (see taskbar.rs).
     let instance_slot = taskbar::claim_instance_slot_and_set_identity();
+
+    // OLE on the main thread: required before a drag can be handed to other
+    // applications (see native_drag.rs). Cheap no-op when already up.
+    native_drag::init_ole();
 
     let conn = db::open_db(&db_path()).expect("failed to open database");
     let user_id = user::default_user_id(&conn);

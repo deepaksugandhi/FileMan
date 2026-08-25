@@ -1281,6 +1281,7 @@ dependencies = [
  "tempfile",
  "trash",
  "windows 0.61.3",
+ "windows-core 0.61.2",
  "winreg",
  "winresource",
  "zip",

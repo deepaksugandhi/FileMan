@@ -197,6 +197,29 @@ pub struct FileManApp {
     /// the filesystem (`read_dir`) on every single repaint. Invalidated via
     /// `mark_dir_dirty`.
     tree_subdirs_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    /// True while mouse capture is held for an in-progress internal file
+    /// drag (so pointer coordinates keep flowing once the cursor leaves the
+    /// window and the OS hand-off can be detected).
+    dnd_capture_active: bool,
+}
+
+/// Resolves the raw HWND of the app window. `None` on non-Windows or if the
+/// handle lookup fails.
+fn window_hwnd(frame: &eframe::Frame) -> Option<windows::Win32::Foundation::HWND> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let handle = frame.window_handle().ok()?;
+        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+            return Some(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = frame;
+        None
+    }
 }
 
 /// Resolves the device name of the monitor the window currently sits on, via
@@ -519,6 +542,7 @@ impl FileManApp {
             dnd_pane_rects: [None, None],
             dnd_tab_rects: Vec::new(),
             tree_subdirs_cache: HashMap::new(),
+            dnd_capture_active: false,
         }
     }
 
@@ -1041,15 +1065,48 @@ impl FileManApp {
     /// pointer gets drop-target feedback; on release the dragged items are
     /// copied into the target pane's active folder — or MOVED when Shift is
     /// held. Releasing outside any pane (or pressing Escape) cancels.
-    fn process_file_drag_drop(&mut self, ctx: &egui::Context) {
-        let Some(payload) = egui::DragAndDrop::payload::<DragFiles>(ctx).map(|p| (*p).clone())
-        else {
+    ///
+    /// While a drag is in flight this method holds Win32 mouse capture, so
+    /// pointer coordinates keep arriving after the cursor leaves the window —
+    /// without that, the exit can't be detected and the OS hand-off (drag
+    /// out to other applications) never fires.
+    fn process_file_drag_drop(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let payload_opt = egui::DragAndDrop::payload::<DragFiles>(ctx).map(|p| (*p).clone());
+        if payload_opt.is_none() {
+            // No drag in flight: make sure a stale capture isn't held over.
+            self.release_dnd_capture();
             return;
-        };
-        let (pos, released, shift) = ctx.input(|i| {
-            (i.pointer.interact_pos(), i.pointer.primary_released(), i.modifiers.shift)
-        });
+        }
+        let payload = payload_opt.unwrap();
+        if !self.dnd_capture_active {
+            self.set_dnd_capture(window_hwnd(frame));
+        }
+        let (released, shift) = ctx.input(|i| (i.pointer.primary_released(), i.modifiers.shift));
+        // egui's own pointer position goes stale/None the instant the cursor
+        // crosses the window edge (winit fires CursorLeft -> Event::PointerGone,
+        // which egui reacts to by dropping pointer tracking) — exactly the
+        // moment this method needs an accurate position to detect the exit.
+        // `GetCursorPos` sidesteps that, same as `native_cursor_pos`'s other
+        // caller below for the inbound-drop case.
+        let pos = native_cursor_pos(frame, ctx)
+            .or_else(|| ctx.input(|i| i.pointer.interact_pos()));
         let Some(pos) = pos else { return };
+
+        // Pointer left the window while still holding the dragged items:
+        // hand the drag to Windows so other applications (chat, mail,
+        // Explorer…) can accept it as a real CF_HDROP drop. This call BLOCKS
+        // in OLE's nested loop until the drop resolves.
+        if !released {
+            let screen = ctx.input(|i| i.viewport_rect());
+            if !screen.contains(pos) {
+                self.release_dnd_capture();
+                egui::DragAndDrop::clear_payload(ctx);
+                ctx.set_cursor_icon(egui::CursorIcon::Default);
+                self.finish_drag_out(&payload.paths);
+                ctx.request_repaint();
+                return;
+            }
+        }
 
         // Hovering a tab header opens that tab immediately, so the user can
         // finish the drop inside the tab that just came to the front.
@@ -1095,8 +1152,10 @@ impl FileManApp {
         }
 
         // Release: transfer into the target pane's active folder — or cancel
-        // when dropped outside every pane. (The plugin clears the payload at
-        // end-of-pass anyway; clearing here keeps things explicit.)
+        // when dropped inside the window but outside every pane. (The plugin
+        // clears the payload at end-of-pass anyway; clearing here keeps
+        // things explicit.)
+        self.release_dnd_capture();
         egui::DragAndDrop::clear_payload(ctx);
         let Some(target_pane) = target_pane else { return };
         let dest = self.panes[target_pane].active_tab().path.clone();
@@ -1111,6 +1170,75 @@ impl FileManApp {
         // The dragged items left the source folder: forget its selection.
         if let Some(src_pane) = self.panes.get_mut(payload.from_pane) {
             src_pane.active_tab_mut().clear_selection();
+        }
+    }
+
+    /// Grabs Win32 mouse capture for an in-progress internal drag so motion
+    /// events keep arriving beyond the window edge (see
+    /// `process_file_drag_drop`).
+    #[cfg(windows)]
+    fn set_dnd_capture(&mut self, hwnd: Option<windows::Win32::Foundation::HWND>) {
+        if let Some(hwnd) = hwnd {
+            unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+            }
+            self.dnd_capture_active = true;
+        }
+    }
+
+    /// Releases the capture taken by `set_dnd_capture`.
+    #[cfg(windows)]
+    fn release_dnd_capture(&mut self) {
+        if self.dnd_capture_active {
+            unsafe {
+                // Failure is fine: capture is auto-released when the window
+                // loses it (alt-tab, another SetCapture).
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+            }
+            self.dnd_capture_active = false;
+        }
+    }
+
+    /// Non-Windows no-ops for the capture pair.
+    #[cfg(not(windows))]
+    fn set_dnd_capture(&mut self, _hwnd: Option<()>) {
+        self.dnd_capture_active = true;
+    }
+
+    #[cfg(not(windows))]
+    fn release_dnd_capture(&mut self) {
+        self.dnd_capture_active = false;
+    }
+
+    /// Resolves an OS-level drag-out (see `native_drag`): refreshes listings
+    /// and reports the result. A target that requested MOVE deletes the
+    /// sources (to the Recycle Bin), matching Explorer's drag semantics.
+    fn finish_drag_out(&mut self, paths: &[PathBuf]) {
+        match crate::native_drag::start_drag_out(paths) {
+            crate::native_drag::DragOutOutcome::Dropped { moved } => {
+                if moved {
+                    let parents: Vec<PathBuf> = paths
+                        .iter()
+                        .filter_map(|p| p.parent().map(|x| x.to_path_buf()))
+                        .collect();
+                    match crate::fs_ops::delete_to_trash(paths) {
+                        Ok(()) => {
+                            for dir in parents {
+                                self.mark_dir_dirty(&dir);
+                            }
+                            self.status =
+                                format!("Moved {} item(s) out of FileMan", paths.len());
+                        }
+                        Err(e) => self.status = format!("Drop move failed: {e}"),
+                    }
+                } else {
+                    self.status = format!("Copied {} item(s) to another application", paths.len());
+                }
+            }
+            crate::native_drag::DragOutOutcome::Cancelled => {}
+            crate::native_drag::DragOutOutcome::Failed(e) => {
+                self.status = format!("Drag failed: {e}");
+            }
         }
     }
 
@@ -4166,7 +4294,7 @@ impl eframe::App for FileManApp {
         // In-flight file drag & drop: tab-opening, drop-target feedback and
         // the actual copy/move on release. Runs after the panes have laid
         // out so this frame's rects are current.
-        self.process_file_drag_drop(&ctx);
+        self.process_file_drag_drop(&ctx, frame);
         self.process_external_file_drop(&ctx, frame);
 
         // Toast notifications: whenever the status message changes, surface
