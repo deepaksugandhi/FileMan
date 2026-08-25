@@ -363,7 +363,12 @@ pub fn load_shortcut_map(conn: &Connection, user_id: i64) -> HashMap<KeyCombo, A
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
             for (combo_str, action_id) in rows {
-                if let (Some(combo), Some(action)) = (KeyCombo::parse(&combo_str), ActionRef::from_id(&action_id)) {
+                let Some(combo) = KeyCombo::parse(&combo_str) else { continue };
+                if action_id == UNBOUND_SENTINEL {
+                    // Explicitly cleared — overrides the hardcoded default
+                    // (or a global binding) for this combo.
+                    map.remove(&combo);
+                } else if let Some(action) = ActionRef::from_id(&action_id) {
                     map.insert(combo, action);
                 }
             }
@@ -397,6 +402,22 @@ pub fn set_binding(conn: &Connection, scope: Scope, combo: KeyCombo, action: Act
         rusqlite::params![scope_key, combo_str, action.to_id()],
     )?;
     Ok(None)
+}
+
+/// Sentinel `action_id` marking a combo as explicitly unbound — distinct from
+/// simply having no row, which would let a hardcoded default (or a broader
+/// scope's binding) keep applying.
+const UNBOUND_SENTINEL: &str = "none";
+
+/// Clears whatever is bound to `combo` at `scope` (default or explicit),
+/// so it no longer triggers any action.
+pub fn clear_binding(conn: &Connection, scope: Scope, combo: KeyCombo) -> Result<()> {
+    conn.execute(
+        "INSERT INTO bindings (scope, key_combo, action_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT(scope, key_combo) DO UPDATE SET action_id=?3",
+        rusqlite::params![scope.to_key(), combo.to_string(), UNBOUND_SENTINEL],
+    )?;
+    Ok(())
 }
 
 /// Reads the toolbar layout for `scope`, ordered by position.

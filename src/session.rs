@@ -168,6 +168,7 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
             tabs: Vec::new(),
             active_tab: 0,
             address_bar: String::new(),
+            address_edit_mode: false,
         });
         let resolved_path = nearest_existing_ancestor(&PathBuf::from(path));
         let mut tab = Tab::new(resolved_path);

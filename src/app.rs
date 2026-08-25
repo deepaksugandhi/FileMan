@@ -3,7 +3,6 @@ use crate::archive;
 use crate::fs_ops::{self, ClipboardOp};
 use crate::pane::Pane;
 use crate::progress::{self, BackgroundOp, OpStatus};
-use crate::search;
 use crate::session::{self, WindowGeometry};
 use crate::tab::ViewMode;
 use crate::tree;
@@ -192,6 +191,12 @@ pub struct FileManApp {
     /// Tab-header rects captured during rendering — `((pane, tab), rect,
     /// is_active)` — so a dragged item hovering an inactive tab can open it.
     dnd_tab_rects: Vec<((usize, usize), egui::Rect, bool)>,
+    /// Subdirectory listing for each expanded sidebar-tree folder, keyed by
+    /// path. `CollapsingHeader::show` re-runs its body closure every frame a
+    /// node is open, so without this cache an expanded branch would re-hit
+    /// the filesystem (`read_dir`) on every single repaint. Invalidated via
+    /// `mark_dir_dirty`.
+    tree_subdirs_cache: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 /// Resolves the device name of the monitor the window currently sits on, via
@@ -513,6 +518,7 @@ impl FileManApp {
             tips: crate::tips::TipsCard::new(),
             dnd_pane_rects: [None, None],
             dnd_tab_rects: Vec::new(),
+            tree_subdirs_cache: HashMap::new(),
         }
     }
 
@@ -533,6 +539,7 @@ impl FileManApp {
                         Ok(entries) => {
                             tab.listing = entries;
                             tab.listing_error = None;
+                            tab.listing_version += 1;
                         }
                         Err(e) => tab.listing_error = Some(e.to_string()),
                     }
@@ -563,6 +570,7 @@ impl FileManApp {
                 }
             }
         }
+        self.tree_subdirs_cache.remove(dir);
     }
 
     // ponytail: writes on every state-changing action rather than debouncing
@@ -704,9 +712,11 @@ impl FileManApp {
                     self.dirty = true;
                 }
                 Action::Refresh => {
+                    let dir = self.active_tab_dir();
                     self.panes[self.active_pane]
                         .active_tab_mut()
                         .listing_dirty = true;
+                    self.tree_subdirs_cache.remove(&dir);
                 }
                 Action::Find => {
                     let search_path = self.active_tab_dir();
@@ -819,10 +829,13 @@ impl FileManApp {
             header = header.open(Some(false));
         }
         let response = header.show(ui, |ui| {
-            if let Ok(subdirs) = crate::fs_entry::list_subdirs(dir) {
-                for subdir in subdirs {
-                    self.show_dir_node(ui, &subdir, active_path, force_expand);
-                }
+            let subdirs = self
+                .tree_subdirs_cache
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| crate::fs_entry::list_subdirs(dir).unwrap_or_default())
+                .clone();
+            for subdir in subdirs {
+                self.show_dir_node(ui, &subdir, active_path, force_expand);
             }
         });
         if is_active {
@@ -897,6 +910,24 @@ impl FileManApp {
             .join("\n");
         Self::set_clipboard_text(ctx, &text);
         self.status = "File path copied".into();
+    }
+
+    /// Builds the breadcrumb trail for `path`: each ancestor from the root
+    /// down to `path` itself, paired with its display label (folder/drive
+    /// name), for rendering as clickable navigation segments.
+    fn path_breadcrumbs(path: &Path) -> Vec<(String, PathBuf)> {
+        let mut ancestors: Vec<&Path> = path.ancestors().collect();
+        ancestors.reverse();
+        ancestors
+            .into_iter()
+            .map(|anc| {
+                let label = anc
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| anc.display().to_string());
+                (label, anc.to_path_buf())
+            })
+            .collect()
     }
 
     /// Copies the current folder path to the system clipboard.
@@ -1445,23 +1476,39 @@ impl FileManApp {
         );
         ui.add_space(8.0);
         egui::Grid::new("shortcuts_grid")
-            .num_columns(3)
+            .num_columns(4)
             .spacing([16.0, 5.0])
             .striped(true)
             .show(ui, |ui| {
                 for action in Action::ALL {
-                    let combo = self
+                    let combo_opt = self
                         .shortcut_map
                         .iter()
                         .find(|(_, a)| **a == ActionRef::Builtin(action))
-                        .map(|(c, _)| c.to_string())
+                        .map(|(c, _)| *c);
+                    let combo_label = combo_opt
+                        .map(|c| c.to_string())
                         .unwrap_or_else(|| "(none)".to_string());
                     ui.label(action.label());
-                    ui.label(egui::RichText::new(&combo).weak());
+                    ui.label(egui::RichText::new(&combo_label).weak());
                     let capturing = self.capturing_shortcut_for == Some(action);
                     let rebind_label = if capturing { "Press a key…" } else { "Rebind" };
                     if ui.button(rebind_label).clicked() {
                         self.capturing_shortcut_for = Some(action);
+                    }
+                    if let Some(combo) = combo_opt {
+                        if ui.button("Clear").clicked() {
+                            let _ = crate::actions::clear_binding(
+                                &self.conn,
+                                crate::actions::Scope::User(self.current_user_id),
+                                combo,
+                            );
+                            self.shortcut_map =
+                                crate::actions::load_shortcut_map(&self.conn, self.current_user_id);
+                            self.status = format!("Cleared shortcut for {}", action.label());
+                        }
+                    } else {
+                        ui.label("");
                     }
                     ui.end_row();
                 }
@@ -2296,7 +2343,9 @@ impl FileManApp {
                 }
             }
         }
-        // Explorer-style framed address field.
+        // Explorer-style framed address field: a clickable breadcrumb trail
+        // by default, switching to a typeable path box (via the folder icon)
+        // for manually entering a path.
         egui::Frame::new()
             .fill(ui.visuals().window_fill())
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -2304,39 +2353,128 @@ impl FileManApp {
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("📁");
-                    let address_id = egui::Id::new(("address_bar", pane_idx));
-                    let address_resp = ui.add(
-                        egui::TextEdit::singleline(&mut pane.address_bar)
-                            .id(address_id)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Type a path and press Enter...")
-                            .frame(
-                                egui::Frame::new()
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE),
-                            ),
-                    );
-                    // Track which pane's address bar has focus
-                    if address_resp.has_focus() {
-                        self.focused_address_pane = Some(pane_idx);
-                    } else if self.focused_address_pane == Some(pane_idx) {
-                        self.focused_address_pane = None;
+                    if ui.button("📁").on_hover_text("Type a path").clicked() {
+                        pane.address_edit_mode = true;
                     }
-                    if address_resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
-                        let target = PathBuf::from(pane.address_bar.trim());
-                        if target.exists() {
+                    if pane.address_edit_mode {
+                        let address_id = egui::Id::new(("address_bar", pane_idx));
+                        let address_resp = ui.add(
+                            egui::TextEdit::singleline(&mut pane.address_bar)
+                                .id(address_id)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Type a path and press Enter...")
+                                .frame(
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::TRANSPARENT)
+                                        .stroke(egui::Stroke::NONE),
+                                ),
+                        );
+                        if pane_idx == self.active_pane && !address_resp.has_focus() {
+                            address_resp.request_focus();
+                        }
+                        // Track which pane's address bar has focus
+                        if address_resp.has_focus() {
+                            self.focused_address_pane = Some(pane_idx);
+                        } else if self.focused_address_pane == Some(pane_idx) {
+                            self.focused_address_pane = None;
+                        }
+                        if address_resp.lost_focus() {
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let target = PathBuf::from(pane.address_bar.trim());
+                                if target.exists() {
+                                    if pane.active_tab_mut().try_navigate(target) {
+                                        self.active_pane = pane_idx;
+                                        self.dirty = true;
+                                    } else {
+                                        self.status =
+                                            "Tab is pinned — unpin it to navigate".to_string();
+                                    }
+                                } else {
+                                    self.status =
+                                        format!("Path not found: {}", pane.address_bar.trim());
+                                }
+                            }
+                            pane.address_edit_mode = false;
+                        }
+                    } else {
+                        let crumbs = Self::path_breadcrumbs(&current_path);
+                        // Fit as many trailing crumbs (closest to the current
+                        // folder) as the available width allows, so a long
+                        // path truncates its earliest ancestors behind an
+                        // ellipsis instead of spilling into the next pane.
+                        const MIN_STRETCH: f32 = 24.0; // room left for the copy-path click area
+                        let font_id = egui::TextStyle::Button.resolve(ui.style());
+                        let text_color = ui.visuals().text_color();
+                        let btn_padding = ui.spacing().button_padding.x * 2.0;
+                        let item_spacing = ui.spacing().item_spacing.x;
+                        let measure = |ui: &egui::Ui, s: &str| -> f32 {
+                            ui.painter()
+                                .layout_no_wrap(s.to_string(), font_id.clone(), text_color)
+                                .size()
+                                .x
+                        };
+                        let sep_width = measure(ui, ">") + item_spacing * 2.0;
+                        let last = crumbs.len() - 1;
+                        // Always show at least the current folder, regardless of budget.
+                        let mut budget = ui.available_width()
+                            - MIN_STRETCH
+                            - (measure(ui, &crumbs[last].0) + btn_padding + item_spacing);
+                        let mut first_shown = last;
+                        for i in (0..last).rev() {
+                            let w = measure(ui, &crumbs[i].0) + btn_padding + item_spacing + sep_width;
+                            if w > budget {
+                                break;
+                            }
+                            budget -= w;
+                            first_shown = i;
+                        }
+                        let truncated = first_shown > 0;
+                        let last_idx = crumbs.len().saturating_sub(1);
+                        let mut nav_target = None;
+                        if truncated {
+                            ui.label("…").on_hover_text(
+                                crumbs[..first_shown]
+                                    .iter()
+                                    .map(|(l, _)| l.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" > "),
+                            );
+                            ui.label(">");
+                        }
+                        for (i, (label, full_path)) in crumbs.iter().enumerate().skip(first_shown) {
+                            if i == last_idx {
+                                // Current folder: shown as plain text, not a
+                                // button — clicking it would "navigate" to
+                                // the already-current path, which clears the
+                                // forward-history stack for no reason.
+                                ui.strong(label);
+                            } else if ui.button(label).clicked() {
+                                nav_target = Some(full_path.clone());
+                            }
+                            if i != last_idx {
+                                ui.label(">");
+                            }
+                        }
+                        // Clicking the empty space past the last segment
+                        // copies the full path instead of entering edit mode.
+                        let stretch = ui.allocate_response(
+                            egui::vec2(ui.available_width().max(8.0), ui.spacing().interact_size.y),
+                            egui::Sense::click(),
+                        );
+                        if stretch
+                            .on_hover_text("Click to copy the full path")
+                            .clicked()
+                        {
+                            Self::set_clipboard_text(ctx, &current_path.to_string_lossy());
+                            self.status = "Path copied to clipboard".to_string();
+                        }
+                        if let Some(target) = nav_target {
                             if pane.active_tab_mut().try_navigate(target) {
                                 self.active_pane = pane_idx;
                                 self.dirty = true;
                             } else {
-                                self.status =
-                                    "Tab is pinned — unpin it to navigate".to_string();
+                                self.status = "Tab is pinned — unpin it to navigate".to_string();
                             }
-                        } else {
-                            self.status = format!("Path not found: {}", pane.address_bar.trim());
                         }
                     }
                 });
@@ -2400,21 +2538,24 @@ impl FileManApp {
             }
         });
 
+        // Filtering + sorting involves an O(n log n) sort with
+        // per-comparison lowercasing allocations — cache it on the tab and
+        // only redo the work when the listing/filter/sort actually changed,
+        // not on every repaint (blinking cursor, hover, toast fade, ...).
+        let (query, sort_col, sort_asc) = {
+            let tab = pane.active_tab();
+            (tab.filter.clone(), tab.sort_col.clone(), tab.sort_asc)
+        };
         let listing_result: Result<Vec<crate::fs_entry::FsEntry>, String> =
             match &pane.active_tab().listing_error {
                 Some(err) => Err(err.clone()),
-                None => Ok(pane.active_tab().listing.clone()),
+                None => Ok(pane
+                    .active_tab_mut()
+                    .display_entries(&query, &sort_col, sort_asc)
+                    .to_vec()),
             };
         match listing_result {
-            Ok(mut entries) => {
-                // Apply this tab's search filter
-                let query = pane.active_tab().filter.clone();
-                search::filter_entries(&mut entries, &query);
-                let (sort_col, sort_asc) = {
-                    let tab = pane.active_tab();
-                    (tab.sort_col.clone(), tab.sort_asc)
-                };
-                crate::fs_entry::sort_entries(&mut entries, &sort_col, sort_asc);
+            Ok(entries) => {
                 // Lazily extract+cache the shell-associated app icon for
                 // each file in this listing; slots align 1:1 with `entries`
                 // (None for folders and unresolvable types).
@@ -3009,10 +3150,25 @@ impl eframe::App for FileManApp {
                         egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
                             // `Key::Copy`/`Cut`/`Paste` only arrive from
                             // dedicated hardware keys here — don't let them
-                            // shadow the actual key being pressed.
+                            // shadow the actual key being pressed. Bare
+                            // modifier keys (Ctrl/Shift/Alt/Super) fire their
+                            // own Key event the instant they're pressed down
+                            // — e.g. holding Ctrl before N arrives sends
+                            // `Key::ControlLeft` first — so skip those and
+                            // keep waiting for the real key.
                             let is_synthetic = matches!(
                                 key,
-                                egui::Key::Copy | egui::Key::Cut | egui::Key::Paste
+                                egui::Key::Copy
+                                    | egui::Key::Cut
+                                    | egui::Key::Paste
+                                    | egui::Key::ShiftLeft
+                                    | egui::Key::ShiftRight
+                                    | egui::Key::ControlLeft
+                                    | egui::Key::ControlRight
+                                    | egui::Key::AltLeft
+                                    | egui::Key::AltRight
+                                    | egui::Key::SuperLeft
+                                    | egui::Key::SuperRight
                             );
                             if is_synthetic {
                                 None
@@ -3062,6 +3218,28 @@ impl eframe::App for FileManApp {
                     || id == egui::Id::new(("filter_input", self.active_pane))
             })
         });
+        // '*' jumps straight to the filter box, wherever focus currently is
+        // (but not while already typing in some other text field, where '*'
+        // should just be typed normally).
+        if self.dialog.is_none() && self.capturing_shortcut_for.is_none() && !text_focused {
+            // Consume (not just read) the '*' event: this runs before the
+            // filter box is drawn this frame, and requesting focus takes
+            // effect immediately — if the event were left in the queue, the
+            // now-focused TextEdit would see it later this same frame and
+            // insert a literal '*'.
+            let star_pressed = ctx.input_mut(|i| {
+                let before = i.events.len();
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == "*"));
+                i.events.len() != before
+            });
+            if star_pressed {
+                ctx.memory_mut(|m| {
+                    m.request_focus(egui::Id::new(("filter_input", self.active_pane)))
+                });
+            }
+        }
+
         if self.dialog.is_none()
             && self.capturing_shortcut_for.is_none()
             && !text_focused

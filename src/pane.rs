@@ -6,6 +6,9 @@ pub struct Pane {
     pub active_tab: usize,
     /// Editable address bar text for this pane.
     pub address_bar: String,
+    /// True while showing the typeable address bar (`address_bar`) instead
+    /// of the clickable breadcrumb trail.
+    pub address_edit_mode: bool,
 }
 
 impl Pane {
@@ -14,6 +17,7 @@ impl Pane {
             address_bar: initial_path.display().to_string(),
             tabs: vec![Tab::new(initial_path)],
             active_tab: 0,
+            address_edit_mode: false,
         }
     }
 

@@ -50,6 +50,15 @@ pub struct Tab {
     /// True when `listing` is stale (fresh tab, navigation, or an external
     /// mutation) and needs to be reloaded via a background listing job.
     pub listing_dirty: bool,
+    /// Bumped every time `listing` is replaced with a fresh background-job
+    /// result. Lets the UI cache the filtered+sorted view (which involves an
+    /// O(n log n) sort with per-comparison allocations) and only redo that
+    /// work when the listing, filter, or sort actually changed — not on
+    /// every repaint (blinking cursor, hover, toast fade, ...).
+    pub listing_version: u64,
+    /// The last computed (filter, sort_col, sort_asc, listing_version) view,
+    /// so unchanged frames can reuse it instead of re-filtering/re-sorting.
+    pub display_cache: Option<((u64, String, String, bool), Vec<FsEntry>)>,
     /// Set when the last background listing job for this tab's path failed
     /// (e.g. permission denied). Cleared on the next successful listing.
     pub listing_error: Option<String>,
@@ -78,9 +87,29 @@ impl Tab {
             listing: Vec::new(),
             listing_dirty: true,
             listing_error: None,
+            listing_version: 0,
+            display_cache: None,
             locked: false,
             custom_name: None,
         }
+    }
+
+    /// The filtered+sorted view for `filter`/`sort_col`/`sort_asc`, recomputed
+    /// only when the cache key (those three plus `listing_version`) changed
+    /// since the last call.
+    pub fn display_entries(&mut self, filter: &str, sort_col: &str, sort_asc: bool) -> &[FsEntry] {
+        let key = (self.listing_version, filter.to_string(), sort_col.to_string(), sort_asc);
+        let stale = match &self.display_cache {
+            Some((cached_key, _)) => *cached_key != key,
+            None => true,
+        };
+        if stale {
+            let mut entries = self.listing.clone();
+            crate::search::filter_entries(&mut entries, filter);
+            crate::fs_entry::sort_entries(&mut entries, sort_col, sort_asc);
+            self.display_cache = Some((key, entries));
+        }
+        &self.display_cache.as_ref().unwrap().1
     }
 
     /// The tab's display label: the custom name if one was set, otherwise
