@@ -52,6 +52,8 @@ Switch between three layouts via **Settings > View**:
 - **List** — compact single-column list with name, date, and size.
 - **Icons** — grid of large icons with filenames, suited for image-heavy folders.
 
+Each file shows the same associated app icon Windows Explorer uses for its file type (e.g. `.txt` files show Notepad's icon). Folders keep the folder glyph.
+
 ### Filtering
 
 Type in the filter box (next to the Up button) to narrow the visible files. The filter is case-insensitive and matches against filenames. Click the red **x** to clear.

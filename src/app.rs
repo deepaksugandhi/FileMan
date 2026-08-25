@@ -143,6 +143,11 @@ pub struct FileManApp {
     /// Loaded exe icons for custom actions, keyed by exe path. `None` means
     /// extraction failed (no icon) and should not be retried every frame.
     custom_icons: HashMap<String, Option<egui::TextureHandle>>,
+    /// Shell-associated icon textures for files in the listings, keyed by
+    /// `icon_cache::file_icon_cache_key` (extension, or full path for
+    /// exe-like types). `None` values are failed lookups, cached so they
+    /// aren't retried every frame.
+    file_icons: HashMap<String, Option<egui::TextureHandle>>,
     /// Set while the Settings "Shortcuts" tab is waiting for the next key
     /// event to bind to this action.
     capturing_shortcut_for: Option<Action>,
@@ -429,6 +434,7 @@ impl FileManApp {
             toolbar_actions,
             custom_actions,
             custom_icons: HashMap::new(),
+            file_icons: HashMap::new(),
             capturing_shortcut_for: None,
             new_custom_action_label: String::new(),
             new_custom_action_exe: None,
@@ -1609,6 +1615,23 @@ impl FileManApp {
                                 fg,
                             );
                         }
+                        // App version pinned to the bottom of the nav rail.
+                        // Sourced from Cargo.toml ([package] version) at
+                        // compile time — never a hardcoded literal here, so
+                        // it can't drift from the installer (which reads the
+                        // same value from the built exe's version resource).
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "FileMan v{}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                        });
                     });
                     ui.separator();
 
@@ -2107,6 +2130,11 @@ impl FileManApp {
                     (tab.sort_col.clone(), tab.sort_asc)
                 };
                 crate::fs_entry::sort_entries(&mut entries, &sort_col, sort_asc);
+                // Lazily extract+cache the shell-associated app icon for
+                // each file in this listing; slots align 1:1 with `entries`
+                // (None for folders and unresolvable types).
+                let entry_icons =
+                    crate::icon_cache::ensure_entry_icons(&mut self.file_icons, ctx, &entries);
                 let ctrl = ui.input(|i| i.modifiers.ctrl);
                 let shift = ui.input(|i| i.modifiers.shift);
                 let mode = pane.active_tab().view_mode;
@@ -2167,12 +2195,23 @@ impl FileManApp {
                                             row.set_selected(is_selected);
 
                                             row.col(|ui| {
-                                                let label = if entry.is_dir {
-                                                    format!("\u{1F4C1} {}", entry.name)
-                                                } else {
-                                                    entry.name.clone()
-                                                };
-                                                ui.add(egui::Label::new(&label).selectable(false));
+                                                // Folders keep their emoji glyph;
+                                                // files show the associated app
+                                                // icon for their type, falling
+                                                // back to bare text when none.
+                                                ui.horizontal(|ui| {
+                                                    if entry.is_dir {
+                                                        ui.label("\u{1F4C1}");
+                                                    } else if let Some(tex) = &entry_icons[row_idx] {
+                                                        ui.add(egui::Image::new(
+                                                            egui::load::SizedTexture::new(
+                                                                tex.id(),
+                                                                egui::vec2(16.0, 16.0),
+                                                            ),
+                                                        ));
+                                                    }
+                                                    ui.add(egui::Label::new(&entry.name).selectable(false));
+                                                });
                                             });
                                             row.col(|ui| {
                                                 let text = entry
@@ -2258,12 +2297,21 @@ impl FileManApp {
                                         .active_tab()
                                         .selected
                                         .contains(&entry.name);
-                                    let label = if entry.is_dir {
-                                        format!("\u{1F4C1} {}", entry.name)
-                                    } else {
-                                        entry.name.clone()
-                                    };
-                                    let resp = ui.selectable_label(is_selected, &label);
+                                    let resp = ui
+                                        .horizontal(|ui| {
+                                            if entry.is_dir {
+                                                ui.label("\u{1F4C1}");
+                                            } else if let Some(tex) = &entry_icons[idx] {
+                                                ui.add(egui::Image::new(
+                                                    egui::load::SizedTexture::new(
+                                                        tex.id(),
+                                                        egui::vec2(16.0, 16.0),
+                                                    ),
+                                                ));
+                                            }
+                                            ui.selectable_label(is_selected, &entry.name)
+                                        })
+                                        .inner;
                                     handle_entry_response(
                                         &resp, entry, is_selected,
                                         &mut select_name,
@@ -2288,12 +2336,31 @@ impl FileManApp {
                                             .active_tab()
                                             .selected
                                             .contains(&entry.name);
-                                        ui.allocate_ui(egui::vec2(76.0, 56.0), |ui| {
-                                            let icon = if entry.is_dir { "🗀" } else { "🗋" };
-                                            let resp = ui.selectable_label(
-                                                is_selected,
-                                                format!("{icon}\n{}", entry.name),
-                                            );
+                                        ui.allocate_ui(egui::vec2(76.0, 72.0), |ui| {
+                                            // Tile: associated app icon (or the
+                                            // generic glyph) above the filename.
+                                            // The union of both responses drives
+                                            // selection/opening so clicking either
+                                            // part works.
+                                            let resp = ui
+                                                .vertical_centered(|ui| {
+                                                    let img_resp = if entry.is_dir {
+                                                        ui.label("🗀")
+                                                    } else if let Some(tex) = &entry_icons[idx] {
+                                                        ui.add(egui::Image::new(
+                                                            egui::load::SizedTexture::new(
+                                                                tex.id(),
+                                                                egui::vec2(32.0, 32.0),
+                                                            ),
+                                                        ))
+                                                    } else {
+                                                        ui.label("🗋")
+                                                    };
+                                                    let text_resp =
+                                                        ui.selectable_label(is_selected, &entry.name);
+                                                    img_resp | text_resp
+                                                })
+                                                .inner;
                                             handle_entry_response(
                                                 &resp, entry, is_selected,
                                                 &mut select_name,

@@ -2,10 +2,12 @@
 ; Build:  ISCC.exe installer.iss   (output lands in .\installer\)
 
 #define MyAppName "FileMan"
-; Keep in sync with Cargo.toml (bump both on release).
-#define MyAppVersion "0.1.0"
 #define MyAppPublisher "FileMan"
 #define MyAppExeName "fileman.exe"
+; Version is read out of the compiled exe's embedded VERSIONINFO resource,
+; which build.rs derives from Cargo.toml ([package] version) at compile
+; time. Cargo.toml is the single source of truth — bump it there only.
+#define MyAppVersion GetStringFileInfo(SourcePath + "target\release\" + MyAppExeName, "FileVersion")
 
 [Setup]
 AppId={{9F1C42A5-3E7B-4C6D-8A19-B2D05F6E7C31}
