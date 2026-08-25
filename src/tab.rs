@@ -55,6 +55,10 @@ pub struct Tab {
     pub listing_error: Option<String>,
     /// Pinned tabs refuse to close or navigate away from their folder.
     pub locked: bool,
+    /// User-assigned tab label. When set, overrides the folder-name label
+    /// and survives navigation (the tab keeps its custom title even as
+    /// `path` changes).
+    pub custom_name: Option<String>,
 }
 
 pub const DEFAULT_COL_WIDTHS: [f32; 4] = [220.0, 140.0, 90.0, 60.0];
@@ -75,7 +79,19 @@ impl Tab {
             listing_dirty: true,
             listing_error: None,
             locked: false,
+            custom_name: None,
         }
+    }
+
+    /// The tab's display label: the custom name if one was set, otherwise
+    /// the current folder's name.
+    pub fn display_label(&self) -> String {
+        self.custom_name.clone().unwrap_or_else(|| {
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.display().to_string())
+        })
     }
 
     /// Navigates to `new_path` unless the tab is pinned (`locked`), in which

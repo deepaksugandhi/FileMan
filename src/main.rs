@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod actions;
 mod app;
 mod archive;
@@ -14,6 +16,7 @@ mod search;
 mod session;
 mod tab;
 mod taskbar;
+mod tips;
 mod tree;
 mod user;
 mod win_default;
@@ -43,7 +46,9 @@ fn main() -> eframe::Result<()> {
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_dir());
 
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 800.0])
+        .with_maximized(true);
     if let Some(loaded) = &loaded {
         if let Some(window) = &loaded.window {
             viewport = viewport.with_inner_size([window.width, window.height]);

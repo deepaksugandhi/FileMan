@@ -41,6 +41,8 @@ enum Dialog {
     DuplicateName { src: PathBuf, dest_dir: PathBuf, suggested: String },
     /// Tab context menu: right-click on a tab to duplicate or close it.
     TabContext { pane_idx: usize, tab_idx: usize },
+    /// Renaming a tab's display label (independent of its folder).
+    RenameTab { pane_idx: usize, tab_idx: usize, name: String },
     /// Find dialog for searching files. Results keep their full metadata so
     /// the results table can display and sort by name/folder/date/size. The
     /// name/folder filters narrow the displayed list without discarding hits;
@@ -61,6 +63,17 @@ enum Dialog {
     Help,
     /// Confirm delete: paths ready to be deleted, waiting for user confirmation.
     ConfirmDelete { paths: Vec<PathBuf> },
+}
+
+/// Payload carried while file entries are dragged between panes/tabs: the
+/// selected full paths, the folder they came from (so same-folder drops are
+/// ignored), and the pane that started the drag (so its selection can be
+/// cleared once the transfer is queued).
+#[derive(Clone)]
+struct DragFiles {
+    paths: Vec<PathBuf>,
+    from_dir: PathBuf,
+    from_pane: usize,
 }
 
 pub struct FileManApp {
@@ -167,6 +180,18 @@ pub struct FileManApp {
     /// This process's open-order slot (SPEC §11), assigned in `main` before
     /// the window was created; used to color this window's taskbar icon.
     instance_slot: usize,
+    /// Whether the rotating bottom-left tips card is shown (persisted per
+    /// user as `tips_enabled`).
+    tips_enabled: bool,
+    /// State for the tips card: current tip, rotation timing and session
+    /// visibility.
+    tips: crate::tips::TipsCard,
+    /// Pane body rects captured during rendering, for drag & drop
+    /// hit-testing. Refreshed every frame.
+    dnd_pane_rects: [Option<egui::Rect>; 2],
+    /// Tab-header rects captured during rendering — `((pane, tab), rect,
+    /// is_active)` — so a dragged item hovering an inactive tab can open it.
+    dnd_tab_rects: Vec<((usize, usize), egui::Rect, bool)>,
 }
 
 /// Resolves the device name of the monitor the window currently sits on, via
@@ -186,6 +211,44 @@ fn current_monitor_name(frame: &eframe::Frame) -> Option<String> {
     #[cfg(not(windows))]
     {
         let _ = frame;
+        None
+    }
+}
+
+/// The mouse cursor's position in window-client egui points, read straight
+/// from the OS rather than from egui's own pointer tracking.
+///
+/// A native OS file drag (dropped from Explorer/WinRAR) never generates the
+/// mouse-move messages winit turns into egui pointer events — Windows' OLE
+/// drag loop owns the cursor for the whole drag, so `dropped_files` always
+/// arrives with `i.pointer.hover_pos()` stuck at wherever the mouse was
+/// before the external drag started. `GetCursorPos` sidesteps that by asking
+/// Windows for the cursor's current screen position directly.
+fn native_cursor_pos(frame: &eframe::Frame, ctx: &egui::Context) -> Option<egui::Pos2> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let handle = frame.window_handle().ok()?;
+        let RawWindowHandle::Win32(h) = handle.as_raw() else {
+            return None;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _);
+        let mut point = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut point).is_err() {
+                return None;
+            }
+            let _ = ScreenToClient(hwnd, &mut point);
+        }
+        let ppp = ctx.pixels_per_point();
+        Some(egui::pos2(point.x as f32 / ppp, point.y as f32 / ppp))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (frame, ctx);
         None
     }
 }
@@ -379,6 +442,9 @@ impl FileManApp {
         let tab_strip_width = crate::config::get(&conn, current_user_id, "tab_strip_width")
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(150.0);
+        let tips_enabled = crate::config::get(&conn, current_user_id, crate::tips::KEY_TIPS_ENABLED)
+            .map(|raw| raw != "false")
+            .unwrap_or(true);
         let favourites = crate::db::get_favourites(&conn, current_user_id);
         let split_ratio = crate::db::get_split_ratio(&conn, current_user_id).unwrap_or(0.5);
         let tree_width = crate::db::get_tree_width(&conn, current_user_id).unwrap_or(200.0);
@@ -443,6 +509,10 @@ impl FileManApp {
             tab_strip_width,
             taskbar_badge_applied: false,
             instance_slot,
+            tips_enabled,
+            tips: crate::tips::TipsCard::new(),
+            dnd_pane_rects: [None, None],
+            dnd_tab_rects: Vec::new(),
         }
     }
 
@@ -854,15 +924,6 @@ impl FileManApp {
         self.status = format!("Cut {} item(s)", self.clipboard.len());
     }
 
-    /// Pastes the clipboard into the active tab's directory.
-    ///
-    /// Name collisions are checked up front with a cheap `Path::exists`
-    /// (no recursive walk), preserving the original one-at-a-time
-    /// duplicate-name prompt: the first colliding item stops the paste and
-    /// opens `Dialog::DuplicateName`, exactly as before. Once there are no
-    /// collisions left, the whole batch runs as a single background
-    /// operation with a progress bar, rather than blocking the UI thread —
-    /// see `progress::copy_items_bg`/`move_items_bg`.
     fn paste_clipboard(&mut self) {
         if self.clipboard.is_empty() {
             self.status = "Clipboard is empty".into();
@@ -884,6 +945,18 @@ impl FileManApp {
             return;
         }
 
+        self.transfer_items(items, dest, op);
+    }
+
+    /// Shared tail of clipboard-paste and drag & drop: checks name
+    /// collisions up front with a cheap `Path::exists` (no recursive walk),
+    /// preserving the original one-at-a-time duplicate-name prompt — the
+    /// first colliding item stops the transfer and opens
+    /// `Dialog::DuplicateName`. Once there are no collisions left, the whole
+    /// batch runs as a single background operation with a progress bar,
+    /// rather than blocking the UI thread — see
+    /// `progress::copy_items_bg`/`move_items_bg`.
+    fn transfer_items(&mut self, items: Vec<PathBuf>, dest: PathBuf, op: Option<ClipboardOp>) {
         for src in &items {
             let name = match src.file_name() {
                 Some(n) => n,
@@ -919,13 +992,143 @@ impl FileManApp {
             Some(ClipboardOp::Copy) => progress::copy_items_bg(items, dest.clone()),
             _ => progress::move_items_bg(items, dest.clone()),
         });
-        self.status = format!("Pasting into {}…", dest.display());
+        self.status = match op {
+            Some(ClipboardOp::Cut) => format!("Moving into {}…", dest.display()),
+            _ => format!("Copying into {}…", dest.display()),
+        };
         if op == Some(ClipboardOp::Cut) {
             self.clipboard.clear();
         }
         self.panes[self.active_pane]
             .active_tab_mut()
             .clear_selection();
+    }
+
+    /// Per-frame handling of an in-flight file drag (started by dragging a
+    /// listing row): hovering an inactive tab opens it browser-style so the
+    /// drop can complete inside the newly opened tab; the pane under the
+    /// pointer gets drop-target feedback; on release the dragged items are
+    /// copied into the target pane's active folder — or MOVED when Shift is
+    /// held. Releasing outside any pane (or pressing Escape) cancels.
+    fn process_file_drag_drop(&mut self, ctx: &egui::Context) {
+        let Some(payload) = egui::DragAndDrop::payload::<DragFiles>(ctx).map(|p| (*p).clone())
+        else {
+            return;
+        };
+        let (pos, released, shift) = ctx.input(|i| {
+            (i.pointer.interact_pos(), i.pointer.primary_released(), i.modifiers.shift)
+        });
+        let Some(pos) = pos else { return };
+
+        // Hovering a tab header opens that tab immediately, so the user can
+        // finish the drop inside the tab that just came to the front.
+        if !released {
+            for &((pane_idx, tab_idx), rect, is_active) in &self.dnd_tab_rects {
+                if !is_active && rect.contains(pos) && self.panes[pane_idx].active_tab != tab_idx {
+                    self.panes[pane_idx].active_tab = tab_idx;
+                    self.active_pane = pane_idx;
+                    self.dirty = true;
+                    break;
+                }
+            }
+        }
+
+        let target_pane = self
+            .dnd_pane_rects
+            .iter()
+            .position(|r| r.is_some_and(|rect| rect.contains(pos)));
+
+        if !released {
+            // Drop-target feedback: brand-orange border around the receiving
+            // pane, plus a copy/move/forbidden cursor.
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd_highlight"),
+            ));
+            if let Some(rect) = target_pane.and_then(|p| self.dnd_pane_rects[p]) {
+                painter.rect_stroke(
+                    rect.expand(-1.0),
+                    6.0,
+                    egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 165, 0)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            ctx.set_cursor_icon(if target_pane.is_none() {
+                egui::CursorIcon::NoDrop
+            } else if shift {
+                egui::CursorIcon::Move
+            } else {
+                egui::CursorIcon::Copy
+            });
+            return;
+        }
+
+        // Release: transfer into the target pane's active folder — or cancel
+        // when dropped outside every pane. (The plugin clears the payload at
+        // end-of-pass anyway; clearing here keeps things explicit.)
+        egui::DragAndDrop::clear_payload(ctx);
+        let Some(target_pane) = target_pane else { return };
+        let dest = self.panes[target_pane].active_tab().path.clone();
+        if dest == payload.from_dir {
+            self.status = "Source and destination are the same folder".to_string();
+            return;
+        }
+        let op = if shift { ClipboardOp::Cut } else { ClipboardOp::Copy };
+        self.clipboard = payload.paths.clone();
+        self.clipboard_op = Some(op);
+        self.transfer_items(payload.paths, dest, Some(op));
+        // The dragged items left the source folder: forget its selection.
+        if let Some(src_pane) = self.panes.get_mut(payload.from_pane) {
+            src_pane.active_tab_mut().clear_selection();
+        }
+    }
+
+    /// Handles files/folders dragged in from another application (e.g.
+    /// Explorer, WinRAR): drops them (always copied — the source isn't ours
+    /// to move from) into whichever pane/tab the pointer was actually over.
+    fn process_external_file_drop(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = dropped
+            .into_iter()
+            .map(|f| f.path().to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        // egui's own pointer position is stale here — see `native_cursor_pos`.
+        let pos = native_cursor_pos(frame, ctx)
+            .or_else(|| ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())));
+
+        // Dropping directly on a tab header targets that tab specifically
+        // (and brings it to front), matching the in-app drag & drop behavior.
+        let tab_hit = pos.and_then(|pos| {
+            self.dnd_tab_rects
+                .iter()
+                .find(|(_, rect, _)| rect.contains(pos))
+                .map(|&((pane_idx, tab_idx), ..)| (pane_idx, tab_idx))
+        });
+
+        let (target_pane, dest) = if let Some((pane_idx, tab_idx)) = tab_hit {
+            self.panes[pane_idx].active_tab = tab_idx;
+            self.active_pane = pane_idx;
+            self.dirty = true;
+            (pane_idx, self.panes[pane_idx].tabs[tab_idx].path.clone())
+        } else {
+            let target_pane = pos
+                .and_then(|pos| {
+                    self.dnd_pane_rects
+                        .iter()
+                        .position(|r| r.is_some_and(|rect| rect.contains(pos)))
+                })
+                .unwrap_or(self.active_pane);
+            (target_pane, self.panes[target_pane].active_tab().path.clone())
+        };
+        self.active_pane = target_pane;
+        self.transfer_items(paths, dest, Some(ClipboardOp::Copy));
     }
 
     fn delete_selection(&mut self) {
@@ -1013,9 +1216,30 @@ impl FileManApp {
             Dialog::Rename { path, name } => fs_ops::rename_item(path, name)
                 .map(|_| format!("Renamed to {name}"))
                 .map_err(|err| format!("Rename failed: {err}")),
-            Dialog::NewFolder { name } => fs_ops::create_folder(&parent, name)
-                .map(|_| format!("Created folder {name}"))
-                .map_err(|err| format!("Create folder failed: {err}")),
+            Dialog::NewFolder { name } => {
+                let names: Vec<&str> = name.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                if names.is_empty() {
+                    Err("Enter at least one folder name".to_string())
+                } else {
+                    let mut created = 0;
+                    let mut errors = Vec::new();
+                    for n in &names {
+                        match fs_ops::create_folder(&parent, n) {
+                            Ok(_) => created += 1,
+                            Err(err) => errors.push(format!("{n}: {err}")),
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(format!("Created {created} folder(s)"))
+                    } else {
+                        Err(format!(
+                            "Created {created}/{}; {}",
+                            names.len(),
+                            errors.join("; ")
+                        ))
+                    }
+                }
+            }
             Dialog::NewFile { name } => fs_ops::create_file(&parent, name)
                 .map(|_| format!("Created file {name}"))
                 .map_err(|err| format!("Create file failed: {err}")),
@@ -1040,6 +1264,17 @@ impl FileManApp {
                     }
                 }
             }
+            Dialog::RenameTab { pane_idx, tab_idx, name } => {
+                if let Some(tab) = self
+                    .panes
+                    .get_mut(*pane_idx)
+                    .and_then(|p| p.tabs.get_mut(*tab_idx))
+                {
+                    tab.custom_name =
+                        if name.trim().is_empty() { None } else { Some(name.trim().to_string()) };
+                }
+                Ok(String::new())
+            }
             Dialog::TabContext { .. } | Dialog::Find { .. } | Dialog::Help
             | Dialog::ConfirmDelete { .. } => Ok(String::new()),
         };
@@ -1049,7 +1284,7 @@ impl FileManApp {
                 Dialog::NewFolder { .. } | Dialog::NewFile { .. } => Some(parent.clone()),
                 Dialog::DuplicateName { dest_dir, .. } => Some(dest_dir.clone()),
                 Dialog::TabContext { .. } | Dialog::Find { .. } | Dialog::NewUser { .. } | Dialog::Help
-                | Dialog::ConfirmDelete { .. } => None,
+                | Dialog::ConfirmDelete { .. } | Dialog::RenameTab { .. } => None,
             };
         }
         if let Some(dir) = dirty_dir {
@@ -1119,11 +1354,27 @@ impl FileManApp {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Size").weak());
             ui.add_space(8.0);
-            let response = ui.add(
-                egui::Slider::new(&mut self.font_size, 8.0..=24.0)
-                    .step_by(0.5)
-                    .suffix("px"),
-            );
+            // The global 3D-button fill is near-white so it reads against
+            // the grey panel behind toolbar buttons; against this dialog's
+            // white background it makes the slider handle disappear except
+            // for its outline. Give the handle a fill that actually shows.
+            let response = ui
+                .scope(|ui| {
+                    let v = &mut ui.style_mut().visuals.widgets;
+                    let handle_fill = egui::Color32::from_rgb(150, 150, 156);
+                    v.inactive.bg_fill = handle_fill;
+                    v.inactive.weak_bg_fill = handle_fill;
+                    v.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 128);
+                    v.hovered.weak_bg_fill = egui::Color32::from_rgb(120, 120, 128);
+                    v.active.bg_fill = egui::Color32::from_rgb(90, 90, 96);
+                    v.active.weak_bg_fill = egui::Color32::from_rgb(90, 90, 96);
+                    ui.add(
+                        egui::Slider::new(&mut self.font_size, 8.0..=24.0)
+                            .step_by(0.5)
+                            .suffix("px"),
+                    )
+                })
+                .inner;
             if response.changed() {
                 let _ = crate::config::set(
                     &self.conn,
@@ -1149,6 +1400,28 @@ impl FileManApp {
                 orientation.as_str(),
             );
         }
+
+        ui.add_space(14.0);
+        settings_group_label(ui, "Tips");
+        let mut tips_on = self.tips_enabled;
+        if ui
+            .checkbox(&mut tips_on, "Show rotating feature tips")
+            .changed()
+        {
+            self.tips_enabled = tips_on;
+            self.tips.set_visible(tips_on);
+            let _ = crate::config::set(
+                &self.conn,
+                crate::config::Scope::User(self.current_user_id),
+                crate::tips::KEY_TIPS_ENABLED,
+                if tips_on { "true" } else { "false" },
+            );
+        }
+        ui.label(
+            egui::RichText::new("Small hints about FileMan's functions, shown near the bottom-left corner.")
+                .weak()
+                .small(),
+        );
 
         ui.add_space(10.0);
         ui.label(
@@ -1518,6 +1791,9 @@ impl FileManApp {
         self.tab_strip_width = crate::config::get(&self.conn, uid, "tab_strip_width")
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(150.0);
+        self.tips_enabled = crate::config::get(&self.conn, uid, crate::tips::KEY_TIPS_ENABLED)
+            .map(|raw| raw != "false")
+            .unwrap_or(true);
         self.shortcut_map = crate::actions::load_shortcut_map(&self.conn, uid);
         self.toolbar_actions = crate::actions::load_toolbar(&self.conn, uid);
         self.custom_actions = crate::actions::list_custom_actions(&self.conn, uid);
@@ -1705,10 +1981,7 @@ impl FileManApp {
         {
             let path = self.panes[pane_idx].tabs[tab_idx].path.clone();
             let locked = self.panes[pane_idx].tabs[tab_idx].locked;
-            let label = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+            let label = self.panes[pane_idx].tabs[tab_idx].display_label();
             let theme = ctx.theme();
             let mut win = egui::Window::new(&label)
                 .title_bar(false)
@@ -1777,6 +2050,15 @@ impl FileManApp {
                         self.dirty = true;
                         self.dialog = None;
                     }
+                    // Renaming is allowed even for pinned tabs — it only
+                    // changes the label, not the folder.
+                    if ui.button("Rename Tab").clicked() {
+                        self.dialog = Some(Dialog::RenameTab {
+                            pane_idx,
+                            tab_idx,
+                            name: label.clone(),
+                        });
+                    }
                 });
         }
     }
@@ -1784,6 +2066,9 @@ impl FileManApp {
     /// One file-browser pane: click-to-focus background, the tab strip
     /// (horizontal row or vertical sidebar), and the pane content.
     fn show_pane_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pane_idx: usize, is_active: bool) {
+        // Record this pane's extent for the drag & drop hit-test pass.
+        self.dnd_pane_rects[pane_idx] = Some(ui.max_rect());
+
         // Click on pane background to set as active
         let pane_resp = ui.interact(ui.max_rect(), egui::Id::new(("pane_bg", pane_idx)), egui::Sense::click());
         if pane_resp.clicked() {
@@ -1842,24 +2127,23 @@ impl FileManApp {
         let mut hover: Option<(usize, usize)> = None;
         match self.tab_orientation {
             TabOrientation::Horizontal => {
+                let mut tab_rects: Vec<((usize, usize), egui::Rect, bool)> = Vec::new();
                 ui.horizontal(|ui| {
                     let pane = &mut self.panes[pane_idx];
                     for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-                        let label = tab
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| tab.path.display().to_string());
+                        let label = tab.display_label();
+                        let is_tab_active = tab_idx == pane.active_tab;
                         let ev = tab_strip_item(
                             ui,
                             &label,
                             (pane_idx, tab_idx),
-                            tab_idx == pane.active_tab,
+                            is_tab_active,
                             is_active,
                             tab.locked,
                             &mut hover,
                             None,
                         );
+                        tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
                         clicked = clicked.or(ev.clicked.then_some(tab_idx));
                         context_menu = context_menu.or(ev.secondary_clicked.then_some(tab_idx));
                         closed = closed.or(ev.close_clicked.then_some(tab_idx));
@@ -1869,6 +2153,7 @@ impl FileManApp {
                         opened = true;
                     }
                 });
+                self.dnd_tab_rects.extend(tab_rects);
                 TabStripResult { clicked, closed, opened, context_menu, content_rect: None, menu_pos }
             }
             TabOrientation::Vertical => {
@@ -1894,6 +2179,7 @@ impl FileManApp {
                     avail.max,
                 );
 
+                let mut tab_rects: Vec<((usize, usize), egui::Rect, bool)> = Vec::new();
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip_rect), |ui| {
                     let pane = &mut self.panes[pane_idx];
                     let row_w = ui.available_width();
@@ -1903,11 +2189,7 @@ impl FileManApp {
                     let double_h = single_h.max(self.font_size * 2.0 + 10.0);
                     let text_w = (row_w - 6.0 - 20.0).max(1.0);
                     for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-                        let label = tab
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| tab.path.display().to_string());
+                        let label = tab.display_label();
                         let needs_two_lines = ui
                             .painter()
                             .layout_no_wrap(
@@ -1919,16 +2201,18 @@ impl FileManApp {
                             .x
                             > text_w;
                         let row_h = if needs_two_lines { double_h } else { single_h };
+                        let is_tab_active = tab_idx == pane.active_tab;
                         let ev = tab_strip_item(
                             ui,
                             &label,
                             (pane_idx, tab_idx),
-                            tab_idx == pane.active_tab,
+                            is_tab_active,
                             is_active,
                             tab.locked,
                             &mut hover,
                             Some(egui::vec2(row_w, row_h)),
                         );
+                        tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
                         clicked = clicked.or(ev.clicked.then_some(tab_idx));
                         context_menu = context_menu.or(ev.secondary_clicked.then_some(tab_idx));
                         closed = closed.or(ev.close_clicked.then_some(tab_idx));
@@ -1942,6 +2226,7 @@ impl FileManApp {
                         opened = true;
                     }
                 });
+                self.dnd_tab_rects.extend(tab_rects);
 
                 let drag_resp = ui.interact(
                     handle_rect,
@@ -2138,12 +2423,21 @@ impl FileManApp {
                 let ctrl = ui.input(|i| i.modifiers.ctrl);
                 let shift = ui.input(|i| i.modifiers.shift);
                 let mode = pane.active_tab().view_mode;
+                // Maximum-contrast listing text: pure white on dark, pure
+                // black on light — the theme defaults are softer than ideal
+                // for long stretches of filenames.
+                let listing_text = if ui.visuals().dark_mode {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::BLACK
+                };
 
                 let mut select_name: Option<String> = None;
                 let mut select_index: Option<usize> = None;
                 let mut nav_target: Option<PathBuf> = None;
                 let mut open_target: Option<PathBuf> = None;
                 let mut row_action: Option<RowAction> = None;
+                let mut drag_start: Option<String> = None;
 
                 match mode {
                     ViewMode::Details => {
@@ -2162,7 +2456,7 @@ impl FileManApp {
                                     .id_salt(format!("file_table_pane_{pane_idx}"))
                                     .striped(true)
                                     .resizable(true)
-                                    .sense(egui::Sense::click())
+                                    .sense(egui::Sense::click_and_drag())
                                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                                     .column(egui_extras::Column::initial(col_w[0]).clip(true))
                                     .column(egui_extras::Column::initial(col_w[1]).clip(true))
@@ -2201,7 +2495,7 @@ impl FileManApp {
                                                 // back to bare text when none.
                                                 ui.horizontal(|ui| {
                                                     if entry.is_dir {
-                                                        ui.label("\u{1F4C1}");
+                                                        ui.label(egui::RichText::new("\u{1F4C1}").color(listing_text));
                                                     } else if let Some(tex) = &entry_icons[row_idx] {
                                                         ui.add(egui::Image::new(
                                                             egui::load::SizedTexture::new(
@@ -2210,7 +2504,13 @@ impl FileManApp {
                                                             ),
                                                         ));
                                                     }
-                                                    ui.add(egui::Label::new(&entry.name).selectable(false));
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(entry.name.as_str())
+                                                                .color(listing_text),
+                                                        )
+                                                        .selectable(false),
+                                                    );
                                                 });
                                             });
                                             row.col(|ui| {
@@ -2222,7 +2522,7 @@ impl FileManApp {
                                                             .to_string()
                                                     })
                                                     .unwrap_or_default();
-                                                ui.label(text);
+                                                ui.label(egui::RichText::new(text).color(listing_text));
                                             });
                                             row.col(|ui| {
                                                 let size_text = if entry.is_dir {
@@ -2230,11 +2530,11 @@ impl FileManApp {
                                                 } else {
                                                     format_file_size(entry.size)
                                                 };
-                                                ui.label(size_text);
+                                                ui.label(egui::RichText::new(size_text).color(listing_text));
                                             });
                                             row.col(|ui| {
                                                 if entry.archive {
-                                                    ui.label("A");
+                                                    ui.label(egui::RichText::new("A").color(listing_text));
                                                 }
                                             });
 
@@ -2253,6 +2553,13 @@ impl FileManApp {
                                             if row_resp.secondary_clicked() && !is_selected {
                                                 select_name = Some(entry.name.clone());
                                                 select_index = Some(row_idx);
+                                            }
+                                            // The table carries click_and_drag
+                                            // sense, so a row drag starts a
+                                            // copy/move gesture without
+                                            // interfering with clicks.
+                                            if row_resp.drag_started() {
+                                                drag_start = Some(entry.name.clone());
                                             }
                                             styled_context_menu(&row_resp, |ui| {
                                                 show_entry_context_menu(ui, &mut row_action, &entry.path, entry.is_dir);
@@ -2300,7 +2607,7 @@ impl FileManApp {
                                     let resp = ui
                                         .horizontal(|ui| {
                                             if entry.is_dir {
-                                                ui.label("\u{1F4C1}");
+                                                ui.label(egui::RichText::new("\u{1F4C1}").color(listing_text));
                                             } else if let Some(tex) = &entry_icons[idx] {
                                                 ui.add(egui::Image::new(
                                                     egui::load::SizedTexture::new(
@@ -2309,7 +2616,11 @@ impl FileManApp {
                                                     ),
                                                 ));
                                             }
-                                            ui.selectable_label(is_selected, &entry.name)
+                                            ui.selectable_label(
+                                                is_selected,
+                                                egui::RichText::new(entry.name.as_str())
+                                                    .color(listing_text),
+                                            )
                                         })
                                         .inner;
                                     handle_entry_response(
@@ -2320,6 +2631,14 @@ impl FileManApp {
                                         &mut open_target,
                                         idx,
                                     );
+                                    let drag_zone = ui.interact(
+                                        resp.rect,
+                                        egui::Id::new(("entry_dnd", pane_idx, idx)),
+                                        egui::Sense::drag(),
+                                    );
+                                    if drag_zone.drag_started() {
+                                        drag_start = Some(entry.name.clone());
+                                    }
                                     styled_context_menu(&resp, |ui| {
                                         show_entry_context_menu(ui, &mut row_action, &entry.path, entry.is_dir);
                                     });
@@ -2345,7 +2664,7 @@ impl FileManApp {
                                             let resp = ui
                                                 .vertical_centered(|ui| {
                                                     let img_resp = if entry.is_dir {
-                                                        ui.label("🗀")
+                                                        ui.label(egui::RichText::new("🗀").color(listing_text))
                                                     } else if let Some(tex) = &entry_icons[idx] {
                                                         ui.add(egui::Image::new(
                                                             egui::load::SizedTexture::new(
@@ -2354,10 +2673,13 @@ impl FileManApp {
                                                             ),
                                                         ))
                                                     } else {
-                                                        ui.label("🗋")
+                                                        ui.label(egui::RichText::new("🗋").color(listing_text))
                                                     };
-                                                    let text_resp =
-                                                        ui.selectable_label(is_selected, &entry.name);
+                                                    let text_resp = ui.selectable_label(
+                                                        is_selected,
+                                                        egui::RichText::new(entry.name.as_str())
+                                                            .color(listing_text),
+                                                    );
                                                     img_resp | text_resp
                                                 })
                                                 .inner;
@@ -2369,6 +2691,14 @@ impl FileManApp {
                                                 &mut open_target,
                                                 idx,
                                             );
+                                            let drag_zone = ui.interact(
+                                                resp.rect,
+                                                egui::Id::new(("entry_dnd", pane_idx, idx)),
+                                                egui::Sense::drag(),
+                                            );
+                                            if drag_zone.drag_started() {
+                                                drag_start = Some(entry.name.clone());
+                                            }
                                             styled_context_menu(&resp, |ui| {
                                                 show_entry_context_menu(ui, &mut row_action, &entry.path, entry.is_dir);
                                             });
@@ -2377,6 +2707,28 @@ impl FileManApp {
                                 });
                             });
                     }
+                }
+
+                // A row drag starts a copy/move gesture: make sure the
+                // dragged entry is part of the selection, then publish the
+                // selected paths as the drag payload. Modifiers are ignored
+                // at drag START on purpose — Shift+drag means "move" at drop
+                // time, not range-select.
+                if let Some(name) = drag_start.take() {
+                    if !pane.active_tab().selected.contains(&name) {
+                        pane.active_tab_mut().select_only(&name);
+                    }
+                    self.last_selected_index = None;
+                    self.active_pane = pane_idx;
+                    let tab = pane.active_tab();
+                    egui::DragAndDrop::set_payload(
+                        ctx,
+                        DragFiles {
+                            paths: tab.selected.iter().map(|n| tab.path.join(n)).collect(),
+                            from_dir: tab.path.clone(),
+                            from_pane: pane_idx,
+                        },
+                    );
                 }
 
                 if let Some(name) = select_name {
@@ -2733,6 +3085,11 @@ impl eframe::App for FileManApp {
             }
         }
 
+        // Fresh hit-test geometry for the drag & drop pass below; the pane
+        // bodies and tab strips refill these as they render this frame.
+        self.dnd_pane_rects = [None, None];
+        self.dnd_tab_rects.clear();
+
         for pane_idx in 0..2 {
             self.poll_listing(pane_idx, &ctx);
         }
@@ -3013,8 +3370,10 @@ impl eframe::App for FileManApp {
                     .title_bar(true)
                     .resizable(false)
                     .collapsible(false)
+                    .auto_sized()
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(&ctx, |ui| {
+                        ui.set_width(360.0);
                         ui.label(&progress_text);
                         ui.add(egui::ProgressBar::new(fraction).animate(still_running));
                         if !still_running {
@@ -3041,11 +3400,15 @@ impl eframe::App for FileManApp {
                                 _ => {}
                             }
                             ui.add_space(4.0);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Close").clicked() {
-                                    dismiss_op = true;
-                                }
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        dismiss_op = true;
+                                    }
+                                },
+                            );
                         }
                     });
 
@@ -3481,6 +3844,7 @@ impl eframe::App for FileManApp {
                         } else {
                             None
                         };
+                        let multiline = matches!(dialog, Dialog::NewFolder { .. });
                         let (title, name) = match dialog {
                             Dialog::Rename { name, .. } => ("Rename", name),
                             Dialog::NewFolder { name } => ("New Folder", name),
@@ -3489,6 +3853,7 @@ impl eframe::App for FileManApp {
                                 ("Duplicate Name", suggested)
                             }
                             Dialog::NewUser { name } => ("New User", name),
+                            Dialog::RenameTab { name, .. } => ("Rename Tab", name),
                             Dialog::Find { .. } | Dialog::TabContext { .. } | Dialog::Help
                             | Dialog::ConfirmDelete { .. } => unreachable!(),
                         };
@@ -3499,7 +3864,18 @@ impl eframe::App for FileManApp {
                                 if let Some(ref label) = src_label {
                                     ui.label(label.as_str());
                                 }
-                                let edit = ui.text_edit_singleline(name);
+                                if multiline {
+                                    ui.label("One folder per line:");
+                                }
+                                let edit = if multiline {
+                                    ui.add(
+                                        egui::TextEdit::multiline(name)
+                                            .desired_rows(4)
+                                            .desired_width(260.0),
+                                    )
+                                } else {
+                                    ui.text_edit_singleline(name)
+                                };
                                 // Default keyboard focus goes to the input
                                 // box — but seed it ONLY while nothing else
                                 // holds focus (i.e. on open). Re-requesting
@@ -3509,7 +3885,11 @@ impl eframe::App for FileManApp {
                                 if ctx.memory(|m| m.focused().is_none()) {
                                     edit.request_focus();
                                 }
-                                commit = edit.lost_focus()
+                                // Enter submits single-line dialogs; a
+                                // multiline folder-name box needs Enter to
+                                // insert newlines, so it only submits via OK.
+                                commit = !multiline
+                                    && edit.lost_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 ui.horizontal(|ui| {
                                     if ui.button("OK").clicked() {
@@ -3605,6 +3985,12 @@ impl eframe::App for FileManApp {
             }
         });
 
+        // In-flight file drag & drop: tab-opening, drop-target feedback and
+        // the actual copy/move on release. Runs after the panes have laid
+        // out so this frame's rects are current.
+        self.process_file_drag_drop(&ctx);
+        self.process_external_file_drop(&ctx, frame);
+
         // Toast notifications: whenever the status message changes, surface
         // it as a transient banner near the top of the window for ~3 seconds
         // instead of a permanent line under the toolbar.
@@ -3668,6 +4054,23 @@ impl eframe::App for FileManApp {
                 ctx.request_repaint_after(
                     std::time::Duration::from_secs(TOAST_SECS) - elapsed,
                 );
+            }
+        }
+
+        // Rotating tips card pinned to the bottom-left corner. "Turn off"
+        // persists the disable; ✕ only hides until the next launch.
+        if self.tips_enabled {
+            match self.tips.draw(&ctx, self.font_size) {
+                crate::tips::TipAction::Disable => {
+                    self.tips_enabled = false;
+                    let _ = crate::config::set(
+                        &self.conn,
+                        crate::config::Scope::User(self.current_user_id),
+                        crate::tips::KEY_TIPS_ENABLED,
+                        "false",
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -3906,6 +4309,9 @@ struct TabItemEvents {
     close_clicked: bool,
     /// Pointer position of the secondary click, for anchoring the menu.
     secondary_pos: Option<egui::Pos2>,
+    /// The tab header's on-screen rect — reused by the drag & drop pass to
+    /// detect "dragged item hovers this tab".
+    rect: egui::Rect,
 }
 
 /// What a tab strip's rendering reported back to the pane: which tab was
@@ -4141,6 +4547,7 @@ fn tab_strip_item(
         } else {
             None
         },
+        rect: tab_resp.rect,
     }
 }
 

@@ -124,7 +124,7 @@ fn copy_item_recursive(
     let _ = progress.send(ProgressUpdate {
         files_done: done,
         files_total: total,
-        current_file: name,
+        current_file: name.clone(),
     });
     if src.is_dir() {
         let dest = dest_dir.join(src.file_name().unwrap());
@@ -144,7 +144,13 @@ fn copy_item_recursive(
             ));
         }
         fs::copy(src, &dest)?;
-        Ok(done + 1)
+        let new_done = done + 1;
+        let _ = progress.send(ProgressUpdate {
+            files_done: new_done,
+            files_total: total,
+            current_file: name,
+        });
+        Ok(new_done)
     }
 }
 

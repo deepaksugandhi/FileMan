@@ -84,8 +84,8 @@ pub fn save_session(
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     user_id,
                     pane_idx as i64,
@@ -97,6 +97,7 @@ pub fn save_session(
                     format_col_widths(&tab.col_widths),
                     tab.view_mode.as_str(),
                     tab.locked as i64,
+                    tab.custom_name,
                 ],
             )?;
         }
@@ -130,10 +131,10 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         .ok();
 
     let mut stmt = conn.prepare(
-        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked
+        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name
          FROM panes WHERE user_id = ?1 ORDER BY pane_index, tab_index",
     )?;
-    let rows: Vec<(i64, String, bool, String, bool, String, String, i64)> = stmt
+    let rows: Vec<(i64, String, bool, String, bool, String, String, i64, Option<String>)> = stmt
         .query_map(params![user_id], |row| {
             Ok((
                 row.get(0)?,
@@ -144,6 +145,7 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
             ))
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -160,7 +162,7 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         + 1;
     let mut panes: Vec<Option<Pane>> = (0..pane_count).map(|_| None).collect();
 
-    for (pane_idx, path, is_active, sort_col, sort_asc, col_widths, view_mode, locked) in rows {
+    for (pane_idx, path, is_active, sort_col, sort_asc, col_widths, view_mode, locked, custom_name) in rows {
         let pane_idx = pane_idx as usize;
         let pane = panes[pane_idx].get_or_insert_with(|| Pane {
             tabs: Vec::new(),
@@ -174,6 +176,7 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         tab.col_widths = parse_col_widths(&col_widths);
         tab.view_mode = crate::tab::ViewMode::from_str(&view_mode);
         tab.locked = locked != 0;
+        tab.custom_name = custom_name;
         pane.tabs.push(tab);
         if is_active {
             pane.active_tab = pane.tabs.len() - 1;
