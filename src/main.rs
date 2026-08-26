@@ -53,7 +53,12 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0])
-        .with_maximized(true);
+        .with_maximized(true)
+        // FileMan registers its own OLE drop target (native_drag.rs) so a
+        // single drag/drop path covers both internal pane-to-pane drops and
+        // genuinely external ones; winit registering its own would collide
+        // (only one IDropTarget per HWND).
+        .with_drag_and_drop(false);
     if let Some(loaded) = &loaded {
         if let Some(window) = &loaded.window {
             viewport = viewport.with_inner_size([window.width, window.height]);

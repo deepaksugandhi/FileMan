@@ -64,17 +64,6 @@ enum Dialog {
     ConfirmDelete { paths: Vec<PathBuf> },
 }
 
-/// Payload carried while file entries are dragged between panes/tabs: the
-/// selected full paths, the folder they came from (so same-folder drops are
-/// ignored), and the pane that started the drag (so its selection can be
-/// cleared once the transfer is queued).
-#[derive(Clone)]
-struct DragFiles {
-    paths: Vec<PathBuf>,
-    from_dir: PathBuf,
-    from_pane: usize,
-}
-
 pub struct FileManApp {
     conn: Connection,
     current_user_id: i64,
@@ -197,10 +186,16 @@ pub struct FileManApp {
     /// the filesystem (`read_dir`) on every single repaint. Invalidated via
     /// `mark_dir_dirty`.
     tree_subdirs_cache: HashMap<PathBuf, Vec<PathBuf>>,
-    /// True while mouse capture is held for an in-progress internal file
-    /// drag (so pointer coordinates keep flowing once the cursor leaves the
-    /// window and the OS hand-off can be detected).
-    dnd_capture_active: bool,
+    /// Hand-off point with the OLE drop target registered in
+    /// `native_drag.rs`: this frame's pane/tab rects go in, a resolved drop
+    /// comes back out. See `native_drag`'s module docs for why.
+    dnd_shared: crate::native_drag::SharedDndState,
+    /// Set once `native_drag::register_drop_target` has succeeded for this
+    /// window (needs a live `eframe::Frame`, unavailable at construction).
+    drop_target_registered: bool,
+    /// A row-drag that just started this frame, queued for
+    /// `start_native_drag` once the current pane borrow ends.
+    pending_native_drag: Option<(usize, Vec<PathBuf>, PathBuf)>,
 }
 
 /// Resolves the raw HWND of the app window. `None` on non-Windows or if the
@@ -239,44 +234,6 @@ fn current_monitor_name(frame: &eframe::Frame) -> Option<String> {
     #[cfg(not(windows))]
     {
         let _ = frame;
-        None
-    }
-}
-
-/// The mouse cursor's position in window-client egui points, read straight
-/// from the OS rather than from egui's own pointer tracking.
-///
-/// A native OS file drag (dropped from Explorer/WinRAR) never generates the
-/// mouse-move messages winit turns into egui pointer events — Windows' OLE
-/// drag loop owns the cursor for the whole drag, so `dropped_files` always
-/// arrives with `i.pointer.hover_pos()` stuck at wherever the mouse was
-/// before the external drag started. `GetCursorPos` sidesteps that by asking
-/// Windows for the cursor's current screen position directly.
-fn native_cursor_pos(frame: &eframe::Frame, ctx: &egui::Context) -> Option<egui::Pos2> {
-    #[cfg(windows)]
-    {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::Graphics::Gdi::ScreenToClient;
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-        let handle = frame.window_handle().ok()?;
-        let RawWindowHandle::Win32(h) = handle.as_raw() else {
-            return None;
-        };
-        let hwnd = windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _);
-        let mut point = POINT::default();
-        unsafe {
-            if GetCursorPos(&mut point).is_err() {
-                return None;
-            }
-            let _ = ScreenToClient(hwnd, &mut point);
-        }
-        let ppp = ctx.pixels_per_point();
-        Some(egui::pos2(point.x as f32 / ppp, point.y as f32 / ppp))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (frame, ctx);
         None
     }
 }
@@ -542,7 +499,11 @@ impl FileManApp {
             dnd_pane_rects: [None, None],
             dnd_tab_rects: Vec::new(),
             tree_subdirs_cache: HashMap::new(),
-            dnd_capture_active: false,
+            dnd_shared: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::native_drag::DndSharedState::default(),
+            )),
+            drop_target_registered: false,
+            pending_native_drag: None,
         }
     }
 
@@ -1059,169 +1020,116 @@ impl FileManApp {
             .clear_selection();
     }
 
-    /// Per-frame handling of an in-flight file drag (started by dragging a
-    /// listing row): hovering an inactive tab opens it browser-style so the
-    /// drop can complete inside the newly opened tab; the pane under the
-    /// pointer gets drop-target feedback; on release the dragged items are
-    /// copied into the target pane's active folder — or MOVED when Shift is
-    /// held. Releasing outside any pane (or pressing Escape) cancels.
-    ///
-    /// While a drag is in flight this method holds Win32 mouse capture, so
-    /// pointer coordinates keep arriving after the cursor leaves the window —
-    /// without that, the exit can't be detected and the OS hand-off (drag
-    /// out to other applications) never fires.
-    fn process_file_drag_drop(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let payload_opt = egui::DragAndDrop::payload::<DragFiles>(ctx).map(|p| (*p).clone());
-        if payload_opt.is_none() {
-            // No drag in flight: make sure a stale capture isn't held over.
-            self.release_dnd_capture();
+    /// Registers `native_drag`'s OLE drop target for this window, once a
+    /// `frame` (and so an HWND) is available. Idempotent.
+    fn ensure_drop_target_registered(&mut self, frame: &eframe::Frame) {
+        if self.drop_target_registered {
             return;
         }
-        let payload = payload_opt.unwrap();
-        if !self.dnd_capture_active {
-            self.set_dnd_capture(window_hwnd(frame));
-        }
-        let (released, shift) = ctx.input(|i| (i.pointer.primary_released(), i.modifiers.shift));
-        // egui's own pointer position goes stale/None the instant the cursor
-        // crosses the window edge (winit fires CursorLeft -> Event::PointerGone,
-        // which egui reacts to by dropping pointer tracking) — exactly the
-        // moment this method needs an accurate position to detect the exit.
-        // `GetCursorPos` sidesteps that, same as `native_cursor_pos`'s other
-        // caller below for the inbound-drop case.
-        let pos = native_cursor_pos(frame, ctx)
-            .or_else(|| ctx.input(|i| i.pointer.interact_pos()));
-        let Some(pos) = pos else { return };
-
-        // Pointer left the window while still holding the dragged items:
-        // hand the drag to Windows so other applications (chat, mail,
-        // Explorer…) can accept it as a real CF_HDROP drop. This call BLOCKS
-        // in OLE's nested loop until the drop resolves.
-        if !released {
-            let screen = ctx.input(|i| i.viewport_rect());
-            if !screen.contains(pos) {
-                self.release_dnd_capture();
-                egui::DragAndDrop::clear_payload(ctx);
-                ctx.set_cursor_icon(egui::CursorIcon::Default);
-                self.finish_drag_out(&payload.paths);
-                ctx.request_repaint();
-                return;
+        if let Some(hwnd) = window_hwnd(frame) {
+            if crate::native_drag::register_drop_target(hwnd, self.dnd_shared.clone()).is_ok() {
+                self.drop_target_registered = true;
             }
         }
+    }
 
-        // Hovering a tab header opens that tab immediately, so the user can
-        // finish the drop inside the tab that just came to the front.
-        if !released {
-            for &((pane_idx, tab_idx), rect, is_active) in &self.dnd_tab_rects {
-                if !is_active && rect.contains(pos) && self.panes[pane_idx].active_tab != tab_idx {
-                    self.panes[pane_idx].active_tab = tab_idx;
-                    self.active_pane = pane_idx;
-                    self.dirty = true;
-                    break;
-                }
-            }
+    /// Publishes this frame's pane/tab hit-test rects (already computed by
+    /// `show_pane_body`/the tab strip) to the shared state `native_drag`'s
+    /// drop target reads from — needed before a drag can start, since once
+    /// `DoDragDrop` is running the OS calls that target directly, off
+    /// egui's normal per-frame update.
+    fn sync_dnd_shared(&self, ctx: &egui::Context) {
+        let mut st = self.dnd_shared.lock().unwrap();
+        st.pixels_per_point = ctx.pixels_per_point();
+        for i in 0..2 {
+            st.pane_rects[i] = self.dnd_pane_rects[i].map(|r| (r.min.x, r.min.y, r.max.x, r.max.y));
         }
-
-        let target_pane = self
-            .dnd_pane_rects
+        st.tab_rects = self
+            .dnd_tab_rects
             .iter()
-            .position(|r| r.is_some_and(|rect| rect.contains(pos)));
+            .map(|&((pane, tab), rect, _is_active)| {
+                ((pane, tab), (rect.min.x, rect.min.y, rect.max.x, rect.max.y))
+            })
+            .collect();
+    }
 
-        if !released {
-            // Drop-target feedback: brand-orange border around the receiving
-            // pane, plus a copy/move/forbidden cursor.
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("dnd_highlight"),
-            ));
-            if let Some(rect) = target_pane.and_then(|p| self.dnd_pane_rects[p]) {
-                painter.rect_stroke(
-                    rect.expand(-1.0),
-                    6.0,
-                    egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 165, 0)),
-                    egui::StrokeKind::Inside,
-                );
+    /// Resolves a drop's target pane/tab into the destination folder,
+    /// switching to that tab first if the drop landed on one specifically
+    /// (mirrors the old hover-to-open-tab UX, just resolved at drop time
+    /// instead of live during the drag).
+    fn resolve_drop_dest(&mut self, pane: usize, tab: Option<usize>) -> PathBuf {
+        self.active_pane = pane;
+        if let Some(tab_idx) = tab {
+            if self.panes[pane].active_tab != tab_idx {
+                self.panes[pane].active_tab = tab_idx;
+                self.dirty = true;
             }
-            ctx.set_cursor_icon(if target_pane.is_none() {
-                egui::CursorIcon::NoDrop
-            } else if shift {
-                egui::CursorIcon::Move
+        }
+        self.panes[pane].active_tab().path.clone()
+    }
+
+    /// Per-frame check for a native drop that landed directly on one of our
+    /// own panes/tabs without us having started it — i.e. a genuinely
+    /// external drag (Explorer, WinRAR…) dropped straight onto FileMan. A
+    /// self-drop (started by `start_native_drag`) is already consumed
+    /// there, so this normally only fires for external drops.
+    fn process_pending_native_drop(&mut self) {
+        let pending = self.dnd_shared.lock().unwrap().pending_drop.take();
+        if let Some(drop) = pending {
+            let dest = self.resolve_drop_dest(drop.pane, drop.tab);
+            let op = if drop.is_move { ClipboardOp::Cut } else { ClipboardOp::Copy };
+            self.transfer_items(drop.paths, dest, Some(op));
+        }
+    }
+
+    /// Starts an OS-level drag of `paths` (see `native_drag`'s module docs
+    /// for why this must happen the moment the drag gesture starts, not
+    /// deferred until the cursor is seen leaving the window). Blocks until
+    /// the drop resolves, then handles one of three outcomes: dropped back
+    /// onto one of our own panes/tabs (resolved via `dnd_shared`, written by
+    /// `native_drag`'s `IDropTarget`), dropped onto another application
+    /// (deletes the sources on MOVE, matching Explorer's drag semantics), or
+    /// cancelled/failed.
+    fn start_native_drag(&mut self, from_pane: usize, paths: Vec<PathBuf>, from_dir: PathBuf) {
+        {
+            let mut st = self.dnd_shared.lock().unwrap();
+            st.own_drag = true;
+            st.pending_drop = None;
+        }
+        let outcome = crate::native_drag::start_drag_out(&paths);
+        let pending = {
+            let mut st = self.dnd_shared.lock().unwrap();
+            st.own_drag = false;
+            st.pending_drop.take()
+        };
+
+        if let Some(drop) = pending {
+            let dest = self.resolve_drop_dest(drop.pane, drop.tab);
+            if dest == from_dir {
+                self.status = "Source and destination are the same folder".to_string();
             } else {
-                egui::CursorIcon::Copy
-            });
+                let op = if drop.is_move { ClipboardOp::Cut } else { ClipboardOp::Copy };
+                self.clipboard = drop.paths.clone();
+                self.clipboard_op = Some(op);
+                self.transfer_items(drop.paths, dest, Some(op));
+            }
+            // The dragged items left the source folder: forget its selection.
+            if let Some(src_pane) = self.panes.get_mut(from_pane) {
+                src_pane.active_tab_mut().clear_selection();
+            }
             return;
         }
 
-        // Release: transfer into the target pane's active folder — or cancel
-        // when dropped inside the window but outside every pane. (The plugin
-        // clears the payload at end-of-pass anyway; clearing here keeps
-        // things explicit.)
-        self.release_dnd_capture();
-        egui::DragAndDrop::clear_payload(ctx);
-        let Some(target_pane) = target_pane else { return };
-        let dest = self.panes[target_pane].active_tab().path.clone();
-        if dest == payload.from_dir {
-            self.status = "Source and destination are the same folder".to_string();
-            return;
-        }
-        let op = if shift { ClipboardOp::Cut } else { ClipboardOp::Copy };
-        self.clipboard = payload.paths.clone();
-        self.clipboard_op = Some(op);
-        self.transfer_items(payload.paths, dest, Some(op));
-        // The dragged items left the source folder: forget its selection.
-        if let Some(src_pane) = self.panes.get_mut(payload.from_pane) {
-            src_pane.active_tab_mut().clear_selection();
-        }
-    }
-
-    /// Grabs Win32 mouse capture for an in-progress internal drag so motion
-    /// events keep arriving beyond the window edge (see
-    /// `process_file_drag_drop`).
-    #[cfg(windows)]
-    fn set_dnd_capture(&mut self, hwnd: Option<windows::Win32::Foundation::HWND>) {
-        if let Some(hwnd) = hwnd {
-            unsafe {
-                windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
-            }
-            self.dnd_capture_active = true;
-        }
-    }
-
-    /// Releases the capture taken by `set_dnd_capture`.
-    #[cfg(windows)]
-    fn release_dnd_capture(&mut self) {
-        if self.dnd_capture_active {
-            unsafe {
-                // Failure is fine: capture is auto-released when the window
-                // loses it (alt-tab, another SetCapture).
-                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-            }
-            self.dnd_capture_active = false;
-        }
-    }
-
-    /// Non-Windows no-ops for the capture pair.
-    #[cfg(not(windows))]
-    fn set_dnd_capture(&mut self, _hwnd: Option<()>) {
-        self.dnd_capture_active = true;
-    }
-
-    #[cfg(not(windows))]
-    fn release_dnd_capture(&mut self) {
-        self.dnd_capture_active = false;
-    }
-
-    /// Resolves an OS-level drag-out (see `native_drag`): refreshes listings
-    /// and reports the result. A target that requested MOVE deletes the
-    /// sources (to the Recycle Bin), matching Explorer's drag semantics.
-    fn finish_drag_out(&mut self, paths: &[PathBuf]) {
-        match crate::native_drag::start_drag_out(paths) {
+        // Not dropped on one of our own panes: it genuinely left to the OS
+        // (another application accepted it, or the drag was cancelled).
+        match outcome {
             crate::native_drag::DragOutOutcome::Dropped { moved } => {
                 if moved {
                     let parents: Vec<PathBuf> = paths
                         .iter()
                         .filter_map(|p| p.parent().map(|x| x.to_path_buf()))
                         .collect();
-                    match crate::fs_ops::delete_to_trash(paths) {
+                    match crate::fs_ops::delete_to_trash(&paths) {
                         Ok(()) => {
                             for dir in parents {
                                 self.mark_dir_dirty(&dir);
@@ -1240,54 +1148,6 @@ impl FileManApp {
                 self.status = format!("Drag failed: {e}");
             }
         }
-    }
-
-    /// Handles files/folders dragged in from another application (e.g.
-    /// Explorer, WinRAR): drops them (always copied — the source isn't ours
-    /// to move from) into whichever pane/tab the pointer was actually over.
-    fn process_external_file_drop(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if dropped.is_empty() {
-            return;
-        }
-        let paths: Vec<PathBuf> = dropped
-            .into_iter()
-            .map(|f| f.path().to_path_buf())
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect();
-        if paths.is_empty() {
-            return;
-        }
-        // egui's own pointer position is stale here — see `native_cursor_pos`.
-        let pos = native_cursor_pos(frame, ctx)
-            .or_else(|| ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())));
-
-        // Dropping directly on a tab header targets that tab specifically
-        // (and brings it to front), matching the in-app drag & drop behavior.
-        let tab_hit = pos.and_then(|pos| {
-            self.dnd_tab_rects
-                .iter()
-                .find(|(_, rect, _)| rect.contains(pos))
-                .map(|&((pane_idx, tab_idx), ..)| (pane_idx, tab_idx))
-        });
-
-        let (target_pane, dest) = if let Some((pane_idx, tab_idx)) = tab_hit {
-            self.panes[pane_idx].active_tab = tab_idx;
-            self.active_pane = pane_idx;
-            self.dirty = true;
-            (pane_idx, self.panes[pane_idx].tabs[tab_idx].path.clone())
-        } else {
-            let target_pane = pos
-                .and_then(|pos| {
-                    self.dnd_pane_rects
-                        .iter()
-                        .position(|r| r.is_some_and(|rect| rect.contains(pos)))
-                })
-                .unwrap_or(self.active_pane);
-            (target_pane, self.panes[target_pane].active_tab().path.clone())
-        };
-        self.active_pane = target_pane;
-        self.transfer_items(paths, dest, Some(ClipboardOp::Copy));
     }
 
     fn delete_selection(&mut self) {
@@ -2979,10 +2839,11 @@ impl FileManApp {
                 }
 
                 // A row drag starts a copy/move gesture: make sure the
-                // dragged entry is part of the selection, then publish the
-                // selected paths as the drag payload. Modifiers are ignored
-                // at drag START on purpose — Shift+drag means "move" at drop
-                // time, not range-select.
+                // dragged entry is part of the selection, then queue the
+                // native OS drag to start once this pane's borrow ends (see
+                // `start_native_drag`). Modifiers are ignored at drag START
+                // on purpose — Shift+drag means "move" at drop time, not
+                // range-select.
                 if let Some(name) = drag_start.take() {
                     if !pane.active_tab().selected.contains(&name) {
                         pane.active_tab_mut().select_only(&name);
@@ -2990,14 +2851,9 @@ impl FileManApp {
                     self.last_selected_index = None;
                     self.active_pane = pane_idx;
                     let tab = pane.active_tab();
-                    egui::DragAndDrop::set_payload(
-                        ctx,
-                        DragFiles {
-                            paths: tab.selected.iter().map(|n| tab.path.join(n)).collect(),
-                            from_dir: tab.path.clone(),
-                            from_pane: pane_idx,
-                        },
-                    );
+                    let paths: Vec<PathBuf> = tab.selected.iter().map(|n| tab.path.join(n)).collect();
+                    let from_dir = tab.path.clone();
+                    self.pending_native_drag = Some((pane_idx, paths, from_dir));
                 }
 
                 if let Some(name) = select_name {
@@ -4291,11 +4147,18 @@ impl eframe::App for FileManApp {
             }
         });
 
-        // In-flight file drag & drop: tab-opening, drop-target feedback and
-        // the actual copy/move on release. Runs after the panes have laid
-        // out so this frame's rects are current.
-        self.process_file_drag_drop(&ctx, frame);
-        self.process_external_file_drop(&ctx, frame);
+        // Native drag & drop (see `native_drag`'s module docs): register the
+        // drop target once an HWND is available, publish this frame's
+        // freshly-laid-out pane/tab rects for it to hit-test against, start
+        // any row-drag that began this frame (blocks until the drop
+        // resolves), then pick up a drop that landed on us without us
+        // having started it (a genuinely external drag).
+        self.ensure_drop_target_registered(frame);
+        self.sync_dnd_shared(&ctx);
+        if let Some((pane_idx, paths, from_dir)) = self.pending_native_drag.take() {
+            self.start_native_drag(pane_idx, paths, from_dir);
+        }
+        self.process_pending_native_drop();
 
         // Toast notifications: whenever the status message changes, surface
         // it as a transient banner near the top of the window for ~3 seconds
