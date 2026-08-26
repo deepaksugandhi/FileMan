@@ -76,12 +76,16 @@ pub fn load_file_icon_texture(
 ) -> Option<egui::TextureHandle> {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
-    use windows::Win32::UI::Shell::{SHGFI_ICON, SHGFI_LARGEICON, SHGetFileInfoW, SHFILEINFOW};
+    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGetFileInfoW};
     use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+    use windows::core::PCWSTR;
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut sfi = SHFILEINFOW::default();
     let ok = unsafe {
         SHGetFileInfoW(
@@ -138,10 +142,12 @@ fn finish_texture(
 
 /// Decodes a HICON into top-down BGRA pixels plus its dimensions.
 #[cfg(windows)]
-fn hicon_to_rgba(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<(Vec<u8>, [usize; 2])> {
+fn hicon_to_rgba(
+    hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> Option<(Vec<u8>, [usize; 2])> {
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC,
-        BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
 
@@ -194,14 +200,15 @@ fn hicon_to_rgba(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Optio
 }
 
 #[cfg(windows)]
-fn extract_first_icon_hicon(exe_path: &str) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
-    use windows::core::PCWSTR;
+fn extract_first_icon_hicon(
+    exe_path: &str,
+) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     use windows::Win32::UI::Shell::ExtractIconExW;
+    use windows::core::PCWSTR;
 
     let wide: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
     let mut hicon = Default::default();
-    let count =
-        unsafe { ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut hicon), None, 1) };
+    let count = unsafe { ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut hicon), None, 1) };
     if count == 0 || hicon.is_invalid() {
         return None;
     }

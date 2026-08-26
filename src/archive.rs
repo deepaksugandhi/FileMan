@@ -134,6 +134,9 @@ mod tests {
 
         extract_archive(&zip_path, &extract_dir).unwrap();
         assert!(extract_dir.join("hello.txt").exists());
-        assert_eq!(fs::read(extract_dir.join("hello.txt")).unwrap(), b"hello world");
+        assert_eq!(
+            fs::read(extract_dir.join("hello.txt")).unwrap(),
+            b"hello world"
+        );
     }
 }

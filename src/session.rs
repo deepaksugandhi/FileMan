@@ -134,7 +134,17 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name
          FROM panes WHERE user_id = ?1 ORDER BY pane_index, tab_index",
     )?;
-    let rows: Vec<(i64, String, bool, String, bool, String, String, i64, Option<String>)> = stmt
+    let rows: Vec<(
+        i64,
+        String,
+        bool,
+        String,
+        bool,
+        String,
+        String,
+        i64,
+        Option<String>,
+    )> = stmt
         .query_map(params![user_id], |row| {
             Ok((
                 row.get(0)?,
@@ -154,15 +164,21 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         return Ok(None);
     }
 
-    let pane_count = rows
-        .iter()
-        .map(|(idx, ..)| *idx)
-        .max()
-        .unwrap() as usize
-        + 1;
+    let pane_count = rows.iter().map(|(idx, ..)| *idx).max().unwrap() as usize + 1;
     let mut panes: Vec<Option<Pane>> = (0..pane_count).map(|_| None).collect();
 
-    for (pane_idx, path, is_active, sort_col, sort_asc, col_widths, view_mode, locked, custom_name) in rows {
+    for (
+        pane_idx,
+        path,
+        is_active,
+        sort_col,
+        sort_asc,
+        col_widths,
+        view_mode,
+        locked,
+        custom_name,
+    ) in rows
+    {
         let pane_idx = pane_idx as usize;
         let pane = panes[pane_idx].get_or_insert_with(|| Pane {
             tabs: Vec::new(),
@@ -238,7 +254,9 @@ mod tests {
 
         save_session(&conn, 1, &window, &[pane0, pane1], 1).unwrap();
 
-        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1)
+            .unwrap()
+            .expect("session should exist");
 
         assert_eq!(loaded.panes.len(), 2);
         assert_eq!(loaded.panes[0].tabs.len(), 2);
@@ -280,7 +298,9 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1)
+            .unwrap()
+            .expect("session should exist");
         assert_eq!(loaded.panes[0].tabs[0].sort_col, "size");
         assert!(!loaded.panes[0].tabs[0].sort_asc);
     }
@@ -308,8 +328,13 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
-        assert_eq!(loaded.panes[0].tabs[0].col_widths, [300.5, 120.0, 80.0, 45.0]);
+        let loaded = load_session(&conn, 1)
+            .unwrap()
+            .expect("session should exist");
+        assert_eq!(
+            loaded.panes[0].tabs[0].col_widths,
+            [300.5, 120.0, 80.0, 45.0]
+        );
     }
 
     #[test]
@@ -387,8 +412,22 @@ mod tests {
             pos_y: None,
             monitor_name: None,
         };
-        save_session(&conn, 1, &window, &[Pane::new(dir1.path().to_path_buf())], 0).unwrap();
-        save_session(&conn, 2, &window, &[Pane::new(dir2.path().to_path_buf())], 0).unwrap();
+        save_session(
+            &conn,
+            1,
+            &window,
+            &[Pane::new(dir1.path().to_path_buf())],
+            0,
+        )
+        .unwrap();
+        save_session(
+            &conn,
+            2,
+            &window,
+            &[Pane::new(dir2.path().to_path_buf())],
+            0,
+        )
+        .unwrap();
 
         let loaded1 = load_session(&conn, 1).unwrap().expect("user 1 session");
         let loaded2 = load_session(&conn, 2).unwrap().expect("user 2 session");
@@ -420,7 +459,9 @@ mod tests {
         conn.execute("UPDATE app_state SET active_pane = 5 WHERE user_id = 1", [])
             .unwrap();
 
-        let loaded = load_session(&conn, 1).unwrap().expect("session should exist");
+        let loaded = load_session(&conn, 1)
+            .unwrap()
+            .expect("session should exist");
         assert_eq!(loaded.active_pane, 0); // clamped to the only valid index
     }
 }

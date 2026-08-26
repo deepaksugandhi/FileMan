@@ -98,7 +98,12 @@ impl Tab {
     /// only when the cache key (those three plus `listing_version`) changed
     /// since the last call.
     pub fn display_entries(&mut self, filter: &str, sort_col: &str, sort_asc: bool) -> &[FsEntry] {
-        let key = (self.listing_version, filter.to_string(), sort_col.to_string(), sort_asc);
+        let key = (
+            self.listing_version,
+            filter.to_string(),
+            sort_col.to_string(),
+            sort_asc,
+        );
         let stale = match &self.display_cache {
             Some((cached_key, _)) => *cached_key != key,
             None => true,
@@ -271,7 +276,10 @@ mod tests {
         let mut a = Tab::new(PathBuf::from("C:\\a"));
         let b = Tab::new(PathBuf::from("C:\\b"));
         a.filter = "readme".to_string();
-        assert!(b.filter.is_empty(), "each tab has its own independent filter");
+        assert!(
+            b.filter.is_empty(),
+            "each tab has its own independent filter"
+        );
 
         a.navigate_to(PathBuf::from("C:\\a\\sub"));
         assert!(a.filter.is_empty(), "navigating clears the stale filter");

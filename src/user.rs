@@ -40,7 +40,11 @@ pub fn default_user_id(conn: &Connection) -> i64 {
         [],
         |row| row.get(0),
     )
-    .or_else(|_| conn.query_row("SELECT id FROM users ORDER BY id LIMIT 1", [], |row| row.get(0)))
+    .or_else(|_| {
+        conn.query_row("SELECT id FROM users ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+    })
     .unwrap_or(1)
 }
 

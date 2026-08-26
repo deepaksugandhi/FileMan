@@ -59,11 +59,7 @@ fn count_files(dir: &Path) -> u64 {
 
 /// Counts a single item: 1 for a file, recursive count for a directory.
 fn count_item(path: &Path) -> u64 {
-    if path.is_dir() {
-        count_files(path)
-    } else {
-        1
-    }
+    if path.is_dir() { count_files(path) } else { 1 }
 }
 
 /// Copies each item in `items` (file or directory) into `dest_dir` on a
@@ -120,7 +116,11 @@ fn copy_item_recursive(
     done: u64,
     total: u64,
 ) -> io::Result<u64> {
-    let name = src.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = src
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let _ = progress.send(ProgressUpdate {
         files_done: done,
         files_total: total,
@@ -242,7 +242,11 @@ pub fn delete_to_trash_bg(paths: Vec<PathBuf>) -> BackgroundOp {
         let mut errors = Vec::new();
         let mut permanent_count = 0u64;
         for (i, path) in paths.iter().enumerate() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             let _ = progress_tx.send(ProgressUpdate {
                 files_done: i as u64,
                 files_total: total,
@@ -251,8 +255,11 @@ pub fn delete_to_trash_bg(paths: Vec<PathBuf>) -> BackgroundOp {
             match trash::delete(path) {
                 Ok(()) => {}
                 Err(_) => {
-                    // Fallback to permanent delete (network/UNC paths, etc.)
-                    match std::fs::remove_file(path) {
+                    // Fallback to permanent delete (network/UNC paths have
+                    // no Recycle Bin). Must handle folders too: removing a
+                    // directory with `remove_file` fails with a misleading
+                    // "Access is denied (os error 5)".
+                    match crate::fs_ops::delete_permanently(path) {
                         Ok(()) => {
                             permanent_count += 1;
                         }
@@ -309,7 +316,10 @@ mod tests {
         while op.poll() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(op.status, OpStatus::Completed(format!("Copied into {}", dest.display())));
+        assert_eq!(
+            op.status,
+            OpStatus::Completed(format!("Copied into {}", dest.display()))
+        );
         assert!(dest.join("hello.txt").exists());
     }
 
@@ -344,7 +354,10 @@ mod tests {
         while op.poll() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(op.status, OpStatus::Completed(format!("Moved into {}", dest.display())));
+        assert_eq!(
+            op.status,
+            OpStatus::Completed(format!("Moved into {}", dest.display()))
+        );
         assert!(!src.exists());
         assert!(dest.join("hello.txt").exists());
     }

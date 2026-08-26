@@ -20,26 +20,30 @@
 
 /// Fixed palette assigned in open-order, cycling if more instances than colors.
 const PALETTE: [(u8, u8, u8); 6] = [
-    (66, 133, 244),  // blue
-    (52, 168, 83),   // green
-    (251, 140, 0),   // orange
-    (156, 39, 176),  // purple
-    (229, 57, 53),   // red
-    (0, 172, 193),   // cyan
+    (66, 133, 244), // blue
+    (52, 168, 83),  // green
+    (251, 140, 0),  // orange
+    (156, 39, 176), // purple
+    (229, 57, 53),  // red
+    (0, 172, 193),  // cyan
 ];
 
 #[cfg(windows)]
 mod win {
     use super::PALETTE;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HWND, INVALID_HANDLE_VALUE, LPARAM, WPARAM};
-    use windows::Win32::Graphics::Gdi::{CreateBitmap, CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC};
-    use windows::Win32::System::Memory::{CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE};
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, HDC,
+    };
+    use windows::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
+    };
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIconIndirect, SendMessageW, HICON, ICONINFO, ICON_BIG, ICON_SMALL, WM_SETICON,
+        CreateIconIndirect, HICON, ICON_BIG, ICON_SMALL, ICONINFO, SendMessageW, WM_SETICON,
     };
+    use windows::core::PCWSTR;
 
     /// Atomically claims the next open-order slot across all running
     /// instances via a named, pagefile-backed shared memory section.
@@ -94,11 +98,20 @@ mod win {
                 ..Default::default()
             };
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let color = CreateDIBSection(None as Option<HDC>, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let color = CreateDIBSection(
+                None as Option<HDC>,
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .ok()?;
             if bits.is_null() {
                 return None;
             }
-            let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
+            let pixels =
+                std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
             for px in pixels.chunks_exact_mut(4) {
                 px[0] = b;
                 px[1] = g;
@@ -122,10 +135,20 @@ mod win {
         let color = PALETTE[slot % PALETTE.len()];
         unsafe {
             if let Some(big) = colored_icon(color, 32) {
-                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(big.0 as isize)));
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_BIG as usize)),
+                    Some(LPARAM(big.0 as isize)),
+                );
             }
             if let Some(small) = colored_icon(color, 16) {
-                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(small.0 as isize)));
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_SMALL as usize)),
+                    Some(LPARAM(small.0 as isize)),
+                );
             }
         }
     }

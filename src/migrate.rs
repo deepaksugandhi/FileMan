@@ -83,17 +83,19 @@ fn scope_key_user(user_id: i64) -> String {
 pub fn collect(conn: &Connection, user_id: i64, source_user: Option<String>) -> SettingsFile {
     let user_scope = scope_key_user(user_id);
     let query_bindings = |scope: &str| -> Vec<Binding> {
-        conn.prepare_cached("SELECT key_combo, action_id FROM bindings WHERE scope = ?1 ORDER BY key_combo")
-            .and_then(|mut s| {
-                s.query_map([scope], |row| {
-                    Ok(Binding {
-                        combo: row.get(0)?,
-                        action_id: row.get(1)?,
-                    })
+        conn.prepare_cached(
+            "SELECT key_combo, action_id FROM bindings WHERE scope = ?1 ORDER BY key_combo",
+        )
+        .and_then(|mut s| {
+            s.query_map([scope], |row| {
+                Ok(Binding {
+                    combo: row.get(0)?,
+                    action_id: row.get(1)?,
                 })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
             })
-            .unwrap_or_default()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
     };
     let query_toolbar = |scope: &str| -> Vec<String> {
         conn.prepare_cached(
@@ -162,16 +164,15 @@ pub fn collect(conn: &Connection, user_id: i64, source_user: Option<String>) -> 
 
 /// Writes the export as pretty-printed JSON.
 pub fn write_to_path(file: &SettingsFile, path: &std::path::Path) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(file)
-        .map_err(|e| format!("Serialize failed: {e}"))?;
+    let json = serde_json::to_string_pretty(file).map_err(|e| format!("Serialize failed: {e}"))?;
     std::fs::write(path, json).map_err(|e| format!("Write failed: {e}"))
 }
 
 /// Reads and validates an export file.
 pub fn read_from_path(path: &std::path::Path) -> Result<SettingsFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("Read failed: {e}"))?;
-    let file: SettingsFile =
-        serde_json::from_str(&text).map_err(|e| format!("Not a valid FileMan settings file: {e}"))?;
+    let file: SettingsFile = serde_json::from_str(&text)
+        .map_err(|e| format!("Not a valid FileMan settings file: {e}"))?;
     if file.version > FORMAT_VERSION {
         return Err(format!(
             "Settings file version {} is newer than this app supports ({FORMAT_VERSION})",
@@ -199,7 +200,11 @@ pub fn import_into(
             }
         }
     };
-    apply_cfg(&file.user_config, crate::config::Scope::User(user_id), &mut summary.config_values);
+    apply_cfg(
+        &file.user_config,
+        crate::config::Scope::User(user_id),
+        &mut summary.config_values,
+    );
     // Only overwrite shared defaults when the exporter actually had any;
     // otherwise a minimal per-user export would wipe nothing but could add
     // stale globals from an unrelated machine. Appending only is safest.
@@ -230,7 +235,10 @@ pub fn import_into(
         if ids.is_empty() {
             return;
         }
-        if conn.execute("DELETE FROM toolbar_layout WHERE scope = ?1", [scope]).is_ok() {
+        if conn
+            .execute("DELETE FROM toolbar_layout WHERE scope = ?1", [scope])
+            .is_ok()
+        {
             for (pos, id) in ids.iter().enumerate() {
                 let _ = conn.execute(
                     "INSERT INTO toolbar_layout (scope, position, action_id) VALUES (?1, ?2, ?3)",
@@ -353,7 +361,8 @@ mod tests {
             "{{\"version\":{},\"exported_at\":\"x\",\"source_user\":null,\"user_config\":[]}}",
             FORMAT_VERSION + 1
         );
-        let path = std::env::temp_dir().join(format!("fileman-mig-test-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("fileman-mig-test-{}.json", std::process::id()));
         std::fs::write(&path, newer).unwrap();
         assert!(read_from_path(&path).is_err());
         let _ = std::fs::remove_file(&path);
@@ -382,6 +391,9 @@ mod tests {
         import_into(&other, 5, &file).unwrap();
         let map = crate::actions::load_shortcut_map(&other, 5);
         let combo = crate::actions::KeyCombo::ctrl(egui::Key::K);
-        assert_eq!(map.get(&combo), Some(&crate::actions::ActionRef::Custom(99)));
+        assert_eq!(
+            map.get(&combo),
+            Some(&crate::actions::ActionRef::Custom(99))
+        );
     }
 }

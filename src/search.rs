@@ -15,11 +15,7 @@ pub fn filter_entries(entries: &mut Vec<FsEntry>, query: &str) {
 /// whose name matches the query through `tx` as soon as it is found, so the
 /// UI can show results progressively instead of waiting for the whole walk.
 /// The channel closing signals completion.
-pub fn recursive_search(
-    root: PathBuf,
-    query: String,
-    tx: std::sync::mpsc::Sender<FsEntry>,
-) {
+pub fn recursive_search(root: PathBuf, query: String, tx: std::sync::mpsc::Sender<FsEntry>) {
     walk_recursive(&root, &query, &tx);
 }
 
@@ -97,10 +93,7 @@ mod tests {
 
     #[test]
     fn filter_is_case_insensitive() {
-        let mut entries = vec![
-            entry("MyFile.txt", false),
-            entry("other.txt", false),
-        ];
+        let mut entries = vec![entry("MyFile.txt", false), entry("other.txt", false)];
         filter_entries(&mut entries, "myfile");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "MyFile.txt");

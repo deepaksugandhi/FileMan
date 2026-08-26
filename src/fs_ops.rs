@@ -152,17 +152,85 @@ pub fn create_file(parent: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(file)
 }
 
-/// Sends every path to the Recycle Bin (never permanently deletes).
-pub fn delete_to_trash(paths: &[PathBuf]) -> Result<(), trash::Error> {
+/// Sends every path to the Recycle Bin (never permanently deletes — except
+/// for UNC network paths, which have no Recycle Bin; there it falls back to
+/// a permanent delete, matching what Explorer does on shares).
+pub fn delete_to_trash(paths: &[PathBuf]) -> Result<(), String> {
     for path in paths {
-        trash::delete(path)?;
+        match trash::delete(path) {
+            Ok(()) => {}
+            Err(e) => {
+                if is_network_path(path) {
+                    delete_permanently(path).map_err(|err| format!("{}: {err}", path.display()))?;
+                } else {
+                    return Err(format!("{}: {e}", path.display()));
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// True for UNC network paths (`\\server\share\...`), which have no
+/// Recycle Bin.
+pub fn is_network_path(path: &Path) -> bool {
+    path.as_os_str().to_string_lossy().starts_with(r"\\")
+}
+
+/// Permanently removes a file or a whole directory tree. Used as the
+/// fallback where the Recycle Bin can't take the item (network shares).
+pub fn delete_permanently(path: &Path) -> io::Result<()> {
+    // symlink_metadata (not metadata): never follow a link out of the tree
+    // being deleted.
+    if path.symlink_metadata()?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_permanently_removes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"x").unwrap();
+
+        delete_permanently(&file).unwrap();
+
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn delete_permanently_removes_directory_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("020814");
+        fs::create_dir_all(tree.join("nested")).unwrap();
+        fs::write(tree.join("f.txt"), b"x").unwrap();
+        fs::write(tree.join("nested").join("g.txt"), b"y").unwrap();
+
+        delete_permanently(&tree).unwrap();
+
+        assert!(!tree.exists(), "folders must be removable, not just files");
+    }
+
+    #[test]
+    fn delete_permanently_reports_missing_paths_as_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        assert!(delete_permanently(&missing).is_err());
+    }
+
+    #[test]
+    fn network_path_detection_covers_unc_but_not_local_drives() {
+        assert!(is_network_path(Path::new(r"\\ho\d\MSDN\Work")));
+        assert!(is_network_path(Path::new(r"\\")));
+        assert!(!is_network_path(Path::new(r"C:\Users\PC")));
+        assert!(!is_network_path(Path::new(r"Z:\folder")));
+    }
 
     #[test]
     fn copies_a_file() {

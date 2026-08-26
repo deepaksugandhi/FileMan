@@ -18,9 +18,9 @@ pub fn list_drives() -> Vec<PathBuf> {
 pub fn list_network_servers() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
+        use windows::Win32::Foundation::*;
         use windows::Win32::NetworkManagement::WNet::*;
         use windows::Win32::System::Com::*;
-        use windows::Win32::Foundation::*;
 
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -107,9 +107,10 @@ pub fn unc_share_root(path: &Path) -> Option<PathBuf> {
         return None;
     };
     match prefix.kind() {
-        Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
-            Some(PathBuf::from(format!("{}\\", prefix.as_os_str().to_string_lossy())))
-        }
+        Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => Some(PathBuf::from(format!(
+            "{}\\",
+            prefix.as_os_str().to_string_lossy()
+        ))),
         _ => None,
     }
 }

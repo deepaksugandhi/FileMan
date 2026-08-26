@@ -21,8 +21,8 @@ pub const KEY_TIPS_ENABLED: &str = "tips_enabled";
 const TIPS: &[&str] = &[
     "Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste files — pasting lands in whichever folder you're browsing.",
     "Use F3 to copy full file path & F4 to copy folder path.",
-	"Delete sends the selection to the Recycle Bin, so slips of the mouse are always recoverable.",
-	"Create a unique profile for each user/scenario. Click dropdown besides Settings button.",
+    "Delete sends the selection to the Recycle Bin, so slips of the mouse are always recoverable.",
+    "Create a unique profile for each user/scenario. Click dropdown besides Settings button.",
     "Press Ctrl+F to search a folder tree recursively, then narrow the hits with the name and folder filters.",
     "Right-click any tab to duplicate or close it — handy for comparing two folders side by side.",
     "Drag the divider between the two panes to give either side more room.",
@@ -190,11 +190,10 @@ impl TipsCard {
                                         // (two strokes) so it never depends
                                         // on font/emoji glyph coverage — same
                                         // approach as the settings nav icons.
-                                        let (close_rect, close_resp) = ui
-                                            .allocate_exact_size(
-                                                egui::vec2(20.0, 20.0),
-                                                egui::Sense::click(),
-                                            );
+                                        let (close_rect, close_resp) = ui.allocate_exact_size(
+                                            egui::vec2(20.0, 20.0),
+                                            egui::Sense::click(),
+                                        );
                                         let close_resp = close_resp
                                             .on_hover_text("Hide tips until FileMan restarts");
                                         if close_resp.clicked() {

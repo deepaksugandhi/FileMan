@@ -1,8 +1,8 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,23 +46,21 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
 /// Recognized columns: "name", "modified", "size", "archive".
 pub fn sort_entries(entries: &mut [FsEntry], sort_col: &str, asc: bool) {
     entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| {
-                if a.is_dir {
-                    // Dirs always sorted alphabetically, always ascending.
-                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                } else {
-                    // Files sorted by the requested column.
-                    let ord = match sort_col {
-                        "modified" => a.modified.cmp(&b.modified),
-                        "size" => a.size.cmp(&b.size),
-                        "archive" => a.archive.cmp(&b.archive),
-                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    };
-                    if asc { ord } else { ord.reverse() }
-                }
-            })
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            if a.is_dir {
+                // Dirs always sorted alphabetically, always ascending.
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            } else {
+                // Files sorted by the requested column.
+                let ord = match sort_col {
+                    "modified" => a.modified.cmp(&b.modified),
+                    "size" => a.size.cmp(&b.size),
+                    "archive" => a.archive.cmp(&b.archive),
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                };
+                if asc { ord } else { ord.reverse() }
+            }
+        })
     });
 }
 

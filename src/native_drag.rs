@@ -136,20 +136,23 @@ pub fn start_drag_out(paths: &[std::path::PathBuf]) -> DragOutOutcome {
 mod imp {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::{implement, PCWSTR};
     use windows::Win32::Foundation::{
         DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, POINT, S_OK,
     };
     use windows::Win32::Graphics::Gdi::ScreenToClient;
-    use windows::Win32::System::Com::{CoTaskMemFree, IDataObject, FORMATETC, TYMED_HGLOBAL, DVASPECT_CONTENT};
+    use windows::Win32::System::Com::{
+        CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL,
+    };
     use windows::Win32::System::Ole::{
-        DoDragDrop, IDropSource, IDropSource_Impl, IDropTarget, IDropTarget_Impl,
-        ReleaseStgMedium, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
-        DROPEFFECT_NONE,
+        CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
+        DoDragDrop, IDropSource, IDropSource_Impl, IDropTarget, IDropTarget_Impl, ReleaseStgMedium,
     };
     use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{ILCreateFromPathW, SHCreateShellItemArrayFromIDLists, BHID_DataObject};
+    use windows::Win32::UI::Shell::{
+        BHID_DataObject, ILCreateFromPathW, SHCreateShellItemArrayFromIDLists,
+    };
+    use windows::core::{PCWSTR, implement};
 
     pub(super) fn register_drop_target(
         hwnd: windows::Win32::Foundation::HWND,
@@ -263,7 +266,10 @@ mod imp {
 
     impl FileDropTarget_Impl {
         /// Screen-space `pt` -> egui points -> the pane/tab under it, if any.
-        fn hit_test(&self, pt: &windows::Win32::Foundation::POINTL) -> Option<(usize, Option<usize>)> {
+        fn hit_test(
+            &self,
+            pt: &windows::Win32::Foundation::POINTL,
+        ) -> Option<(usize, Option<usize>)> {
             let mut p = POINT { x: pt.x, y: pt.y };
             unsafe {
                 let _ = ScreenToClient(self.hwnd, &mut p);
@@ -272,7 +278,10 @@ mod imp {
             if st.pixels_per_point <= 0.0 {
                 return None;
             }
-            let (x, y) = (p.x as f32 / st.pixels_per_point, p.y as f32 / st.pixels_per_point);
+            let (x, y) = (
+                p.x as f32 / st.pixels_per_point,
+                p.y as f32 / st.pixels_per_point,
+            );
             for &((pane, tab), (l, t, r, b)) in &st.tab_rects {
                 if x >= l && x <= r && y >= t && y <= b {
                     return Some((pane, Some(tab)));
@@ -340,7 +349,9 @@ mod imp {
             let own_drag = self.state.lock().unwrap().own_drag;
             let effect = match self.hit_test(pt) {
                 None => DROPEFFECT_NONE,
-                Some(_) if own_drag && (grfkeystate & MK_SHIFT) != MODIFIERKEYS_FLAGS(0) => DROPEFFECT_MOVE,
+                Some(_) if own_drag && (grfkeystate & MK_SHIFT) != MODIFIERKEYS_FLAGS(0) => {
+                    DROPEFFECT_MOVE
+                }
                 Some(_) => DROPEFFECT_COPY,
             };
             unsafe {
@@ -376,9 +387,18 @@ mod imp {
             }
             let own_drag = self.state.lock().unwrap().own_drag;
             let is_move = own_drag && (grfkeystate & MK_SHIFT) != MODIFIERKEYS_FLAGS(0);
-            self.state.lock().unwrap().pending_drop = Some(PendingDrop { paths, pane, tab, is_move });
+            self.state.lock().unwrap().pending_drop = Some(PendingDrop {
+                paths,
+                pane,
+                tab,
+                is_move,
+            });
             unsafe {
-                *pdweffect = if is_move { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+                *pdweffect = if is_move {
+                    DROPEFFECT_MOVE
+                } else {
+                    DROPEFFECT_COPY
+                };
             }
             Ok(())
         }

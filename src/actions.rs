@@ -14,7 +14,12 @@ pub struct KeyCombo {
 
 impl KeyCombo {
     pub fn new(ctrl: bool, shift: bool, alt: bool, key: egui::Key) -> Self {
-        KeyCombo { ctrl, shift, alt, key }
+        KeyCombo {
+            ctrl,
+            shift,
+            alt,
+            key,
+        }
     }
 
     pub fn ctrl(key: egui::Key) -> Self {
@@ -66,7 +71,12 @@ impl KeyCombo {
                 other => key = egui::Key::ALL.iter().copied().find(|k| k.name() == other),
             }
         }
-        key.map(|key| KeyCombo { ctrl, shift, alt, key })
+        key.map(|key| KeyCombo {
+            ctrl,
+            shift,
+            alt,
+            key,
+        })
     }
 }
 
@@ -332,7 +342,12 @@ pub fn list_custom_actions(conn: &Connection, user_id: i64) -> Vec<CustomAction>
 }
 
 /// Adds a custom "open with `<exe>`" action, scoped to `user_id`.
-pub fn add_custom_action(conn: &Connection, user_id: i64, label: &str, exe_path: &str) -> Result<i64> {
+pub fn add_custom_action(
+    conn: &Connection,
+    user_id: i64,
+    label: &str,
+    exe_path: &str,
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO custom_actions (label, exe_path, scope) VALUES (?1, ?2, ?3)",
         rusqlite::params![label, exe_path, Scope::User(user_id).to_key()],
@@ -342,7 +357,10 @@ pub fn add_custom_action(conn: &Connection, user_id: i64, label: &str, exe_path:
 
 /// Removes a custom action by row id.
 pub fn remove_custom_action(conn: &Connection, id: i64) -> Result<()> {
-    conn.execute("DELETE FROM custom_actions WHERE id = ?1", rusqlite::params![id])?;
+    conn.execute(
+        "DELETE FROM custom_actions WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
     Ok(())
 }
 
@@ -357,13 +375,19 @@ pub fn load_shortcut_map(conn: &Connection, user_id: i64) -> HashMap<KeyCombo, A
         }
     }
     for scope_key in [Scope::Global.to_key(), Scope::User(user_id).to_key()] {
-        if let Ok(mut stmt) = conn.prepare("SELECT key_combo, action_id FROM bindings WHERE scope = ?1") {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT key_combo, action_id FROM bindings WHERE scope = ?1")
+        {
             let rows: Vec<(String, String)> = stmt
-                .query_map(rusqlite::params![scope_key], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_map(rusqlite::params![scope_key], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
             for (combo_str, action_id) in rows {
-                let Some(combo) = KeyCombo::parse(&combo_str) else { continue };
+                let Some(combo) = KeyCombo::parse(&combo_str) else {
+                    continue;
+                };
                 if action_id == UNBOUND_SENTINEL {
                     // Explicitly cleared — overrides the hardcoded default
                     // (or a global binding) for this combo.
@@ -381,7 +405,12 @@ pub fn load_shortcut_map(conn: &Connection, user_id: i64) -> HashMap<KeyCombo, A
 /// action already bound there) if `combo` is already taken by something
 /// else in that same scope's *explicit* bindings — callers surface this as
 /// a status message rather than silently overwriting.
-pub fn set_binding(conn: &Connection, scope: Scope, combo: KeyCombo, action: ActionRef) -> Result<Option<ActionRef>> {
+pub fn set_binding(
+    conn: &Connection,
+    scope: Scope,
+    combo: KeyCombo,
+    action: ActionRef,
+) -> Result<Option<ActionRef>> {
     let scope_key = scope.to_key();
     let combo_str = combo.to_string();
     let existing: Option<String> = conn
@@ -422,23 +451,30 @@ pub fn clear_binding(conn: &Connection, scope: Scope, combo: KeyCombo) -> Result
 
 /// Reads the toolbar layout for `scope`, ordered by position.
 pub fn get_layout(conn: &Connection, scope: Scope) -> Vec<ActionRef> {
-    let mut stmt = match conn.prepare("SELECT action_id FROM toolbar_layout WHERE scope = ?1 ORDER BY position") {
+    let mut stmt = match conn
+        .prepare("SELECT action_id FROM toolbar_layout WHERE scope = ?1 ORDER BY position")
+    {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    stmt.query_map(rusqlite::params![scope.to_key()], |row| row.get::<_, String>(0))
-        .map(|rows| {
-            rows.filter_map(|r| r.ok())
-                .filter_map(|id| ActionRef::from_id(&id))
-                .collect()
-        })
-        .unwrap_or_default()
+    stmt.query_map(rusqlite::params![scope.to_key()], |row| {
+        row.get::<_, String>(0)
+    })
+    .map(|rows| {
+        rows.filter_map(|r| r.ok())
+            .filter_map(|id| ActionRef::from_id(&id))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Overwrites the toolbar layout for `scope`.
 pub fn set_layout(conn: &Connection, scope: Scope, actions: &[ActionRef]) -> Result<()> {
     let scope_key = scope.to_key();
-    conn.execute("DELETE FROM toolbar_layout WHERE scope = ?1", rusqlite::params![scope_key])?;
+    conn.execute(
+        "DELETE FROM toolbar_layout WHERE scope = ?1",
+        rusqlite::params![scope_key],
+    )?;
     for (position, action) in actions.iter().enumerate() {
         conn.execute(
             "INSERT INTO toolbar_layout (scope, position, action_id) VALUES (?1, ?2, ?3)",
@@ -486,8 +522,20 @@ mod tests {
         init_tables(&conn).unwrap();
 
         let combo = KeyCombo::ctrl(egui::Key::K);
-        set_binding(&conn, Scope::User(1), combo, ActionRef::Builtin(Action::Copy)).unwrap();
-        let conflict = set_binding(&conn, Scope::User(1), combo, ActionRef::Builtin(Action::Cut)).unwrap();
+        set_binding(
+            &conn,
+            Scope::User(1),
+            combo,
+            ActionRef::Builtin(Action::Copy),
+        )
+        .unwrap();
+        let conflict = set_binding(
+            &conn,
+            Scope::User(1),
+            combo,
+            ActionRef::Builtin(Action::Cut),
+        )
+        .unwrap();
         assert_eq!(conflict, Some(ActionRef::Builtin(Action::Copy)));
     }
 
@@ -498,8 +546,20 @@ mod tests {
         init_tables(&conn).unwrap();
 
         let combo = KeyCombo::ctrl(egui::Key::K);
-        set_binding(&conn, Scope::User(1), combo, ActionRef::Builtin(Action::Copy)).unwrap();
-        let result = set_binding(&conn, Scope::User(1), combo, ActionRef::Builtin(Action::Copy)).unwrap();
+        set_binding(
+            &conn,
+            Scope::User(1),
+            combo,
+            ActionRef::Builtin(Action::Copy),
+        )
+        .unwrap();
+        let result = set_binding(
+            &conn,
+            Scope::User(1),
+            combo,
+            ActionRef::Builtin(Action::Copy),
+        )
+        .unwrap();
         assert_eq!(result, None);
     }
 
@@ -511,19 +571,43 @@ mod tests {
 
         // Default: Ctrl+C is Copy.
         let map = load_shortcut_map(&conn, 1);
-        assert_eq!(map.get(&KeyCombo::ctrl(egui::Key::C)), Some(&ActionRef::Builtin(Action::Copy)));
+        assert_eq!(
+            map.get(&KeyCombo::ctrl(egui::Key::C)),
+            Some(&ActionRef::Builtin(Action::Copy))
+        );
 
         // Global override: Ctrl+C becomes Find for everyone.
-        set_binding(&conn, Scope::Global, KeyCombo::ctrl(egui::Key::C), ActionRef::Builtin(Action::Find)).unwrap();
+        set_binding(
+            &conn,
+            Scope::Global,
+            KeyCombo::ctrl(egui::Key::C),
+            ActionRef::Builtin(Action::Find),
+        )
+        .unwrap();
         let map = load_shortcut_map(&conn, 1);
-        assert_eq!(map.get(&KeyCombo::ctrl(egui::Key::C)), Some(&ActionRef::Builtin(Action::Find)));
+        assert_eq!(
+            map.get(&KeyCombo::ctrl(egui::Key::C)),
+            Some(&ActionRef::Builtin(Action::Find))
+        );
 
         // Per-user override: user 1 gets Copy back, user 2 still sees Find.
-        set_binding(&conn, Scope::User(1), KeyCombo::ctrl(egui::Key::C), ActionRef::Builtin(Action::Copy)).unwrap();
+        set_binding(
+            &conn,
+            Scope::User(1),
+            KeyCombo::ctrl(egui::Key::C),
+            ActionRef::Builtin(Action::Copy),
+        )
+        .unwrap();
         let map1 = load_shortcut_map(&conn, 1);
         let map2 = load_shortcut_map(&conn, 2);
-        assert_eq!(map1.get(&KeyCombo::ctrl(egui::Key::C)), Some(&ActionRef::Builtin(Action::Copy)));
-        assert_eq!(map2.get(&KeyCombo::ctrl(egui::Key::C)), Some(&ActionRef::Builtin(Action::Find)));
+        assert_eq!(
+            map1.get(&KeyCombo::ctrl(egui::Key::C)),
+            Some(&ActionRef::Builtin(Action::Copy))
+        );
+        assert_eq!(
+            map2.get(&KeyCombo::ctrl(egui::Key::C)),
+            Some(&ActionRef::Builtin(Action::Find))
+        );
     }
 
     #[test]

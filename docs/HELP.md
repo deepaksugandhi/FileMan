@@ -40,6 +40,8 @@ The left panel shows your drives and folders. Click any folder to navigate there
 
 Each pane supports multiple tabs. Open a new tab with the **+ Tab** button or close one with the **x** on hover. Right-click a tab for more options (duplicate, close, pin). Pinned tabs resist accidental navigation.
 
+Tab labels show the folder name automatically. **Rename Tab** (right-click) assigns a custom label that survives navigation; renamed tabs wear a small teal dot in their top-left corner so you can tell them apart from automatic names. Hovering the tab explains the marker.
+
 ---
 
 ## Viewing Files
@@ -62,6 +64,13 @@ Type in the filter box (next to the Up button) to narrow the visible files. The 
 
 In Details view, click any column header to sort by that column. Click again to reverse the sort order. A small arrow indicates the active sort column.
 
+Sorting is **universal**: whatever you pick becomes the default for every tab you open from now on. When you change the sorting, FileMan asks where to apply it:
+
+- **All open tabs** — re-sorts every open tab in both panes and saves it as your default.
+- **This tab only** — re-sorts just the current tab; other tabs and the default are untouched.
+
+Either way, a tab you sort individually keeps its own sorting — across navigation, new folders, and app restarts — until you change it again.
+
 ---
 
 ## File Operations
@@ -73,7 +82,7 @@ In Details view, click any column header to sort by that column. Click again to 
 | Copy | Ctrl+C | Copy selected files to clipboard |
 | Cut | Ctrl+X | Cut selected files to clipboard |
 | Paste | Ctrl+V | Paste files from clipboard |
-| Delete | Del | Send selected files to the Recycle Bin |
+| Delete | Del | Send selected files to the Recycle Bin (network-share items are deleted permanently, since shares have no Recycle Bin) |
 | Rename | F2 | Rename the selected file or folder |
 | New Folder | — | Create a new folder in the current directory |
 | New File | — | Create a new empty file |

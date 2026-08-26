@@ -32,8 +32,8 @@ mod win {
     use super::MonitorInfo;
     use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR,
-        MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+        MONITORINFOEXW, MonitorFromWindow,
     };
 
     fn monitor_info_for(hmonitor: HMONITOR) -> Option<MonitorInfo> {
@@ -53,7 +53,12 @@ mod win {
         const MONITORINFOF_PRIMARY: u32 = 1;
         Some(MonitorInfo {
             name,
-            work: (rc.left as f32, rc.top as f32, rc.right as f32, rc.bottom as f32),
+            work: (
+                rc.left as f32,
+                rc.top as f32,
+                rc.right as f32,
+                rc.bottom as f32,
+            ),
             is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
         })
     }
@@ -112,13 +117,15 @@ mod tests {
 
     #[test]
     fn clamp_pulls_negative_position_back_into_work_area() {
-        let pos = clamp_into_work_area((-500.0, -500.0), (800.0, 600.0), (0.0, 0.0, 1920.0, 1080.0));
+        let pos =
+            clamp_into_work_area((-500.0, -500.0), (800.0, 600.0), (0.0, 0.0, 1920.0, 1080.0));
         assert_eq!(pos, (0.0, 0.0));
     }
 
     #[test]
     fn clamp_pulls_position_beyond_far_edge_back_in() {
-        let pos = clamp_into_work_area((3000.0, 3000.0), (800.0, 600.0), (0.0, 0.0, 1920.0, 1080.0));
+        let pos =
+            clamp_into_work_area((3000.0, 3000.0), (800.0, 600.0), (0.0, 0.0, 1920.0, 1080.0));
         assert_eq!(pos, (1120.0, 480.0));
     }
 
@@ -132,7 +139,11 @@ mod tests {
     #[test]
     fn clamp_respects_a_non_zero_origin_work_area() {
         // e.g. a secondary monitor to the right of the primary.
-        let pos = clamp_into_work_area((100.0, 100.0), (800.0, 600.0), (1920.0, 0.0, 3840.0, 1080.0));
+        let pos = clamp_into_work_area(
+            (100.0, 100.0),
+            (800.0, 600.0),
+            (1920.0, 0.0, 3840.0, 1080.0),
+        );
         assert_eq!(pos, (1920.0, 100.0));
     }
 }

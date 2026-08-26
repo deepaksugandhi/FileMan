@@ -380,11 +380,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let (name, is_default): (String, i64) = conn
-            .query_row(
-                "SELECT name, is_default FROM users WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT name, is_default FROM users WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(name, "Default");
         assert_eq!(is_default, 1);
@@ -439,7 +437,11 @@ mod tests {
         init_db(&conn).unwrap();
 
         let width: f32 = conn
-            .query_row("SELECT width FROM window_state WHERE user_id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT width FROM window_state WHERE user_id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(width, 1200.0);
         let path: String = conn
@@ -447,11 +449,15 @@ mod tests {
             .unwrap();
         assert_eq!(path, "C:\\Users");
         let theme: String = conn
-            .query_row("SELECT theme FROM app_state WHERE user_id = 1", [], |r| r.get(0))
+            .query_row("SELECT theme FROM app_state WHERE user_id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(theme, "dark");
         let fav: String = conn
-            .query_row("SELECT path FROM favourites WHERE user_id = 1", [], |r| r.get(0))
+            .query_row("SELECT path FROM favourites WHERE user_id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(fav, "D:\\Projects");
     }
@@ -477,7 +483,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let theme: String = conn
-            .query_row("SELECT value FROM global_settings WHERE key = 'theme'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM global_settings WHERE key = 'theme'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(theme, "system");
     }
