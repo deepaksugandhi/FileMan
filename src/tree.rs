@@ -12,6 +12,55 @@ pub fn list_drives() -> Vec<PathBuf> {
         .collect()
 }
 
+/// The user's shell-known folders (Desktop, Documents, Downloads, …) as
+/// `(label, path)` pairs, resolved through `SHGetKnownFolderPath` so
+/// redirected folders (OneDrive, custom locations) resolve to where they
+/// really live. Only folders that actually exist are returned.
+pub fn list_system_folders() -> Vec<(String, PathBuf)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{
+            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music,
+            FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        };
+
+        let folders: [(&str, windows::core::GUID); 6] = [
+            ("Desktop", FOLDERID_Desktop),
+            ("Documents", FOLDERID_Documents),
+            ("Downloads", FOLDERID_Downloads),
+            ("Music", FOLDERID_Music),
+            ("Pictures", FOLDERID_Pictures),
+            ("Videos", FOLDERID_Videos),
+        ];
+
+        let mut out = Vec::new();
+        for (label, guid) in folders {
+            let Ok(pwstr) = (unsafe { SHGetKnownFolderPath(&guid, KF_FLAG_DEFAULT, None) })
+            else {
+                continue;
+            };
+            let mut len = 0usize;
+            unsafe {
+                while *pwstr.0.add(len) != 0 {
+                    len += 1;
+                }
+            }
+            let slice = unsafe { std::slice::from_raw_parts(pwstr.0, len) };
+            let path = PathBuf::from(String::from_utf16_lossy(slice));
+            unsafe { CoTaskMemFree(Some(pwstr.0.cast())) };
+            if path.is_dir() {
+                out.push((label.to_string(), path));
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 /// Returns discovered network server paths (UNC `\\server` entries) by
 /// enumerating the Windows network resource tree via `WNetEnumResourceW`.
 /// Returns an empty vec on platforms where the API isn't available or on error.

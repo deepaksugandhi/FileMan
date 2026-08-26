@@ -104,10 +104,11 @@ pub enum Action {
     Refresh,
     Find,
     ToggleSettings,
+    SelectAll,
 }
 
 impl Action {
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 21] = [
         Action::Copy,
         Action::Cut,
         Action::Paste,
@@ -128,6 +129,7 @@ impl Action {
         Action::Refresh,
         Action::Find,
         Action::ToggleSettings,
+        Action::SelectAll,
     ];
 
     /// Stable string id for DB storage — never changes even if `label` does.
@@ -153,6 +155,7 @@ impl Action {
             Action::Refresh => "refresh",
             Action::Find => "find",
             Action::ToggleSettings => "toggle_settings",
+            Action::SelectAll => "select_all",
         }
     }
 
@@ -182,24 +185,90 @@ impl Action {
             Action::Refresh => "Refresh",
             Action::Find => "Find",
             Action::ToggleSettings => "Settings",
+            Action::SelectAll => "Select All",
         }
     }
 
-    /// Hardcoded default shortcut, matching what FileMan bound before the
-    /// rebindable-shortcuts system existed.
-    pub fn default_shortcut(self) -> Option<KeyCombo> {
+    /// Hardcoded default shortcuts, matching what FileMan bound before the
+    /// rebindable-shortcuts system existed. An action can have more than one
+    /// (e.g. Copy Filename is both F3 and the Explorer-style Ctrl+Shift+C).
+    pub fn default_shortcuts(self) -> &'static [KeyCombo] {
         match self {
-            Action::Copy => Some(KeyCombo::ctrl(egui::Key::C)),
-            Action::Cut => Some(KeyCombo::ctrl(egui::Key::X)),
-            Action::Paste => Some(KeyCombo::ctrl(egui::Key::V)),
-            Action::Find => Some(KeyCombo::ctrl(egui::Key::F)),
-            Action::Refresh => Some(KeyCombo::plain(egui::Key::F5)),
-            Action::GoUp => Some(KeyCombo::plain(egui::Key::Backspace)),
-            Action::Rename => Some(KeyCombo::plain(egui::Key::F2)),
-            Action::CopyFilename => Some(KeyCombo::plain(egui::Key::F3)),
-            Action::CopyFolderPath => Some(KeyCombo::plain(egui::Key::F4)),
-            Action::Delete => Some(KeyCombo::plain(egui::Key::Delete)),
-            _ => None,
+            Action::Copy => &[KeyCombo {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                key: egui::Key::C,
+            }],
+            Action::Cut => &[KeyCombo {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                key: egui::Key::X,
+            }],
+            Action::Paste => &[KeyCombo {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                key: egui::Key::V,
+            }],
+            Action::Find => &[KeyCombo {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                key: egui::Key::F,
+            }],
+            Action::Refresh => &[KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                key: egui::Key::F5,
+            }],
+            Action::GoUp => &[KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                key: egui::Key::Backspace,
+            }],
+            Action::Rename => &[KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                key: egui::Key::F2,
+            }],
+            Action::CopyFilename => &[
+                KeyCombo {
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                    key: egui::Key::F3,
+                },
+                KeyCombo {
+                    ctrl: true,
+                    shift: true,
+                    alt: false,
+                    key: egui::Key::C,
+                },
+            ],
+            Action::CopyFolderPath => &[KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                key: egui::Key::F4,
+            }],
+            Action::Delete => &[KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                key: egui::Key::Delete,
+            }],
+            Action::SelectAll => &[KeyCombo {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                key: egui::Key::A,
+            }],
+            _ => &[],
         }
     }
 }
@@ -286,6 +355,12 @@ pub fn init_tables(conn: &Connection) -> Result<()> {
             position INTEGER NOT NULL,
             action_id TEXT NOT NULL,
             PRIMARY KEY (scope, position)
+        );
+        CREATE TABLE IF NOT EXISTS ext_overrides (
+            user_id INTEGER NOT NULL,
+            ext TEXT NOT NULL,
+            exe_path TEXT NOT NULL,
+            PRIMARY KEY (user_id, ext)
         );",
     )?;
 
@@ -370,8 +445,8 @@ pub fn remove_custom_action(conn: &Connection, id: i64) -> Result<()> {
 pub fn load_shortcut_map(conn: &Connection, user_id: i64) -> HashMap<KeyCombo, ActionRef> {
     let mut map: HashMap<KeyCombo, ActionRef> = HashMap::new();
     for action in Action::ALL {
-        if let Some(combo) = action.default_shortcut() {
-            map.insert(combo, ActionRef::Builtin(action));
+        for combo in action.default_shortcuts() {
+            map.insert(*combo, ActionRef::Builtin(action));
         }
     }
     for scope_key in [Scope::Global.to_key(), Scope::User(user_id).to_key()] {
@@ -495,6 +570,54 @@ pub fn load_toolbar(conn: &Connection, user_id: i64) -> Vec<ActionRef> {
     }
 }
 
+/// Extension (without the leading dot, lowercased) a user has pinned to a
+/// specific program, so opening such a file skips the Windows default-app
+/// association. E.g. always launching Excel for `.xlsm`, even if another
+/// program (WPS, etc.) currently owns that extension in Windows.
+pub fn list_ext_overrides(conn: &Connection, user_id: i64) -> Vec<(String, String)> {
+    let mut stmt = match conn
+        .prepare("SELECT ext, exe_path FROM ext_overrides WHERE user_id = ?1 ORDER BY ext")
+    {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(rusqlite::params![user_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// The exe pinned to `ext` for `user_id`, if any.
+pub fn get_ext_override(conn: &Connection, user_id: i64, ext: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT exe_path FROM ext_overrides WHERE user_id = ?1 AND ext = ?2",
+        rusqlite::params![user_id, ext.to_lowercase()],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Pins `ext` to always open with `exe_path` for `user_id`.
+pub fn set_ext_override(conn: &Connection, user_id: i64, ext: &str, exe_path: &str) -> Result<()> {
+    let ext = ext.trim_start_matches('.').to_lowercase();
+    conn.execute(
+        "INSERT INTO ext_overrides (user_id, ext, exe_path) VALUES (?1, ?2, ?3)
+         ON CONFLICT(user_id, ext) DO UPDATE SET exe_path=?3",
+        rusqlite::params![user_id, ext, exe_path],
+    )?;
+    Ok(())
+}
+
+/// Removes `ext`'s override for `user_id`, restoring the Windows default.
+pub fn remove_ext_override(conn: &Connection, user_id: i64, ext: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM ext_overrides WHERE user_id = ?1 AND ext = ?2",
+        rusqlite::params![user_id, ext],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +687,30 @@ mod tests {
     }
 
     #[test]
+    fn default_shortcuts_include_select_all_and_copy_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_tables(&conn).unwrap();
+
+        let map = load_shortcut_map(&conn, 1);
+        // Ctrl+A selects everything in the view.
+        assert_eq!(
+            map.get(&KeyCombo::ctrl(egui::Key::A)),
+            Some(&ActionRef::Builtin(Action::SelectAll))
+        );
+        // Ctrl+Shift+C copies the filename with its full path (the
+        // plain Ctrl+C stays the file-copy action).
+        assert_eq!(
+            map.get(&KeyCombo::new(true, true, false, egui::Key::C)),
+            Some(&ActionRef::Builtin(Action::CopyFilename))
+        );
+        assert_eq!(
+            map.get(&KeyCombo::ctrl(egui::Key::C)),
+            Some(&ActionRef::Builtin(Action::Copy))
+        );
+    }
+
+    #[test]
     fn shortcut_map_merge_precedence_user_over_global_over_default() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -625,6 +772,31 @@ mod tests {
         set_layout(&conn, Scope::User(1), &[ActionRef::Builtin(Action::Find)]).unwrap();
         let toolbar = load_toolbar(&conn, 1);
         assert_eq!(toolbar, vec![ActionRef::Builtin(Action::Find)]);
+    }
+
+    #[test]
+    fn ext_override_round_trips_and_normalizes_case_and_dot() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_tables(&conn).unwrap();
+
+        assert_eq!(get_ext_override(&conn, 1, "xlsm"), None);
+        set_ext_override(&conn, 1, ".XLSM", "C:\\Excel.exe").unwrap();
+        assert_eq!(
+            get_ext_override(&conn, 1, "xlsm"),
+            Some("C:\\Excel.exe".to_string())
+        );
+        assert_eq!(get_ext_override(&conn, 2, "xlsm"), None);
+
+        set_ext_override(&conn, 1, "xlsm", "C:\\Excel2.exe").unwrap();
+        assert_eq!(list_ext_overrides(&conn, 1).len(), 1);
+        assert_eq!(
+            get_ext_override(&conn, 1, "xlsm"),
+            Some("C:\\Excel2.exe".to_string())
+        );
+
+        remove_ext_override(&conn, 1, "xlsm").unwrap();
+        assert_eq!(get_ext_override(&conn, 1, "xlsm"), None);
     }
 
     #[test]

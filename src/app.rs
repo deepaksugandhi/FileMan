@@ -44,11 +44,17 @@ enum Dialog {
     NewFile {
         name: String,
     },
-    /// Shown when a copy/paste hits a name collision; user enters a new name.
-    DuplicateName {
-        src: PathBuf,
+    /// Shown when a copy/move hits name collisions in the destination: the
+    /// user picks overwrite or keep-as-copy for the shown item (Shift+click
+    /// applies the choice to every remaining conflict). `conflicts` holds the
+    /// items still awaiting a decision; `resolved` accumulates the decisions
+    /// for the whole batch (conflict-free items start out in there) and runs
+    /// as one background transfer once `conflicts` drains.
+    PasteConflict {
         dest_dir: PathBuf,
-        suggested: String,
+        op: Option<ClipboardOp>,
+        conflicts: Vec<PathBuf>,
+        resolved: Vec<crate::progress::TransferItem>,
     },
     /// Tab context menu: right-click on a tab to duplicate or close it.
     TabContext {
@@ -142,6 +148,9 @@ pub struct FileManApp {
     tab_menu_pos: Option<egui::Pos2>,
     /// Currently selected page in the settings dialog.
     settings_page: SettingsPage,
+    /// Last window title string sent via `ViewportCommand::Title`, so we only
+    /// re-issue the command when the active folder actually changes.
+    last_title: String,
     /// Last known top-left window position in screen points, for persistence.
     last_pos: Option<(f32, f32)>,
     /// Background file operation in progress (copy/move/delete).
@@ -151,6 +160,10 @@ pub struct FileManApp {
     focused_address_pane: Option<usize>,
     /// Cached network server UNC paths for the sidebar tree.
     network_servers: Vec<PathBuf>,
+    /// Cached shell-known folders (Desktop, Documents, Downloads, …) for
+    /// the sidebar tree. Resolved once at startup — they're OS-wide, not
+    /// per-user-profile, and the shell lookup isn't free.
+    system_folders: Vec<(String, PathBuf)>,
     /// Favourite folder paths for quick access.
     favourites: Vec<String>,
     /// In-flight background directory listing per pane (only the active
@@ -190,6 +203,10 @@ pub struct FileManApp {
     new_custom_action_label: String,
     /// Draft executable path for the "Custom Actions" add-new-action form.
     new_custom_action_exe: Option<PathBuf>,
+    /// Draft extension for the "File Types" add-override form.
+    new_ext_override_ext: String,
+    /// Draft executable path for the "File Types" add-override form.
+    new_ext_override_exe: Option<PathBuf>,
     /// Background recursive-search job for the Find dialog. Streams matching
     /// entries one by one; a `Disconnected` receive means the walk finished.
     find_job: Option<mpsc::Receiver<crate::fs_entry::FsEntry>>,
@@ -427,6 +444,7 @@ enum SettingsPage {
     Shortcuts,
     Toolbar,
     CustomActions,
+    FileTypes,
     ViewMode,
     Advanced,
 }
@@ -568,10 +586,12 @@ impl FileManApp {
             toast: None,
             tab_menu_pos: None,
             settings_page: SettingsPage::default(),
+            last_title: String::new(),
             last_pos: None,
             background_op: None,
             focused_address_pane: None,
             network_servers: tree::list_network_servers(),
+            system_folders: tree::list_system_folders(),
             favourites,
             listing_jobs: [None, None],
             background_op_dirs: Vec::new(),
@@ -586,6 +606,8 @@ impl FileManApp {
             capturing_shortcut_for: None,
             new_custom_action_label: String::new(),
             new_custom_action_exe: None,
+            new_ext_override_ext: String::new(),
+            new_ext_override_exe: None,
             find_job: None,
             tab_orientation,
             tab_strip_width,
@@ -683,6 +705,25 @@ impl FileManApp {
 
     fn active_tab_dir(&self) -> PathBuf {
         self.panes[self.active_pane].active_tab().path.clone()
+    }
+
+    /// Opens `path` with the user's pinned per-extension override if one
+    /// exists (Settings > File Types), otherwise the Windows default app.
+    fn open_path(&self, path: &std::path::Path) {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| crate::actions::get_ext_override(&self.conn, self.current_user_id, ext));
+        match ext {
+            Some(exe) => {
+                let _ = std::process::Command::new(exe).arg(path).spawn();
+            }
+            None => {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", &path.to_string_lossy()])
+                    .spawn();
+            }
+        }
     }
 
     /// Opens a new tab on `pane_idx` seeded with the user's universal default
@@ -876,6 +917,7 @@ impl FileManApp {
                     });
                 }
                 Action::ToggleSettings => self.show_settings = !self.show_settings,
+                Action::SelectAll => self.select_all_in_view(),
             },
             ActionRef::Custom(id) => {
                 if let Some(custom) = self.custom_actions.iter().find(|c| c.id == id) {
@@ -925,18 +967,24 @@ impl FileManApp {
     /// lazily lists its subdirectories when expanded. Clicking a header
     /// toggles expand/collapse; navigating only happens when expanding.
     /// When `force_expand` is true, ancestor nodes are forced open (used
-    /// after navigation to reveal the active path in the tree).
+    /// after navigation to reveal the active path in the tree). `label`
+    /// overrides the header text (system folders show a friendly name
+    /// instead of the path's last segment).
     fn show_dir_node(
         &mut self,
         ui: &mut egui::Ui,
         dir: &Path,
+        label: Option<&str>,
         active_path: &Path,
         force_expand: bool,
     ) {
-        let label = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dir.display().to_string());
+        let label = label
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.display().to_string())
+            });
         // Windows paths are case-insensitive, but a typed address-bar path or
         // an old session save may not match `list_drives()`'s uppercase
         // drive letters byte-for-byte — compare lowercased to avoid silently
@@ -985,7 +1033,7 @@ impl FileManApp {
                 .or_insert_with(|| crate::fs_entry::list_subdirs(dir).unwrap_or_default())
                 .clone();
             for subdir in subdirs {
-                self.show_dir_node(ui, &subdir, active_path, force_expand);
+                self.show_dir_node(ui, &subdir, None, active_path, force_expand);
             }
         });
         if is_active {
@@ -1018,6 +1066,25 @@ impl FileManApp {
             .iter()
             .map(|name| tab.path.join(name))
             .collect()
+    }
+
+    /// Ctrl+A: selects every entry currently visible in the active pane's
+    /// listing (respecting the tab's name filter), like Explorer.
+    fn select_all_in_view(&mut self) {
+        let tab = self.panes[self.active_pane].active_tab_mut();
+        let (filter, sort_col, sort_asc) =
+            (tab.filter.clone(), tab.sort_col.clone(), tab.sort_asc);
+        let names: Vec<String> = tab
+            .display_entries(&filter, &sort_col, sort_asc)
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        self.last_selected_index = Some(names.len() - 1);
+        tab.select_all(&names);
+        self.dirty = true;
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context) {
@@ -1132,41 +1199,50 @@ impl FileManApp {
     }
 
     /// Shared tail of clipboard-paste and drag & drop: checks name
-    /// collisions up front with a cheap `Path::exists` (no recursive walk),
-    /// preserving the original one-at-a-time duplicate-name prompt — the
-    /// first colliding item stops the transfer and opens
-    /// `Dialog::DuplicateName`. Once there are no collisions left, the whole
-    /// batch runs as a single background operation with a progress bar,
-    /// rather than blocking the UI thread — see
-    /// `progress::copy_items_bg`/`move_items_bg`.
+    /// collisions up front with a cheap `Path::exists` (no recursive walk).
+    /// A clean batch runs immediately; any colliding item opens
+    /// `Dialog::PasteConflict` so the user can choose overwrite or
+    /// save-as-copy (Shift+click applies the choice to all conflicts).
+    /// Either way the whole batch then runs as a single background
+    /// operation with a progress bar, rather than blocking the UI thread —
+    /// see `progress::copy_items_bg`/`move_items_bg`.
     fn transfer_items(&mut self, items: Vec<PathBuf>, dest: PathBuf, op: Option<ClipboardOp>) {
-        for src in &items {
-            let name = match src.file_name() {
-                Some(n) => n,
-                None => continue,
-            };
-            if dest.join(name).exists() {
-                let stem = src
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Copy".to_string());
-                let ext = src
-                    .extension()
-                    .map(|e| format!(".{}", e.to_string_lossy()))
-                    .unwrap_or_default();
-                self.dialog = Some(Dialog::DuplicateName {
-                    src: src.clone(),
-                    dest_dir: dest.clone(),
-                    suggested: format!("{stem} (copy){ext}"),
-                });
-                return;
+        let mut conflicts: Vec<PathBuf> = Vec::new();
+        let mut resolved: Vec<progress::TransferItem> = Vec::new();
+        for src in items {
+            let collides = src
+                .file_name()
+                .is_some_and(|name| dest.join(name).exists());
+            if collides {
+                conflicts.push(src);
+            } else {
+                resolved.push(progress::TransferItem::plain(src));
             }
         }
 
+        if conflicts.is_empty() {
+            self.start_transfer(resolved, dest, op);
+        } else {
+            self.dialog = Some(Dialog::PasteConflict {
+                dest_dir: dest,
+                op,
+                conflicts,
+                resolved,
+            });
+        }
+    }
+
+    /// Runs a fully-resolved transfer batch as one background operation.
+    fn start_transfer(
+        &mut self,
+        items: Vec<progress::TransferItem>,
+        dest: PathBuf,
+        op: Option<ClipboardOp>,
+    ) {
         self.background_op_dirs = vec![dest.clone()];
         if op == Some(ClipboardOp::Cut) {
-            for src in &items {
-                if let Some(parent) = src.parent() {
+            for item in &items {
+                if let Some(parent) = item.src.parent() {
                     self.background_op_dirs.push(parent.to_path_buf());
                 }
             }
@@ -1185,6 +1261,95 @@ impl FileManApp {
         self.panes[self.active_pane]
             .active_tab_mut()
             .clear_selection();
+    }
+
+    /// Applies the user's choice from the `PasteConflict` dialog to either
+    /// just the shown item or, when `apply_all` (Shift+click), every
+    /// remaining conflict. When the last conflict is resolved, the whole
+    /// batch is handed to `start_transfer`.
+    fn resolve_paste_conflict(&mut self, overwrite: bool, apply_all: bool) {
+        let Some(Dialog::PasteConflict {
+            dest_dir,
+            op,
+            mut conflicts,
+            mut resolved,
+        }) = self.dialog.take()
+        else {
+            return;
+        };
+
+        // The dialog only exists while at least one conflict is pending.
+        let take = if apply_all { conflicts.len() } else { 1 };
+        let chosen: Vec<PathBuf> = conflicts.drain(..take).collect();
+
+        // Names already claimed in the destination by this batch, so a
+        // generated copy name can never collide with a sibling transfer.
+        let mut taken: std::collections::HashSet<String> = resolved
+            .iter()
+            .map(|t| {
+                t.dest_name.clone().unwrap_or_else(|| {
+                    t.src
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+
+        for src in chosen {
+            if overwrite {
+                resolved.push(progress::TransferItem {
+                    src,
+                    dest_name: None,
+                    overwrite: true,
+                });
+            } else {
+                let name = Self::next_free_copy_name(&dest_dir, &src, &mut taken);
+                resolved.push(progress::TransferItem {
+                    src,
+                    dest_name: Some(name),
+                    overwrite: false,
+                });
+            }
+        }
+
+        if conflicts.is_empty() {
+            self.start_transfer(resolved, dest_dir, op);
+        } else {
+            self.dialog = Some(Dialog::PasteConflict {
+                dest_dir,
+                op,
+                conflicts,
+                resolved,
+            });
+        }
+    }
+
+    /// A free "keep both" name for `src` inside `dest_dir`:
+    /// `name (copy).ext`, then `name (2).ext`, `name (3).ext`, … — never
+    /// colliding with the filesystem or with names already claimed in
+    /// `taken` by the same transfer batch.
+    fn next_free_copy_name(
+        dest_dir: &Path,
+        src: &Path,
+        taken: &mut std::collections::HashSet<String>,
+    ) -> String {
+        let stem = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Copy".to_string());
+        let ext = src
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        let mut candidate = format!("{stem} (copy){ext}");
+        let mut n = 2u32;
+        while dest_dir.join(&candidate).exists() || taken.contains(&candidate) {
+            candidate = format!("{stem} ({n}){ext}");
+            n += 1;
+        }
+        taken.insert(candidate.clone());
+        candidate
     }
 
     /// Registers `native_drag`'s OLE drop target for this window, once a
@@ -1517,17 +1682,6 @@ impl FileManApp {
             Dialog::NewFile { name } => fs_ops::create_file(&parent, name)
                 .map(|_| format!("Created file {name}"))
                 .map_err(|err| format!("Create file failed: {err}")),
-            Dialog::DuplicateName {
-                src,
-                dest_dir,
-                suggested,
-            } => {
-                let dest = dest_dir.join(suggested);
-                match fs_ops::copy_item_to(src, &dest) {
-                    Ok(()) => Ok(format!("Copied to {}", dest.display())),
-                    Err(err) => Err(format!("Copy failed: {err}")),
-                }
-            }
             Dialog::NewUser { name } => {
                 if name.trim().is_empty() {
                     Err("User name cannot be empty".to_string())
@@ -1564,18 +1718,19 @@ impl FileManApp {
             | Dialog::Find { .. }
             | Dialog::Help
             | Dialog::ConfirmDelete { .. }
+            | Dialog::PasteConflict { .. }
             | Dialog::ApplySort { .. } => Ok(String::new()),
         };
         if result.is_ok() {
             dirty_dir = match &dialog {
                 Dialog::Rename { path, .. } => path.parent().map(|p| p.to_path_buf()),
                 Dialog::NewFolder { .. } | Dialog::NewFile { .. } => Some(parent.clone()),
-                Dialog::DuplicateName { dest_dir, .. } => Some(dest_dir.clone()),
                 Dialog::TabContext { .. }
                 | Dialog::Find { .. }
                 | Dialog::NewUser { .. }
                 | Dialog::Help
                 | Dialog::ConfirmDelete { .. }
+                | Dialog::PasteConflict { .. }
                 | Dialog::RenameTab { .. }
                 | Dialog::ApplySort { .. } => None,
             };
@@ -1743,14 +1898,25 @@ impl FileManApp {
             .striped(true)
             .show(ui, |ui| {
                 for action in Action::ALL {
-                    let combo_opt = self
+                    // An action can hold several combos (e.g. Copy Filename
+                    // is F3 and Ctrl+Shift+C); list them all, sorted so the
+                    // HashMap's iteration order never flickers the display.
+                    let mut bound: Vec<crate::actions::KeyCombo> = self
                         .shortcut_map
                         .iter()
-                        .find(|(_, a)| **a == ActionRef::Builtin(action))
-                        .map(|(c, _)| *c);
-                    let combo_label = combo_opt
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "(none)".to_string());
+                        .filter(|(_, a)| **a == ActionRef::Builtin(action))
+                        .map(|(c, _)| *c)
+                        .collect();
+                    bound.sort_by_key(|c| c.to_string());
+                    let combo_label = if bound.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        bound
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    };
                     ui.label(action.label());
                     ui.label(egui::RichText::new(&combo_label).weak());
                     let capturing = self.capturing_shortcut_for == Some(action);
@@ -1762,13 +1928,15 @@ impl FileManApp {
                     if ui.button(rebind_label).clicked() {
                         self.capturing_shortcut_for = Some(action);
                     }
-                    if let Some(combo) = combo_opt {
+                    if !bound.is_empty() {
                         if ui.button("Clear").clicked() {
-                            let _ = crate::actions::clear_binding(
-                                &self.conn,
-                                crate::actions::Scope::User(self.current_user_id),
-                                combo,
-                            );
+                            for combo in bound {
+                                let _ = crate::actions::clear_binding(
+                                    &self.conn,
+                                    crate::actions::Scope::User(self.current_user_id),
+                                    combo,
+                                );
+                            }
                             self.shortcut_map =
                                 crate::actions::load_shortcut_map(&self.conn, self.current_user_id);
                             self.status = format!("Cleared shortcut for {}", action.label());
@@ -1962,6 +2130,82 @@ impl FileManApp {
         });
     }
 
+    /// Settings page: per-extension "always open with" overrides.
+    fn settings_page_file_types(&mut self, ui: &mut egui::Ui) {
+        let overrides = crate::actions::list_ext_overrides(&self.conn, self.current_user_id);
+        let mut remove: Option<String> = None;
+        for (ext, exe_path) in &overrides {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!(".{ext}")).strong().monospace());
+                ui.label(egui::RichText::new(exe_path).weak().small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(ext.clone());
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.separator();
+        }
+        if let Some(ext) = remove {
+            let _ =
+                crate::actions::remove_ext_override(&self.conn, self.current_user_id, &ext);
+            self.status = format!("Removed override for .{ext}");
+        }
+
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new("Add an override").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Extension").weak());
+                ui.add_space(8.0);
+                ui.add_sized(
+                    [80.0, 0.0],
+                    egui::TextEdit::singleline(&mut self.new_ext_override_ext)
+                        .hint_text("xlsm"),
+                );
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Program").weak());
+                ui.add_space(8.0);
+                if ui.button("Browse…").clicked() {
+                    self.new_ext_override_exe = rfd::FileDialog::new()
+                        .set_title("Choose Executable")
+                        .pick_file();
+                }
+                match &self.new_ext_override_exe {
+                    Some(exe) => {
+                        ui.label(egui::RichText::new(exe.display().to_string()).weak());
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("No program selected").weak());
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            let can_add =
+                !self.new_ext_override_ext.trim().is_empty() && self.new_ext_override_exe.is_some();
+            ui.add_enabled_ui(can_add, |ui| {
+                let add_btn = egui::Button::new("Add").fill(ui.visuals().selection.bg_fill);
+                if ui.add(add_btn).clicked() {
+                    if let Some(exe) = self.new_ext_override_exe.take() {
+                        let ext = std::mem::take(&mut self.new_ext_override_ext);
+                        let _ = crate::actions::set_ext_override(
+                            &self.conn,
+                            self.current_user_id,
+                            &ext,
+                            &exe.display().to_string(),
+                        );
+                        self.status = format!("Files ending in \"{ext}\" now always open with this program");
+                    }
+                }
+            });
+        });
+    }
+
     /// Settings page: default listing view mode.
     fn settings_page_view_mode(&mut self, ui: &mut egui::Ui) {
         settings_group_label(ui, "Listing Layout");
@@ -2136,6 +2380,7 @@ impl FileManApp {
                             (SettingsPage::Shortcuts, "Keyboard Shortcuts"),
                             (SettingsPage::Toolbar, "Toolbar"),
                             (SettingsPage::CustomActions, "Custom Actions"),
+                            (SettingsPage::FileTypes, "File Types"),
                             (SettingsPage::ViewMode, "View"),
                             (SettingsPage::Advanced, "Advanced"),
                         ] {
@@ -2244,6 +2489,14 @@ impl FileManApp {
                                         "Open files with your favourite applications.",
                                     );
                                     self.settings_page_custom_actions(ctx, ui);
+                                }
+                                SettingsPage::FileTypes => {
+                                    settings_header(
+                                        ui,
+                                        "File Types",
+                                        "Always open a file extension with a specific program, regardless of Windows' current default (useful when another app keeps re-claiming an extension, e.g. macro-enabled Excel files).",
+                                    );
+                                    self.settings_page_file_types(ui);
                                 }
                                 SettingsPage::ViewMode => {
                                     settings_header(
@@ -2660,6 +2913,16 @@ impl FileManApp {
         // Explorer-style framed address field: a clickable breadcrumb trail
         // by default, switching to a typeable path box (via the folder icon)
         // for manually entering a path.
+        //
+        // The closure below can't touch `self` directly (it already holds
+        // `pane`, a mutable borrow of `self.panes[pane_idx]`), so anything
+        // that would normally be `self.foo = ...` is staged into a local and
+        // applied to `self` once the closure returns.
+        let mut focused_address_pane = self.focused_address_pane;
+        let mut deferred_status: Option<String> = None;
+        let mut deferred_toast: Option<String> = None;
+        let mut became_active = false;
+        let mut became_dirty = false;
         egui::Frame::new()
             .fill(ui.visuals().window_fill())
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -2688,14 +2951,14 @@ impl FileManApp {
                         // state, so re-requesting every frame would cancel
                         // the very Enter-surrenders-focus transition the
                         // commit below relies on.
-                        if self.focused_address_pane != Some(pane_idx) {
+                        if focused_address_pane != Some(pane_idx) {
                             address_resp.request_focus();
                         }
                         // Track which pane's address bar has focus
                         if address_resp.has_focus() {
-                            self.focused_address_pane = Some(pane_idx);
-                        } else if self.focused_address_pane == Some(pane_idx) {
-                            self.focused_address_pane = None;
+                            focused_address_pane = Some(pane_idx);
+                        } else if focused_address_pane == Some(pane_idx) {
+                            focused_address_pane = None;
                         }
                         if address_resp.lost_focus() {
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -2705,14 +2968,14 @@ impl FileManApp {
                                 let target = PathBuf::from(typed);
                                 if target.exists() {
                                     if pane.active_tab_mut().try_navigate(target) {
-                                        self.active_pane = pane_idx;
-                                        self.dirty = true;
+                                        became_active = true;
+                                        became_dirty = true;
                                     } else {
-                                        self.status =
-                                            "Tab is pinned — unpin it to navigate".to_string();
+                                        deferred_status =
+                                            Some("Tab is pinned — unpin it to navigate".to_string());
                                     }
                                 } else {
-                                    self.status = format!("Path not found: {}", typed);
+                                    deferred_status = Some(format!("Path not found: {}", typed));
                                 }
                             }
                             pane.address_edit_mode = false;
@@ -2763,13 +3026,46 @@ impl FileManApp {
                             );
                             ui.label(">");
                         }
+                        let mut copy_clicked = false;
                         for (i, (label, full_path)) in crumbs.iter().enumerate().skip(first_shown) {
                             if i == last_idx {
-                                // Current folder: shown as plain text, not a
-                                // button — clicking it would "navigate" to
-                                // the already-current path, which clears the
-                                // forward-history stack for no reason.
-                                ui.strong(label);
+                                // Current folder: not a navigation button
+                                // (that would just "navigate" to the
+                                // already-current path) — instead it shares
+                                // the copy affordance with the empty stretch
+                                // to its right, so a click anywhere at the
+                                // end of the bar copies the full path.
+                                // Painted as plain strong text, but
+                                // interactive — a non-interactive label here
+                                // made end-of-bar clicks miss whenever the
+                                // crumbs filled most of the bar (narrow
+                                // panes), which read as erratic copying.
+                                let galley = ui.painter().layout_no_wrap(
+                                    label.clone(),
+                                    font_id.clone(),
+                                    ui.visuals().strong_text_color(),
+                                );
+                                let (rect, resp) = ui.allocate_at_least(
+                                    egui::vec2(
+                                        galley.size().x,
+                                        ui.spacing().interact_size.y,
+                                    ),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().galley(
+                                    egui::pos2(
+                                        rect.min.x,
+                                        rect.center().y - galley.size().y / 2.0,
+                                    ),
+                                    galley,
+                                    ui.visuals().strong_text_color(),
+                                );
+                                if resp
+                                    .on_hover_text("Click to copy the full path")
+                                    .clicked()
+                                {
+                                    copy_clicked = true;
+                                }
                             } else if ui.button(label).clicked() {
                                 nav_target = Some(full_path.clone());
                             }
@@ -2777,8 +3073,8 @@ impl FileManApp {
                                 ui.label(">");
                             }
                         }
-                        // Clicking the empty space past the last segment
-                        // copies the full path instead of entering edit mode.
+                        // The empty space past the last segment copies the
+                        // full path too, instead of entering edit mode.
                         let stretch = ui.allocate_response(
                             egui::vec2(ui.available_width().max(8.0), ui.spacing().interact_size.y),
                             egui::Sense::click(),
@@ -2787,20 +3083,42 @@ impl FileManApp {
                             .on_hover_text("Click to copy the full path")
                             .clicked()
                         {
+                            copy_clicked = true;
+                        }
+                        if copy_clicked {
                             Self::set_clipboard_text(ctx, &current_path.to_string_lossy());
-                            self.status = "Path copied to clipboard".to_string();
+                            deferred_toast = Some("Path copied to clipboard".to_string());
                         }
                         if let Some(target) = nav_target {
                             if pane.active_tab_mut().try_navigate(target) {
-                                self.active_pane = pane_idx;
-                                self.dirty = true;
+                                became_active = true;
+                                became_dirty = true;
                             } else {
-                                self.status = "Tab is pinned — unpin it to navigate".to_string();
+                                deferred_status =
+                                    Some("Tab is pinned — unpin it to navigate".to_string());
                             }
                         }
                     }
                 });
             });
+        self.focused_address_pane = focused_address_pane;
+        if let Some(status) = deferred_status {
+            self.status = status;
+        }
+        if became_active {
+            self.active_pane = pane_idx;
+        }
+        if became_dirty {
+            self.dirty = true;
+        }
+        if let Some(toast) = deferred_toast {
+            // Inlined `show_toast`: that method takes `&mut self` as a
+            // whole, which would conflict with `pane`'s still-live borrow
+            // of `self.panes` for the rest of this function.
+            self.status = toast.clone();
+            self.last_status = toast.clone();
+            self.toast = Some((toast, std::time::Instant::now()));
+        }
 
         ui.horizontal(|ui| {
             if ui.button("⬅").on_hover_text("Back").clicked() {
@@ -3313,9 +3631,7 @@ impl FileManApp {
                     }
                 }
                 if let Some(target) = open_target {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/C", "start", "", &target.to_string_lossy()])
-                        .spawn();
+                    self.open_path(&target);
                 }
                 if let Some(action) = row_action {
                     self.active_pane = pane_idx;
@@ -3372,6 +3688,9 @@ impl FileManApp {
                         RowAction::OpenInExplorer(path) => {
                             let _ = std::process::Command::new("explorer").arg(&path).spawn();
                         }
+                        RowAction::Properties(path) => {
+                            crate::win_default::show_properties(&path);
+                        }
                     }
                 }
             }
@@ -3419,6 +3738,20 @@ fn clipboard_event_combo(i: &egui::InputState) -> Option<crate::actions::KeyComb
 impl eframe::App for FileManApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Taskbar/title-bar text: active folder name first, then the app
+        // name, so the folder is what's legible in a crowded taskbar.
+        // Windows shows this text directly, so update it in-place rather
+        // than only formatting a display string.
+        let active_dir = self.active_tab_dir();
+        let folder_name = active_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| active_dir.display().to_string());
+        let title = format!("{folder_name} - FileMan");
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
         // A tab-reorder drag ends wherever the button is released, not only
         // over the strip it started in.
         if self.tab_reorder.is_some() && !ctx.input(|i| i.pointer.primary_down()) {
@@ -3802,8 +4135,33 @@ impl eframe::App for FileManApp {
                             ui.separator();
                         }
 
+                        // System folders (Desktop, Documents, Downloads, …),
+                        // resolved through the shell so redirected locations
+                        // (e.g. OneDrive) land on their real paths.
+                        if !self.system_folders.is_empty() {
+                            for (label, path) in self.system_folders.clone() {
+                                let icon = match label.as_str() {
+                                    "Desktop" => "🖥",
+                                    "Documents" => "🗋",
+                                    "Downloads" => "📥",
+                                    "Music" => "🎵",
+                                    "Pictures" => "🖼",
+                                    _ => "🎬",
+                                };
+                                let display = format!("{icon} {label}");
+                                self.show_dir_node(
+                                    ui,
+                                    &path,
+                                    Some(&display),
+                                    &active_path,
+                                    force_expand,
+                                );
+                            }
+                            ui.separator();
+                        }
+
                         for drive in tree::list_drives() {
-                            self.show_dir_node(ui, &drive, &active_path, force_expand);
+                            self.show_dir_node(ui, &drive, None, &active_path, force_expand);
                         }
                         let mut network_roots = self.network_servers.clone();
                         if let Some(active_unc_root) = tree::unc_share_root(&active_path) {
@@ -3819,7 +4177,7 @@ impl eframe::App for FileManApp {
                             ui.separator();
                             ui.label(egui::RichText::new("Network").strong());
                             for server in &network_roots {
-                                self.show_dir_node(ui, server, &active_path, force_expand);
+                                self.show_dir_node(ui, server, None, &active_path, force_expand);
                             }
                         }
                         self.tree_scroll_frames = self.tree_scroll_frames.saturating_sub(1);
@@ -3871,7 +4229,7 @@ impl eframe::App for FileManApp {
                                 Action::Paste => ("Paste", "Paste clipboard (Ctrl+V)", true),
                                 Action::Delete => ("🗑 Delete", "Send selection to Recycle Bin", true),
                                 Action::Rename => ("Rename", "Rename the selected item", true),
-                                Action::CopyFilename => ("Copy Filename", "Copy full path of selected file", true),
+                                Action::CopyFilename => ("Copy Filename", "Copy full path of selected file (Ctrl+Shift+C)", true),
                                 Action::CopyFolderPath => ("Copy Folder Path", "Copy current folder path", true),
                                 Action::ToggleFavourite => {
                                     if is_fav {
@@ -3890,6 +4248,7 @@ impl eframe::App for FileManApp {
                                 Action::CloseTab => ("Close Tab", "Close the active tab", true),
                                 Action::Refresh => ("🔄 Refresh", "Reload the current folder (F5)", true),
                                 Action::ToggleSettings => ("⚙ Settings", "Preferences", true),
+                                Action::SelectAll => ("Select All", "Select all items in the view (Ctrl+A)", true),
                                 _ => continue,
                             };
                             ui.add_enabled_ui(enabled, |ui| {
@@ -4328,11 +4687,7 @@ impl eframe::App for FileManApp {
                 if let Some(action) = find_row_action {
                     match action {
                         FindRowAction::Open(path) => {
-                            // `start` uses the shell, so files open with their
-                            // default app and folders open in Explorer.
-                            let _ = std::process::Command::new("cmd")
-                                .args(["/C", "start", "", &path.to_string_lossy()])
-                                .spawn();
+                            self.open_path(&path);
                         }
                         FindRowAction::Reveal(parent) => {
                             if self.try_navigate_active(self.active_pane, parent) {
@@ -4618,36 +4973,140 @@ impl eframe::App for FileManApp {
                         self.dialog = None;
                     }
                 }
+                let is_paste_conflict =
+                    matches!(&self.dialog, Some(Dialog::PasteConflict { .. }));
+                if is_paste_conflict {
+                    let mut cancel = false;
+                    // (overwrite, apply-to-all) once the user picks a side.
+                    let mut choice: Option<(bool, bool)> = None;
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                    let (dest_dir, op, conflict_count, first_name) =
+                        if let Some(Dialog::PasteConflict {
+                            dest_dir,
+                            op,
+                            conflicts,
+                            ..
+                        }) = &self.dialog
+                        {
+                            let first = conflicts
+                                .first()
+                                .and_then(|p| p.file_name())
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            (dest_dir.clone(), *op, conflicts.len(), first)
+                        } else {
+                            unreachable!()
+                        };
+                    let verb = if op == Some(ClipboardOp::Cut) {
+                        "moving"
+                    } else {
+                        "copying"
+                    };
+                    egui::Window::new("Name Conflict")
+                        .id(egui::Id::new("paste_conflict_window"))
+                        .title_bar(true)
+                        .resizable(false)
+                        .collapsible(false)
+                        .fixed_size(egui::vec2(470.0, 0.0))
+                        // Modal-style placement: pinned to the screen centre
+                        // rather than egui's cascading default position.
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(&ctx, |ui| {
+                            if conflict_count > 1 {
+                                ui.label(format!(
+                                    "{conflict_count} of the items you're {verb} already \
+                                     exist in \"{}\" with the same names.",
+                                    dest_dir.display()
+                                ));
+                                ui.add_space(4.0);
+                                ui.label(format!(
+                                    "This one: \"{first_name}\" — replace the existing \
+                                     item, or keep both?"
+                                ));
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Tip: hold Shift while clicking a button to apply \
+                                         your choice to all {conflict_count} conflicting \
+                                         items at once."
+                                    ))
+                                    .weak(),
+                                );
+                            } else {
+                                ui.label(format!(
+                                    "\"{first_name}\" already exists in \"{}\".",
+                                    dest_dir.display()
+                                ));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    "Do you want to replace the existing item, or keep \
+                                     both by saving the incoming one as a copy?",
+                                );
+                            }
+                            ui.add_space(8.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    cancel = true;
+                                }
+                                // Read Shift at click time so "hold Shift for
+                                // all items" works with either button.
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let copy_resp = ui
+                                    .button("Save as Copy")
+                                    .on_hover_text(
+                                        "Keep both: the incoming item is renamed \
+                                         (e.g. \"name (copy).ext\")",
+                                    );
+                                if copy_resp.clicked() {
+                                    choice = Some((false, shift));
+                                }
+                                let overwrite_resp = ui
+                                    .button("Overwrite")
+                                    .on_hover_text("Replace the existing item");
+                                if overwrite_resp.clicked() {
+                                    choice = Some((true, shift));
+                                }
+                                // Default focus on the affirmative button so
+                                // Enter confirms immediately (Esc still
+                                // cancels). Seed it only while nothing holds
+                                // focus, so Tab away stays respected.
+                                if ctx.memory(|m| m.focused().is_none()) {
+                                    overwrite_resp.request_focus();
+                                }
+                            });
+                        });
+                    if cancel {
+                        self.dialog = None;
+                        self.status = "Transfer cancelled — nothing was changed".to_string();
+                    } else if let Some((overwrite, apply_all)) = choice {
+                        self.resolve_paste_conflict(overwrite, apply_all);
+                        self.dirty = true;
+                    }
+                }
                 let is_find = matches!(&self.dialog, Some(Dialog::Find { .. }));
                 if self.dialog.is_some()
                     && !find_close
                     && !is_find
                     && !is_help
                     && !is_confirm_delete
+                    && !is_paste_conflict
                     && !is_apply_sort
                 {
                     let mut commit = false;
                     let mut cancel = false;
                     if let Some(dialog) = &mut self.dialog {
-                        // Extract src filename before borrowing dialog further.
-                        let src_label: Option<String> = if let Dialog::DuplicateName { src, .. } = dialog {
-                            src.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                        } else {
-                            None
-                        };
                         let multiline = matches!(dialog, Dialog::NewFolder { .. });
                         let (title, name) = match dialog {
                             Dialog::Rename { name, .. } => ("Rename", name),
                             Dialog::NewFolder { name } => ("New Folder", name),
                             Dialog::NewFile { name } => ("New File", name),
-                            Dialog::DuplicateName { suggested, .. } => {
-                                ("Duplicate Name", suggested)
-                            }
                             Dialog::NewUser { name } => ("New User", name),
                             Dialog::RenameTab { name, .. } => ("Rename Tab", name),
                             Dialog::Find { .. } | Dialog::TabContext { .. } | Dialog::Help
-                            | Dialog::ConfirmDelete { .. } | Dialog::ApplySort { .. } => {
+                            | Dialog::ConfirmDelete { .. } | Dialog::PasteConflict { .. }
+                            | Dialog::ApplySort { .. } => {
                                 unreachable!()
                             }
                         };
@@ -4655,9 +5114,6 @@ impl eframe::App for FileManApp {
                             // Modal-style placement: pinned to screen centre.
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .show(&ctx, |ui| {
-                                if let Some(ref label) = src_label {
-                                    ui.label(label.as_str());
-                                }
                                 if multiline {
                                     ui.label("One folder per line:");
                                 }
@@ -4966,6 +5422,22 @@ fn paint_nav_icon(
             ];
             painter.add(egui::Shape::line(pts.to_vec(), stroke));
         }
+        SettingsPage::FileTypes => {
+            // Small file/document with a folded corner.
+            painter.add(egui::Shape::line(
+                vec![
+                    p(0.22, 0.06),
+                    p(0.60, 0.06),
+                    p(0.78, 0.24),
+                    p(0.78, 0.94),
+                    p(0.22, 0.94),
+                    p(0.22, 0.06),
+                ],
+                stroke,
+            ));
+            painter.line_segment([p(0.60, 0.06), p(0.60, 0.24)], stroke);
+            painter.line_segment([p(0.60, 0.24), p(0.78, 0.24)], stroke);
+        }
         SettingsPage::ViewMode => {
             // Three horizontal lines (list layout icon).
             for (i, w) in [1.0f32, 0.75, 0.5].into_iter().enumerate() {
@@ -5062,6 +5534,7 @@ enum RowAction {
     FavouriteFolder(PathBuf),
     OpenWith(PathBuf),
     OpenInExplorer(PathBuf),
+    Properties(PathBuf),
 }
 
 /// Deferred action requested from a Find-results row. Applied after the
@@ -5593,6 +6066,11 @@ fn show_entry_context_menu(
     ui.separator();
     if ui.button("Open With...").clicked() {
         *row_action = Some(RowAction::OpenWith(entry_path.to_path_buf()));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Properties").clicked() {
+        *row_action = Some(RowAction::Properties(entry_path.to_path_buf()));
         ui.close();
     }
     if is_dir {

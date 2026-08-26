@@ -202,6 +202,13 @@ impl Tab {
             self.selected.insert(name.clone());
         }
     }
+
+    /// Adds every given name to the selection (Ctrl+A select-all).
+    pub fn select_all(&mut self, names: &[String]) {
+        for name in names {
+            self.selected.insert(name.clone());
+        }
+    }
 }
 
 #[cfg(test)]

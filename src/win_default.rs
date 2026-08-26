@@ -61,6 +61,39 @@ pub fn clear_default() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Opens the native Windows "Properties" dialog for a file/folder (the same
+/// one Explorer's right-click menu shows), via the `properties` shell verb.
+#[cfg(windows)]
+pub fn show_properties(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let verb: Vec<u16> = "properties\0".encode_utf16().collect();
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST,
+        hwnd: HWND(std::ptr::null_mut()),
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = ShellExecuteExW(&mut info);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn show_properties(_path: &std::path::Path) {}
+
 #[cfg(not(windows))]
 pub fn is_default() -> bool {
     false
