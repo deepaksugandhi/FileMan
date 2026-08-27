@@ -80,6 +80,9 @@ enum Dialog {
         name_filter: String,
         folder_filter: String,
         include_folders: bool,
+        /// Set once the Find input has been given initial focus, so we don't
+        /// keep stealing focus back from the user on every frame.
+        query_focused: bool,
     },
     /// Create a new user profile.
     NewUser {
@@ -222,6 +225,9 @@ pub struct FileManApp {
     /// Whether the rotating bottom-left tips card is shown (persisted per
     /// user as `tips_enabled`).
     tips_enabled: bool,
+    /// Whether hidden files/folders (Windows FILE_ATTRIBUTE_HIDDEN) are shown
+    /// in listings, persisted per user as `show_hidden`. Off by default.
+    show_hidden: bool,
     /// State for the tips card: current tip, rotation timing and session
     /// visibility.
     tips: crate::tips::TipsCard,
@@ -447,6 +453,7 @@ enum SettingsPage {
     FileTypes,
     ViewMode,
     Advanced,
+    About,
 }
 
 /// Whitelists a stored universal-sort column so a hand-edited settings table
@@ -467,7 +474,7 @@ fn sort_col_label(col: &str) -> &'static str {
     match col {
         "modified" => "Modified",
         "size" => "Size",
-        "archive" => "Archive",
+        "archive" => "Attributes",
         _ => "Name",
     }
 }
@@ -545,6 +552,9 @@ impl FileManApp {
             crate::config::get(&conn, current_user_id, crate::tips::KEY_TIPS_ENABLED)
                 .map(|raw| raw != "false")
                 .unwrap_or(true);
+        let show_hidden = crate::config::get(&conn, current_user_id, "show_hidden")
+            .map(|raw| raw == "true")
+            .unwrap_or(false);
         let favourites = crate::db::get_favourites(&conn, current_user_id);
         let split_ratio = crate::db::get_split_ratio(&conn, current_user_id).unwrap_or(0.5);
         let tree_width = crate::db::get_tree_width(&conn, current_user_id).unwrap_or(200.0);
@@ -614,6 +624,7 @@ impl FileManApp {
             taskbar_badge_applied: false,
             instance_slot,
             tips_enabled,
+            show_hidden,
             tips: crate::tips::TipsCard::new(),
             dnd_pane_rects: [None, None],
             dnd_tab_rects: Vec::new(),
@@ -644,7 +655,11 @@ impl FileManApp {
                     let tab = &mut self.panes[pane_idx].tabs[active_idx];
                     match result {
                         Ok(entries) => {
-                            tab.listing = entries;
+                            tab.listing = if self.show_hidden {
+                                entries
+                            } else {
+                                entries.into_iter().filter(|e| !e.hidden).collect()
+                            };
                             tab.listing_error = None;
                             tab.listing_version += 1;
                         }
@@ -914,6 +929,7 @@ impl FileManApp {
                         name_filter: String::new(),
                         folder_filter: String::new(),
                         include_folders: true,
+                        query_focused: false,
                     });
                 }
                 Action::ToggleSettings => self.show_settings = !self.show_settings,
@@ -1873,6 +1889,32 @@ impl FileManApp {
             .small(),
         );
 
+        ui.add_space(14.0);
+        settings_group_label(ui, "Hidden Files");
+        let mut show_hidden = self.show_hidden;
+        if ui
+            .checkbox(&mut show_hidden, "Show hidden files and folders")
+            .changed()
+        {
+            self.show_hidden = show_hidden;
+            for pane in &mut self.panes {
+                for tab in &mut pane.tabs {
+                    tab.listing_dirty = true;
+                }
+            }
+            let _ = crate::config::set(
+                &self.conn,
+                crate::config::Scope::User(self.current_user_id),
+                "show_hidden",
+                if show_hidden { "true" } else { "false" },
+            );
+        }
+        ui.label(
+            egui::RichText::new("Items with the Windows \"Hidden\" attribute. Off by default.")
+                .weak()
+                .small(),
+        );
+
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new("Changes apply immediately and are remembered per user.")
@@ -2082,7 +2124,7 @@ impl FileManApp {
                 ui.label(egui::RichText::new("Name").weak());
                 ui.add_space(8.0);
                 let name_edit = ui.add_sized(
-                    [ui.available_width(), 0.0],
+                    [240.0, 0.0],
                     egui::TextEdit::singleline(&mut self.new_custom_action_label),
                 );
                 if name_edit.changed() {
@@ -2306,10 +2348,40 @@ impl FileManApp {
                 }
             }
         });
+    }
 
-        ui.add_space(14.0);
-        settings_group_label(ui, "About");
-        ui.label(format!("FileMan v{}", env!("CARGO_PKG_VERSION")));
+    /// "About" settings page: version, website, and where to send bug
+    /// reports / feature requests. Kept separate from Advanced so it reads
+    /// as the app's front door, not a buried footnote.
+    fn settings_page_about(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::Image::new(egui::include_image!("../docs/FileMan Logo.png"))
+                .max_height(64.0)
+                .shrink_to_fit(),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(format!("FileMan v{}", env!("CARGO_PKG_VERSION")))
+                .strong()
+                .size(self.font_size + 2.0),
+        );
+        ui.label(
+            egui::RichText::new("A fast, keyboard-first dual-pane file explorer for Windows.")
+                .weak(),
+        );
+
+        ui.add_space(16.0);
+        settings_group_label(ui, "Website");
+        ui.hyperlink_to("www.speed4ca.com", "https://www.speed4ca.com");
+
+        ui.add_space(16.0);
+        settings_group_label(ui, "Support");
+        ui.label(
+            egui::RichText::new("Found a bug or have a feature request? Email us:")
+                .weak()
+                .small(),
+        );
+        ui.hyperlink_to("speed4ca@gmail.com", "mailto:speed4ca@gmail.com");
     }
 
     /// Re-reads every setting from the database after an import so the UI
@@ -2333,6 +2405,9 @@ impl FileManApp {
         self.tips_enabled = crate::config::get(&self.conn, uid, crate::tips::KEY_TIPS_ENABLED)
             .map(|raw| raw != "false")
             .unwrap_or(true);
+        self.show_hidden = crate::config::get(&self.conn, uid, "show_hidden")
+            .map(|raw| raw == "true")
+            .unwrap_or(false);
         self.shortcut_map = crate::actions::load_shortcut_map(&self.conn, uid);
         self.toolbar_actions = crate::actions::load_toolbar(&self.conn, uid);
         self.custom_actions = crate::actions::list_custom_actions(&self.conn, uid);
@@ -2383,6 +2458,7 @@ impl FileManApp {
                             (SettingsPage::FileTypes, "File Types"),
                             (SettingsPage::ViewMode, "View"),
                             (SettingsPage::Advanced, "Advanced"),
+                            (SettingsPage::About, "About"),
                         ] {
                             let selected = self.settings_page == page;
                             let (rect, resp) = ui.allocate_exact_size(
@@ -2452,7 +2528,7 @@ impl FileManApp {
                     ui.separator();
 
                     // ---- Content pane ----
-                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("settings_content_scroll")
                             .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
@@ -2513,6 +2589,14 @@ impl FileManApp {
                                         "System integration and application info.",
                                     );
                                     self.settings_page_advanced(ui);
+                                }
+                                SettingsPage::About => {
+                                    settings_header(
+                                        ui,
+                                        "About",
+                                        "Version, website, and support contact.",
+                                    );
+                                    self.settings_page_about(ui);
                                 }
                             });
                     });
@@ -3285,7 +3369,7 @@ impl FileManApp {
                                         header.col(|ui| {
                                             sort_header(
                                                 ui,
-                                                "Archive",
+                                                "Attributes",
                                                 "archive",
                                                 &sort_col,
                                                 sort_asc,
@@ -3359,12 +3443,23 @@ impl FileManApp {
                                                 );
                                             });
                                             row.col(|ui| {
-                                                if entry.archive {
-                                                    ui.label(
-                                                        egui::RichText::new("A")
-                                                            .color(listing_text),
-                                                    );
+                                                let mut attrs = String::new();
+                                                if entry.readonly {
+                                                    attrs.push('R');
                                                 }
+                                                if entry.hidden {
+                                                    attrs.push('H');
+                                                }
+                                                if entry.system {
+                                                    attrs.push('S');
+                                                }
+                                                if entry.archive {
+                                                    attrs.push('A');
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(attrs)
+                                                        .color(listing_text),
+                                                );
                                             });
 
                                             let row_resp = row.response();
@@ -3676,13 +3771,14 @@ impl FileManApp {
                             }
                         }
                         RowAction::OpenWith(path) => {
-                            let _ = std::process::Command::new("cmd")
-                                .args([
-                                    "/C",
-                                    "rundll32.exe",
-                                    "shell32.dll,OpenAs_RunDLL",
-                                    &path.to_string_lossy(),
-                                ])
+                            // rundll32 shell32.dll,OpenAs_RunDLL silently opens
+                            // the default app instead of prompting once a file
+                            // type already has an association. OpenWith.exe is
+                            // what Explorer's own "Open with" menu item runs
+                            // (HKCR\Unknown\shell\openas\command) and always
+                            // shows the chooser.
+                            let _ = std::process::Command::new("openwith.exe")
+                                .arg(&path)
                                 .spawn();
                         }
                         RowAction::OpenInExplorer(path) => {
@@ -4448,10 +4544,14 @@ impl eframe::App for FileManApp {
                     name_filter,
                     folder_filter,
                     include_folders,
+                    query_focused,
                 }) = &mut self.dialog
                 {
                     let search_path_clone = search_path.clone();
                     let searching = self.find_job.is_some();
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        find_close = true;
+                    }
                     // Show the dialog UI, capturing any actions needed
                     let mut dialog_ui = |ui: &mut egui::Ui,
                                          query: &mut String,
@@ -4460,12 +4560,20 @@ impl eframe::App for FileManApp {
                                          sort_asc: &mut bool,
                                          name_filter: &mut String,
                                          folder_filter: &mut String,
-                                         include_folders: &mut bool| {
+                                         include_folders: &mut bool,
+                                         query_focused: &mut bool| {
                         ui.horizontal(|ui| {
                             ui.label("Search in:");
-                            ui.label(search_path_clone.display().to_string());
+                            ui.label(search_path_clone.display().to_string())
+                                .on_hover_text(search_path_clone.display().to_string());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("✕ Close").clicked() {
+                                let close_resp = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Close").color(egui::Color32::BLACK),
+                                    )
+                                    .fill(egui::Color32::from_rgb(240, 140, 140)),
+                                );
+                                if close_resp.clicked() {
                                     find_close = true;
                                 }
                             });
@@ -4473,9 +4581,20 @@ impl eframe::App for FileManApp {
                         ui.horizontal(|ui| {
                             ui.label("Find:");
                             let edit = ui.text_edit_singleline(query);
+                            if !*query_focused {
+                                edit.request_focus();
+                                *query_focused = true;
+                            }
                             let enter_pressed =
                                 edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let search_clicked = ui.button("Search").clicked();
+                            let search_clicked = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Search").color(egui::Color32::BLACK),
+                                    )
+                                    .fill(egui::Color32::from_rgb(140, 200, 240)),
+                                )
+                                .clicked();
                             if (enter_pressed || search_clicked) && !query.is_empty() {
                                 find_trigger = Some(query.clone());
                             }
@@ -4567,10 +4686,10 @@ impl eframe::App for FileManApp {
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .vscroll(true)
                             .max_scroll_height(320.0)
-                            .column(egui_extras::Column::initial(170.0).resizable(true).clip(true))
+                            .column(egui_extras::Column::initial(420.0).at_least(200.0).resizable(true).clip(true))
                             .column(egui_extras::Column::remainder().clip(true))
-                            .column(egui_extras::Column::initial(110.0).resizable(true).clip(true))
-                            .column(egui_extras::Column::initial(70.0).resizable(true).clip(true))
+                            .column(egui_extras::Column::initial(150.0).at_least(150.0).resizable(true).clip(false))
+                            .column(egui_extras::Column::initial(110.0).at_least(90.0).resizable(true).clip(true))
                             .header(22.0, |mut header| {
                                 header.col(|ui| {
                                     sort_header(ui, "Name", "name", sort_col, *sort_asc, &mut sort_clicked);
@@ -4663,10 +4782,15 @@ impl eframe::App for FileManApp {
                             }
                         }
                     };
+                    let avail = ctx.input(|i| i.viewport_rect());
+                    let default_size = egui::vec2(
+                        (avail.width() * 0.75).clamp(760.0, 1200.0),
+                        (avail.height() * 0.7).clamp(420.0, 720.0),
+                    );
                     egui::Window::new("Find Files")
                         .resizable(true)
-                        .default_width(560.0)
-                        .default_height(420.0)
+                        .default_size(default_size)
+                        .min_width(760.0)
                         .show(&ctx, |ui| {
                             dialog_ui(
                                 ui,
@@ -4677,6 +4801,7 @@ impl eframe::App for FileManApp {
                                 name_filter,
                                 folder_filter,
                                 include_folders,
+                                query_focused,
                             );
                         });
                 }
@@ -5469,6 +5594,12 @@ fn paint_nav_icon(
             }
             painter.circle_filled(c, 2.2, color);
         }
+        SettingsPage::About => {
+            // Info glyph: ring, dot, stem.
+            painter.circle_stroke(c, rad, stroke);
+            painter.circle_filled(p(0.5, 0.28), 1.5, color);
+            painter.line_segment([p(0.5, 0.46), p(0.5, 0.76)], stroke);
+        }
     }
 }
 
@@ -6045,14 +6176,16 @@ fn show_entry_context_menu(
         *row_action = Some(RowAction::NewFile);
         ui.close();
     }
-    ui.separator();
-    if ui.button("Extract Here").clicked() {
-        *row_action = Some(RowAction::ExtractHere);
-        ui.close();
-    }
-    if ui.button("Extract to...").clicked() {
-        *row_action = Some(RowAction::ExtractTo);
-        ui.close();
+    if archive::is_archive(entry_path) {
+        ui.separator();
+        if ui.button("Extract Here").clicked() {
+            *row_action = Some(RowAction::ExtractHere);
+            ui.close();
+        }
+        if ui.button("Extract to...").clicked() {
+            *row_action = Some(RowAction::ExtractTo);
+            ui.close();
+        }
     }
     ui.separator();
     if ui.button("Copy Filename").clicked() {

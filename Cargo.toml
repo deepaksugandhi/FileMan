@@ -1,13 +1,13 @@
 [package]
 name = "fileman"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 
 [dependencies]
 chrono = "0.4.45"
 eframe = "0.36.1"
 egui = "0.36.1"
-egui_extras = "0.36.1"
+egui_extras = { version = "0.36.1", features = ["image"] }
 flate2 = "1.1"
 raw-window-handle = "0.6"
 rfd = "0.15"

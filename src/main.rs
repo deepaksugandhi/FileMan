@@ -51,9 +51,12 @@ fn main() -> eframe::Result<()> {
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_dir());
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../docs/FileMan Icon.png"))
+        .expect("embedded app icon PNG is malformed");
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0])
         .with_maximized(true)
+        .with_icon(icon)
         // FileMan registers its own OLE drop target (native_drag.rs) so a
         // single drag/drop path covers both internal pane-to-pane drops and
         // genuinely external ones; winit registering its own would collide
@@ -98,7 +101,8 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Speed FileMan",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(app::FileManApp::new(
                 conn,
                 user_id,

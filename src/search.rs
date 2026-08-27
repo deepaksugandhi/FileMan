@@ -67,6 +67,9 @@ mod tests {
             size: 0,
             modified: None,
             archive: false,
+            readonly: false,
+            hidden: false,
+            system: false,
         }
     }
 

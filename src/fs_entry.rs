@@ -14,8 +14,17 @@ pub struct FsEntry {
     pub modified: Option<SystemTime>,
     /// Windows FILE_ATTRIBUTE_ARCHIVE (0x20).
     pub archive: bool,
+    /// Windows FILE_ATTRIBUTE_READONLY (0x1).
+    pub readonly: bool,
+    /// Windows FILE_ATTRIBUTE_HIDDEN (0x2).
+    pub hidden: bool,
+    /// Windows FILE_ATTRIBUTE_SYSTEM (0x4).
+    pub system: bool,
 }
 
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 
 pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
@@ -24,16 +33,19 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
         let entry = entry?;
         let metadata = entry.metadata()?;
         #[cfg(windows)]
-        let archive = metadata.file_attributes() & FILE_ATTRIBUTE_ARCHIVE != 0;
+        let attrs = metadata.file_attributes();
         #[cfg(not(windows))]
-        let archive = false;
+        let attrs = 0u32;
         entries.push(FsEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry.path(),
             is_dir: metadata.is_dir(),
             size: metadata.len(),
             modified: metadata.modified().ok(),
-            archive,
+            archive: attrs & FILE_ATTRIBUTE_ARCHIVE != 0,
+            readonly: attrs & FILE_ATTRIBUTE_READONLY != 0,
+            hidden: attrs & FILE_ATTRIBUTE_HIDDEN != 0,
+            system: attrs & FILE_ATTRIBUTE_SYSTEM != 0,
         });
     }
     sort_entries(&mut entries, "name", true);
@@ -137,6 +149,9 @@ mod tests {
             size,
             modified,
             archive: false,
+            readonly: false,
+            hidden: false,
+            system: false,
         }
     }
 

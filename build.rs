@@ -18,6 +18,7 @@ fn main() {
         res.set("ProductVersion", &version);
         res.set("FileDescription", "FileMan file manager");
         res.set("ProductName", "FileMan");
+        res.set_icon("assets/app.ico");
 
         res.compile()
             .expect("failed to compile Windows version info resource");

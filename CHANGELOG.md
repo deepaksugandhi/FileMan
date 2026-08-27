@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.6 (2026-08-27)
+
+- Find Files modal: wider resizable window with roomier Name/Size columns, full-width Modified column, tooltip on truncated search path, Esc to close, auto-focus on the search box, and light-filled Close/Search buttons.
+- Settings > Hidden Files: toggle to show/hide hidden files and folders (hidden by default).
+- Right-click "Extract Here"/"Extract to..." now only appear for supported archive files (zip, tar, tar.gz/tgz), not every entry.
+- Fixed "Open With..." silently launching the default app instead of showing the app chooser.
+- Real FileMan icon embedded in the exe/installer/shortcuts and shown on the About page; app/logo artwork cleaned up (transparent background, tightly cropped).
+
 ## v0.1.5 (2026-08-26)
 
 - Right-click context menu gains "Properties", opening Windows' native file/folder properties dialog.
