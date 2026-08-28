@@ -5120,11 +5120,10 @@ impl eframe::App for FileManApp {
             let has_custom = !self.custom_actions.is_empty();
             if has_launcher || has_file_launch || has_custom {
                 ui.add_space(2.0);
-                // Center-aligned (not the default top-aligned) so the
-                // search boxes — shorter than the icon+text launch buttons
-                // sharing this row — sit on the same line as everything
-                // else instead of hugging the top of the row.
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // `horizontal` already center-aligns cross-axis (unlike
+                // `with_layout`, which would claim the panel's full
+                // remaining height for this row instead of just one line).
+                ui.horizontal(|ui| {
                     // Search filter for launcher apps (left side).
                     let mut launch_app: Option<i64> = None;
                     if has_launcher {
