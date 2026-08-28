@@ -4770,6 +4770,8 @@ impl eframe::App for FileManApp {
             m.focused().is_some_and(|id| {
                 id == egui::Id::new(("address_bar", self.active_pane))
                     || id == egui::Id::new(("filter_input", self.active_pane))
+                    || id == egui::Id::new("launcher_filter")
+                    || id == egui::Id::new("file_launch_filter")
             })
         });
         // '*' jumps straight to the filter box, wherever focus currently is
@@ -5072,22 +5074,55 @@ impl eframe::App for FileManApp {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     // Search filter for launcher apps (left side).
+                    let mut launch_app: Option<i64> = None;
                     if has_launcher {
-                        let filter_edit = ui.add_sized(
-                            [160.0, 0.0],
+                        let filter_edit = ui.add(
                             egui::TextEdit::singleline(&mut self.launcher_filter)
-                                .hint_text("Search apps..."),
+                                .id(egui::Id::new("launcher_filter"))
+                                .hint_text("\u{26A1} Search apps...")
+                                .desired_width(140.0),
                         );
                         if filter_edit.changed() {
                             self.dirty = true;
                         }
+
+                        // Dropdown: show all matching apps when filter has text.
+                        let filter_lower = self.launcher_filter.to_lowercase();
+                        if !filter_lower.is_empty() {
+                            let matches: Vec<_> = self
+                                .launcher_apps
+                                .iter()
+                                .filter(|a| {
+                                    a.label.to_lowercase().contains(&filter_lower)
+                                        || a.exe_path.to_lowercase().contains(&filter_lower)
+                                })
+                                .cloned()
+                                .collect();
+                            if !matches.is_empty() {
+                                egui::Popup::from_response(&filter_edit)
+                                    .open(true)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .show(|ui| {
+                                        ui.set_min_width(180.0);
+                                        for app in &matches {
+                                            if ui
+                                                .button(format!("\u{26A1} {}", app.label))
+                                                .on_hover_text(&app.exe_path)
+                                                .clicked()
+                                            {
+                                                launch_app = Some(app.id);
+                                            }
+                                        }
+                                    });
+                            }
+                        }
+
                         ui.separator();
                     }
 
                     // Pinned launcher buttons (filtered by search text, only
                     // those with show_button enabled).
                     let filter_lower = self.launcher_filter.to_lowercase();
-                    let mut launch_app: Option<i64> = None;
                     for app in &self.launcher_apps {
                         if !app.show_button {
                             continue;
@@ -5103,7 +5138,8 @@ impl eframe::App for FileManApp {
                             self.launcher_icons.insert(app.exe_path.clone(), tex);
                         }
                         let icon = self.launcher_icons.get(&app.exe_path).cloned().flatten();
-                        if toolbar_button(ui, app.label.clone(), icon.as_ref(), ButtonStyle::Blue)
+                        let label = format!("\u{26A1} {}", app.label);
+                        if toolbar_button(ui, label, icon.as_ref(), ButtonStyle::Blue)
                             .on_hover_text(format!("Launch {}", app.exe_path))
                             .clicked()
                         {
@@ -5119,37 +5155,71 @@ impl eframe::App for FileManApp {
                                 .args(args.split_whitespace())
                                 .spawn();
                             self.status = format!("Launched {label}");
+                            self.launcher_filter.clear();
                         }
                     }
 
                     // File launch shortcut buttons with search filter.
+                    let mut launch_file: Option<i64> = None;
                     if has_file_launch && has_launcher {
                         ui.separator();
                     }
                     if has_file_launch {
-                        let fl_filter_edit = ui.add_sized(
-                            [140.0, 0.0],
+                        let fl_filter_edit = ui.add(
                             egui::TextEdit::singleline(&mut self.file_launch_filter)
-                                .hint_text("Search files..."),
+                                .id(egui::Id::new("file_launch_filter"))
+                                .hint_text("\u{1F4C4} Search files...")
+                                .desired_width(140.0),
                         );
                         if fl_filter_edit.changed() {
                             self.dirty = true;
                         }
+
+                        // Dropdown: show all matching file launches when filter has text.
+                        let fl_filter_lower = self.file_launch_filter.to_lowercase();
+                        if !fl_filter_lower.is_empty() {
+                            let matches: Vec<_> = self
+                                .file_launches
+                                .iter()
+                                .filter(|fl| {
+                                    fl.label.to_lowercase().contains(&fl_filter_lower)
+                                        || fl.file_path.to_lowercase().contains(&fl_filter_lower)
+                                })
+                                .cloned()
+                                .collect();
+                            if !matches.is_empty() {
+                                egui::Popup::from_response(&fl_filter_edit)
+                                    .open(true)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .show(|ui| {
+                                        ui.set_min_width(180.0);
+                                        for fl in &matches {
+                                            if ui
+                                                .button(format!("\u{1F4C4} {}", fl.label))
+                                                .on_hover_text(&fl.file_path)
+                                                .clicked()
+                                            {
+                                                launch_file = Some(fl.id);
+                                            }
+                                        }
+                                    });
+                            }
+                        }
+
                         ui.separator();
                     }
                     let fl_filter_lower = self.file_launch_filter.to_lowercase();
-                    let mut launch_file: Option<i64> = None;
                     for fl in &self.file_launches {
                         if !fl.show_button {
                             continue;
                         }
                         let matches = fl_filter_lower.is_empty()
-                            || fl.label.to_lowercase().contains(&fl_filter_lower)
-                            || fl.file_path.to_lowercase().contains(&fl_filter_lower);
+                            || fl.label.to_lowercase().contains(&fl_filter_lower);
                         if !matches {
                             continue;
                         }
-                        if toolbar_button(ui, fl.label.clone(), None, ButtonStyle::Blue)
+                        let label = format!("\u{1F4C4} {}", fl.label);
+                        if toolbar_button(ui, label, None, ButtonStyle::Blue)
                             .on_hover_text(format!("Open {}", fl.file_path))
                             .clicked()
                         {
@@ -5164,6 +5234,7 @@ impl eframe::App for FileManApp {
                                 .args(["/C", "start", "", &file])
                                 .spawn();
                             self.status = format!("Opened {label}");
+                            self.file_launch_filter.clear();
                         }
                     }
 
@@ -5179,7 +5250,8 @@ impl eframe::App for FileManApp {
                             self.custom_icons.insert(custom.exe_path.clone(), tex);
                         }
                         let icon = self.custom_icons.get(&custom.exe_path).cloned().flatten();
-                        if toolbar_button(ui, custom.label.clone(), icon.as_ref(), ButtonStyle::Green)
+                        let label = format!("\u{1F50D} {}", custom.label);
+                        if toolbar_button(ui, label, icon.as_ref(), ButtonStyle::Green)
                             .on_hover_text(format!(
                                 "Open the selection with {}",
                                 custom.exe_path
