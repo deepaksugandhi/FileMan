@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.7 (2026-08-28)
+
+- App Launcher: configure quick-launch apps (Settings > App Launcher), each with an optional toolbar button and a searchable dropdown on the toolbar's second row.
+- File Launcher: pin specific files as one-click shortcuts (Settings > File Launcher) that open with Windows' default app for the extension.
+- Search dropdowns for both launchers show live filtered results as you type; click an entry to launch it and clear the filter.
+- Toolbar buttons now carry prefix icons to tell button types apart at a glance: ⚡ App launcher, 📄 File launch, 🔍 Custom action (Open With), with custom actions in a distinct green/teal style.
+- Fixed search-box alignment so it matches button height on the toolbar.
+
 ## v0.1.6 (2026-08-27)
 
 - Find Files modal: wider resizable window with roomier Name/Size columns, full-width Modified column, tooltip on truncated search path, Esc to close, auto-focus on the search box, and light-filled Close/Search buttons.

@@ -7302,7 +7302,17 @@ fn help_content(ui: &mut egui::Ui) {
     help_heading(ui, "Custom Actions");
     w(
         ui,
-        "Custom actions let you open files with any application. Go to Settings > Custom Actions to add one. Each action shows as an icon button on the second toolbar row.",
+        "Custom actions let you open files with any application. Go to Settings > Custom Actions to add one. Each action shows as a 🔍 icon button on the second toolbar row.",
+    );
+
+    help_heading(ui, "App Launcher & File Launcher");
+    w(
+        ui,
+        "App Launcher (Settings > App Launcher) lets you configure apps as ⚡ quick-launch buttons. File Launcher (Settings > File Launcher) does the same for specific files, opened with 📄 via their default app.",
+    );
+    w(
+        ui,
+        "Both show a search box on the toolbar's second row — type to filter, then click a result in the dropdown to launch it.",
     );
 
     help_heading(ui, "Settings");

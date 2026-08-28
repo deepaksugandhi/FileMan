@@ -36,6 +36,7 @@ const TIPS: &[&str] = &[
     "Make FileMan the default folder explorer in Settings → Advanced and folders will open here, not Explorer.",
     "Prefer stacked tabs? Switch between horizontal and vertical tab strips under Settings → Appearance.",
     "Large copies and moves run in the background with a progress window — you can keep browsing meanwhile.",
+    "Pin your favourite apps or files as quick-launch buttons in Settings → App Launcher / File Launcher, then find them fast by typing into the search box on the second toolbar row.",
 ];
 
 /// What the user did with the card during the last [`TipsCard::draw`].
