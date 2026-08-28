@@ -325,7 +325,7 @@ pub struct FileManApp {
     /// call (slow, and worse over a network path) — without this cache it
     /// re-ran on every frame, stalling the UI thread and flickering the
     /// cursor between arrow and hourglass.
-    shell_menu_cache: Option<(std::path::PathBuf, Vec<crate::shell_menu::ShellMenuItem>)>,
+    shell_menu_cache: Option<(Vec<std::path::PathBuf>, Vec<crate::shell_menu::ShellMenuItem>)>,
     /// State for the tips card: current tip, rotation timing and session
     /// visibility.
     tips: crate::tips::TipsCard,
@@ -4151,12 +4151,18 @@ impl FileManApp {
                                                 if row_resp.drag_started() {
                                                     drag_start = Some(entry.name.clone());
                                                 }
+                                                let selection_paths = context_menu_paths(
+                                                    pane.active_tab(),
+                                                    entry,
+                                                    is_selected,
+                                                );
                                                 styled_context_menu(&row_resp, |ui| {
                                                     show_entry_context_menu(
                                                         ui,
                                                         &mut row_action,
                                                         &entry.path,
                                                         entry.is_dir,
+                                                        &selection_paths,
                                                         &self.shell_menu_hidden,
                                                         &mut self.shell_menu_cache,
                                                     );
@@ -4242,12 +4248,18 @@ impl FileManApp {
                                         if drag_zone.drag_started() {
                                             drag_start = Some(entry.name.clone());
                                         }
+                                        let selection_paths = context_menu_paths(
+                                            pane.active_tab(),
+                                            entry,
+                                            is_selected,
+                                        );
                                         styled_context_menu(&resp, |ui| {
                                             show_entry_context_menu(
                                                 ui,
                                                 &mut row_action,
                                                 &entry.path,
                                                 entry.is_dir,
+                                                &selection_paths,
                                                 &self.shell_menu_hidden,
                                                 &mut self.shell_menu_cache,
                                             );
@@ -4316,12 +4328,18 @@ impl FileManApp {
                                                 if drag_zone.drag_started() {
                                                     drag_start = Some(entry.name.clone());
                                                 }
+                                                let selection_paths = context_menu_paths(
+                                                    pane.active_tab(),
+                                                    entry,
+                                                    is_selected,
+                                                );
                                                 styled_context_menu(&resp, |ui| {
                                                     show_entry_context_menu(
                                                         ui,
                                                         &mut row_action,
                                                         &entry.path,
                                                         entry.is_dir,
+                                                        &selection_paths,
                                                         &self.shell_menu_hidden,
                                                         &mut self.shell_menu_cache,
                                                     );
@@ -4481,10 +4499,10 @@ impl FileManApp {
                         RowAction::Properties(path) => {
                             crate::win_default::show_properties(&path);
                         }
-                        RowAction::ShellCommand { id, path } => {
+                        RowAction::ShellCommand { id, paths } => {
                             #[cfg(windows)]
                             if let Some(hwnd) = self.hwnd {
-                                crate::shell_menu::invoke(hwnd, &path, id);
+                                crate::shell_menu::invoke(hwnd, &paths, id);
                             }
                         }
                     }
@@ -6626,7 +6644,7 @@ enum RowAction {
     #[allow(dead_code)]
     OpenInExplorer(PathBuf),
     Properties(PathBuf),
-    ShellCommand { id: u32, path: PathBuf },
+    ShellCommand { id: u32, paths: Vec<PathBuf> },
 }
 
 /// Deferred action requested from a Find-results row. Applied after the
@@ -7111,6 +7129,21 @@ fn context_menu_stroke(theme: egui::Theme) -> egui::Stroke {
     }
 }
 
+/// Paths a right-click on `entry` should act on: the full multi-selection
+/// when `entry` is already selected and more than one item is selected
+/// (Explorer's own behavior), otherwise just `entry` itself.
+fn context_menu_paths(
+    tab: &crate::tab::Tab,
+    entry: &crate::fs_entry::FsEntry,
+    is_selected: bool,
+) -> Vec<PathBuf> {
+    if is_selected && tab.selected.len() > 1 {
+        tab.selected.iter().map(|n| tab.path.join(n)).collect()
+    } else {
+        vec![entry.path.clone()]
+    }
+}
+
 /// Same as `Response::context_menu`, but paints the popup with the distinct
 /// per-theme fill from `context_menu_fill` (egui's popup frame reads
 /// `visuals.window_fill`, which defaults to the page background color).
@@ -7138,8 +7171,14 @@ fn show_entry_context_menu(
     row_action: &mut Option<RowAction>,
     entry_path: &std::path::Path,
     is_dir: bool,
+    // Every path the "Windows Explorer" shell submenu should act on: just
+    // `entry_path` for a right-click on an unselected/lone item, or the
+    // full multi-selection when the click landed on a selected row —
+    // otherwise a shell command like "Combine files in Foxit PDF" only
+    // ever sees the single row that was clicked.
+    selection_paths: &[std::path::PathBuf],
     shell_menu_hidden: &std::collections::HashSet<String>,
-    shell_menu_cache: &mut Option<(std::path::PathBuf, Vec<crate::shell_menu::ShellMenuItem>)>,
+    shell_menu_cache: &mut Option<(Vec<std::path::PathBuf>, Vec<crate::shell_menu::ShellMenuItem>)>,
 ) {
     ui.set_min_width(140.0);
     if ui.button("Copy").clicked() {
@@ -7210,15 +7249,16 @@ fn show_entry_context_menu(
     }
 
     // Windows Explorer shell context menu sub-menu. `query_items` is a
-    // blocking shell/COM call, so it's cached per-path rather than re-run
-    // on every frame this menu stays open (see `shell_menu_cache`'s doc).
+    // blocking shell/COM call, so it's cached per-selection rather than
+    // re-run on every frame this menu stays open (see `shell_menu_cache`'s
+    // doc).
     if shell_menu_cache
         .as_ref()
-        .is_none_or(|(cached_path, _)| cached_path != entry_path)
+        .is_none_or(|(cached_paths, _)| cached_paths.as_slice() != selection_paths)
     {
         *shell_menu_cache = Some((
-            entry_path.to_path_buf(),
-            crate::shell_menu::query_items(entry_path),
+            selection_paths.to_vec(),
+            crate::shell_menu::query_items(selection_paths),
         ));
     }
     let shell_items = &shell_menu_cache.as_ref().unwrap().1;
@@ -7229,7 +7269,7 @@ fn show_entry_context_menu(
         ui.separator();
         ui.menu_button("Windows Explorer", |ui| {
             ui.set_min_width(180.0);
-            render_shell_items(ui, row_action, entry_path, shell_items, shell_menu_hidden);
+            render_shell_items(ui, row_action, selection_paths, shell_items, shell_menu_hidden);
         });
     }
 }
@@ -7239,7 +7279,7 @@ fn show_entry_context_menu(
 fn render_shell_items(
     ui: &mut egui::Ui,
     row_action: &mut Option<RowAction>,
-    entry_path: &std::path::Path,
+    selection_paths: &[std::path::PathBuf],
     items: &[crate::shell_menu::ShellMenuItem],
     shell_menu_hidden: &std::collections::HashSet<String>,
 ) {
@@ -7258,11 +7298,11 @@ fn render_shell_items(
         if !item.sub_items.is_empty() {
             let label = item.label.clone();
             let sub_items = item.sub_items.clone();
-            let path = entry_path.to_path_buf();
+            let paths = selection_paths.to_vec();
             let ra = std::rc::Rc::new(std::cell::RefCell::new(None::<RowAction>));
             let ra_clone = ra.clone();
             ui.menu_button(&label, |ui| {
-                render_shell_items(ui, &mut *ra_clone.borrow_mut(), &path, &sub_items, shell_menu_hidden);
+                render_shell_items(ui, &mut *ra_clone.borrow_mut(), &paths, &sub_items, shell_menu_hidden);
             });
             if let Some(action) = ra.borrow_mut().take() {
                 *row_action = Some(action);
@@ -7271,7 +7311,7 @@ fn render_shell_items(
         } else if ui.button(&item.label).clicked() {
             *row_action = Some(RowAction::ShellCommand {
                 id: item.id,
-                path: entry_path.to_path_buf(),
+                paths: selection_paths.to_vec(),
             });
             ui.close();
         }
@@ -7344,6 +7384,10 @@ fn help_content(ui: &mut egui::Ui) {
     w(
         ui,
         "Right-click any file or folder for the context menu with additional options: Extract, Copy Filename, Copy Folder Path, Open With, Open in Windows Explorer, and Add to Favourites.",
+    );
+    w(
+        ui,
+        "The \"Windows Explorer\" submenu covers your whole selection, not just the row you clicked — right-click any selected file with several others selected and pick, say, \"Combine files in Foxit PDF\" to combine all of them at once.",
     );
     w(
         ui,

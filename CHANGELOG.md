@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.9 (2026-08-28)
+
+- The "Windows Explorer" right-click submenu now acts on your whole selection instead of only the row you clicked — fixes shell commands like "Combine files in Foxit PDF" only picking up the first file.
+
 ## v0.1.8 (2026-08-28)
 
 - Custom Action buttons now send every selected file to the target app (e.g. merging several PDFs in Foxit), not just the first one.

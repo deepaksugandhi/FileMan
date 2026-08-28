@@ -38,6 +38,7 @@ const TIPS: &[&str] = &[
     "Large copies and moves run in the background with a progress window — you can keep browsing meanwhile.",
     "Pin your favourite apps or files as quick-launch buttons in Settings → App Launcher / File Launcher, then find them fast by typing into the search box on the second toolbar row.",
     "Just created a folder? It's already selected — press Enter to jump straight in.",
+    "Select several files, then use the \"Windows Explorer\" right-click submenu — commands like combining PDFs see your whole selection, not just the file you clicked.",
 ];
 
 /// What the user did with the card during the last [`TipsCard::draw`].

@@ -4,8 +4,6 @@
 //! those items in our egui right-click menu. When the user picks one, we
 //! invoke the shell verb directly.
 
-use std::path::Path;
-
 /// A single item from the Windows Explorer context menu.
 #[derive(Debug, Clone)]
 pub struct ShellMenuItem {
@@ -20,8 +18,9 @@ pub struct ShellMenuItem {
 mod win {
     use super::*;
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{
-        Common::ITEMIDLIST, CMINVOKECOMMANDINFO, IContextMenu, IShellFolder, SHBindToParent,
+        Common::ITEMIDLIST, CMINVOKECOMMANDINFO, IContextMenu, IShellFolder, SHGetDesktopFolder,
         SHParseDisplayName, GCS_VERBW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -30,67 +29,105 @@ mod win {
         MFT_SEPARATOR, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU,
     };
 
-    /// Collects shell context menu items for `path`.
-    pub fn query_items(path: &Path) -> Vec<ShellMenuItem> {
-        match unsafe { query_items_inner(path) } {
+    /// Collects shell context menu items covering every path in `paths` (all
+    /// must be siblings in the same folder — true for a multi-selection in
+    /// one pane), so entries like "Combine files in Foxit PDF" that need the
+    /// whole selection actually see it.
+    pub fn query_items(paths: &[std::path::PathBuf]) -> Vec<ShellMenuItem> {
+        match unsafe { query_items_inner(paths) } {
             Some(items) => items,
             None => {
-                eprintln!("[shell_menu] query_items returned None for {}", path.display());
+                eprintln!("[shell_menu] query_items returned None for {paths:?}");
                 Vec::new()
             }
         }
     }
 
-    /// Invokes a shell command on `path` by its numeric menu id.
-    pub fn invoke(hwnd: HWND, path: &Path, id: u32) {
+    /// Invokes a shell command on every path in `paths` by its numeric menu id.
+    pub fn invoke(hwnd: HWND, paths: &[std::path::PathBuf], id: u32) {
         unsafe {
-            let _ = invoke_inner(hwnd, path, id);
+            let _ = invoke_inner(hwnd, paths, id);
         }
     }
 
     // ── internals ─────────────────────────────────────────────────────
 
-    unsafe fn query_items_inner(path: &Path) -> Option<Vec<ShellMenuItem>> {
+    /// Binds `paths`' shared parent folder once, then resolves each path to
+    /// a child PIDL relative to that same parent — the shape
+    /// `IShellFolder::GetUIObjectOf` needs to build one `IContextMenu`
+    /// spanning multiple items, instead of one PIDL per path from
+    /// independent (and not necessarily interchangeable) parent bindings.
+    unsafe fn bind_children(
+        paths: &[std::path::PathBuf],
+    ) -> Option<(IShellFolder, Vec<*mut ITEMIDLIST>)> {
         unsafe {
-            let wide: Vec<u16> = path
+            let dir = paths.first()?.parent()?;
+            let dir_wide: Vec<u16> = dir
                 .to_string_lossy()
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
-            let pcwstr = windows::core::PCWSTR::from_raw(wide.as_ptr());
-
-            let mut pidl_full: *mut ITEMIDLIST = std::ptr::null_mut();
-            if let Err(e) = SHParseDisplayName(pcwstr, None, &mut pidl_full, 0, None) {
-                eprintln!("[shell_menu] SHParseDisplayName failed for {}: {e}", path.display());
+            let mut pidl_dir: *mut ITEMIDLIST = std::ptr::null_mut();
+            SHParseDisplayName(
+                windows::core::PCWSTR::from_raw(dir_wide.as_ptr()),
+                None,
+                &mut pidl_dir,
+                0,
+                None,
+            )
+            .ok()?;
+            if pidl_dir.is_null() {
                 return None;
             }
-            if pidl_full.is_null() {
-                eprintln!("[shell_menu] SHParseDisplayName returned null PIDL for {}", path.display());
-                return None;
+            let desktop: IShellFolder = SHGetDesktopFolder().ok()?;
+            let parent: IShellFolder = desktop.BindToObject(pidl_dir, None).ok()?;
+            CoTaskMemFree(Some(pidl_dir.cast()));
+
+            let mut children: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
+            for path in paths {
+                let name = path.file_name()?.to_string_lossy();
+                let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+                if parent
+                    .ParseDisplayName(
+                        HWND::default(),
+                        None,
+                        windows::core::PCWSTR::from_raw(name_wide.as_ptr()),
+                        None,
+                        &mut child,
+                        std::ptr::null_mut(),
+                    )
+                    .is_err()
+                    || child.is_null()
+                {
+                    for c in children {
+                        CoTaskMemFree(Some(c.cast()));
+                    }
+                    return None;
+                }
+                children.push(child);
             }
+            Some((parent, children))
+        }
+    }
 
-            // SHBindToParent splits the PIDL into parent folder + child item
-            // and binds the parent in one call — handles every PIDL shape
-            // (local, UNC, virtual namespace) correctly, unlike a hand-rolled
-            // walk of the raw SHITEMID chain.
-            let mut last: *mut ITEMIDLIST = std::ptr::null_mut();
-            let parent: IShellFolder = match SHBindToParent(pidl_full, Some(&mut last)) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[shell_menu] SHBindToParent failed: {e}");
-                    return None;
-                }
-            };
+    unsafe fn query_items_inner(paths: &[std::path::PathBuf]) -> Option<Vec<ShellMenuItem>> {
+        unsafe {
+            let (parent, children) = bind_children(paths)?;
+            let refs: Vec<*const ITEMIDLIST> =
+                children.iter().map(|c| *c as *const ITEMIDLIST).collect();
 
-            let ctx_menu: IContextMenu = match parent
-                .GetUIObjectOf(HWND::default(), &[last.cast_const()], None)
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[shell_menu] GetUIObjectOf failed: {e}");
-                    return None;
-                }
-            };
+            let ctx_menu: IContextMenu =
+                match parent.GetUIObjectOf(HWND::default(), &refs, None) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[shell_menu] GetUIObjectOf failed: {e}");
+                        for c in children {
+                            CoTaskMemFree(Some(c.cast()));
+                        }
+                        return None;
+                    }
+                };
 
             let hmenu = match CreatePopupMenu() {
                 Ok(m) => m,
@@ -112,6 +149,9 @@ mod win {
             eprintln!("[shell_menu] enumerate_menu returned {} items", items.len());
 
             let _ = DestroyMenu(hmenu);
+            for c in children {
+                CoTaskMemFree(Some(c.cast()));
+            }
 
             Some(items)
         }
@@ -186,29 +226,31 @@ mod win {
         items
     }
 
-    unsafe fn invoke_inner(hwnd: HWND, path: &Path, id: u32) -> Option<()> {
+    unsafe fn invoke_inner(hwnd: HWND, paths: &[std::path::PathBuf], id: u32) -> Option<()> {
         unsafe {
-            let wide: Vec<u16> = path
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let pcwstr = windows::core::PCWSTR::from_raw(wide.as_ptr());
+            let (parent, children) = bind_children(paths)?;
+            let refs: Vec<*const ITEMIDLIST> =
+                children.iter().map(|c| *c as *const ITEMIDLIST).collect();
 
-            let mut pidl_full: *mut ITEMIDLIST = std::ptr::null_mut();
-            SHParseDisplayName(pcwstr, None, &mut pidl_full, 0, None).ok()?;
-            if pidl_full.is_null() {
-                return None;
-            }
+            let ctx_menu: IContextMenu = match parent.GetUIObjectOf(HWND::default(), &refs, None) {
+                Ok(m) => m,
+                Err(_) => {
+                    for c in children {
+                        CoTaskMemFree(Some(c.cast()));
+                    }
+                    return None;
+                }
+            };
 
-            let mut last: *mut ITEMIDLIST = std::ptr::null_mut();
-            let parent: IShellFolder = SHBindToParent(pidl_full, Some(&mut last)).ok()?;
-
-            let ctx_menu: IContextMenu = parent
-                .GetUIObjectOf(HWND::default(), &[last.cast_const()], None)
-                .ok()?;
-
-            let hmenu = CreatePopupMenu().ok()?;
+            let hmenu = match CreatePopupMenu() {
+                Ok(m) => m,
+                Err(_) => {
+                    for c in children {
+                        CoTaskMemFree(Some(c.cast()));
+                    }
+                    return None;
+                }
+            };
             let id_first: u32 = 0x8000;
             let _ =
                 ctx_menu.QueryContextMenu(hmenu, 0, id_first, 0xBFFF, 0x00000004);
@@ -249,6 +291,9 @@ mod win {
 
             let _ = ctx_menu.InvokeCommand(&cmi);
             let _ = DestroyMenu(hmenu);
+            for c in children {
+                CoTaskMemFree(Some(c.cast()));
+            }
 
             Some(())
         }
@@ -276,10 +321,10 @@ mod win {
 #[cfg(not(windows))]
 mod win {
     use super::*;
-    pub fn query_items(_path: &Path) -> Vec<ShellMenuItem> {
+    pub fn query_items(_paths: &[std::path::PathBuf]) -> Vec<ShellMenuItem> {
         Vec::new()
     }
-    pub fn invoke(_hwnd: (), _path: &Path, _id: u32) {}
+    pub fn invoke(_hwnd: (), _paths: &[std::path::PathBuf], _id: u32) {}
 }
 
 pub use win::{invoke, query_items};
