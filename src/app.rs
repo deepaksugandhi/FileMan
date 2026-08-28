@@ -14,6 +14,60 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+/// Reads file paths from the Windows clipboard in `CF_HDROP` format.
+///
+/// Returns `Some(paths)` when the clipboard holds file drop data (e.g. after
+/// a Ctrl+C in Explorer), or `None` if the clipboard is empty or doesn't
+/// contain `CF_HDROP` data.
+#[cfg(windows)]
+fn read_os_clipboard_hdrop() -> Option<Vec<PathBuf>> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::DragQueryFileW;
+
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+
+        let hdrop_result = GetClipboardData(CF_HDROP.0 as u32);
+        let hdrop = match hdrop_result {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = CloseClipboard();
+                return None;
+            }
+        };
+
+        let hdrop = windows::Win32::UI::Shell::HDROP(hdrop.0);
+        let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+        let mut paths = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let len = DragQueryFileW(hdrop, i, None) as usize;
+            let mut buf = vec![0u16; len + 1];
+            DragQueryFileW(hdrop, i, Some(&mut buf));
+            let s = String::from_utf16_lossy(&buf[..len]);
+            if !s.is_empty() {
+                paths.push(PathBuf::from(s));
+            }
+        }
+
+        let _ = CloseClipboard();
+
+        if paths.is_empty() {
+            None
+        } else {
+            Some(paths)
+        }
+    }
+}
+
+/// Non-Windows stub – clipboard file-drop reading is not supported.
+#[cfg(not(windows))]
+fn read_os_clipboard_hdrop() -> Option<Vec<PathBuf>> {
+    None
+}
+
 /// Formats a file size in bytes into a human-readable string (KB, MB, GB, etc.).
 fn format_file_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -119,6 +173,10 @@ pub struct FileManApp {
     clipboard: Vec<PathBuf>,
     clipboard_op: Option<ClipboardOp>,
     dialog: Option<Dialog>,
+    /// Set to `true` when a dialog is opened this frame, cleared after the
+    /// first render. Used to seed one-time widget state (e.g. text selection
+    /// in the rename modal).
+    dialog_just_opened: bool,
     status: String,
     theme_pref: egui::ThemePreference,
     show_settings: bool,
@@ -175,6 +233,7 @@ pub struct FileManApp {
     /// Directories a just-started background copy/move/delete affects, so
     /// their tabs can be marked stale once the operation completes.
     background_op_dirs: Vec<PathBuf>,
+
     /// Fraction of the central panel's width given to the left pane.
     split_ratio: f32,
     /// Width in points of the sidebar folder-tree panel. Driven manually
@@ -194,6 +253,26 @@ pub struct FileManApp {
     /// Loaded exe icons for custom actions, keyed by exe path. `None` means
     /// extraction failed (no icon) and should not be retried every frame.
     custom_icons: HashMap<String, Option<egui::TextureHandle>>,
+    /// Configured launcher apps for the quick-launch toolbar.
+    launcher_apps: Vec<crate::actions::LauncherApp>,
+    /// Text in the launcher search/filter input.
+    launcher_filter: String,
+    /// Icons loaded for launcher apps, keyed by exe path.
+    launcher_icons: HashMap<String, Option<egui::TextureHandle>>,
+    /// Draft label for the settings add-new-launcher-app form.
+    new_launcher_label: String,
+    /// Draft exe path for the settings add-new-launcher-app form.
+    new_launcher_exe: Option<PathBuf>,
+    /// Draft args for the settings add-new-launcher-app form.
+    new_launcher_args: String,
+    /// Configured file launch shortcuts.
+    file_launches: Vec<crate::actions::FileLaunch>,
+    /// Text in the file launch search/filter input.
+    file_launch_filter: String,
+    /// Draft label for the settings add-new-file-launch form.
+    new_file_launch_label: String,
+    /// Draft file path for the settings add-new-file-launch form.
+    new_file_launch_file: Option<PathBuf>,
     /// Shell-associated icon textures for files in the listings, keyed by
     /// `icon_cache::file_icon_cache_key` (extension, or full path for
     /// exe-like types). `None` values are failed lookups, cached so they
@@ -228,6 +307,20 @@ pub struct FileManApp {
     /// Whether hidden files/folders (Windows FILE_ATTRIBUTE_HIDDEN) are shown
     /// in listings, persisted per user as `show_hidden`. Off by default.
     show_hidden: bool,
+    /// Labels of Windows Explorer shell context-menu items to omit from the
+    /// "Windows Explorer" submenu, persisted per user as
+    /// `shell_menu_hidden` (newline-joined). Empty by default.
+    shell_menu_hidden: std::collections::HashSet<String>,
+    /// Scratch buffer for the Settings > Shell Menu textarea, kept separate
+    /// from `shell_menu_hidden` so in-progress edits aren't lost on rebuild.
+    shell_menu_hidden_text: String,
+    /// Cached result of the last `shell_menu::query_items` call, keyed by
+    /// path. `Response::context_menu`'s closure body re-runs every frame
+    /// while the menu is open, and `query_items` is a blocking COM/shell
+    /// call (slow, and worse over a network path) — without this cache it
+    /// re-ran on every frame, stalling the UI thread and flickering the
+    /// cursor between arrow and hourglass.
+    shell_menu_cache: Option<(std::path::PathBuf, Vec<crate::shell_menu::ShellMenuItem>)>,
     /// State for the tips card: current tip, rotation timing and session
     /// visibility.
     tips: crate::tips::TipsCard,
@@ -245,6 +338,11 @@ pub struct FileManApp {
     /// the filesystem (`read_dir`) on every single repaint. Invalidated via
     /// `mark_dir_dirty`.
     tree_subdirs_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    /// In-flight background `list_subdirs` calls, keyed by directory. A
+    /// network folder's `read_dir` can block for seconds; listing subdirs on
+    /// a background thread (like the main pane's listing job) keeps the tree
+    /// from freezing the whole UI while a branch is expanding.
+    tree_subdirs_jobs: HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>>,
     /// Hand-off point with the OLE drop target registered in
     /// `native_drag.rs`: this frame's pane/tab rects go in, a resolved drop
     /// comes back out. See `native_drag`'s module docs for why.
@@ -252,6 +350,10 @@ pub struct FileManApp {
     /// Set once `native_drag::register_drop_target` has succeeded for this
     /// window (needs a live `eframe::Frame`, unavailable at construction).
     drop_target_registered: bool,
+    /// Cached raw window handle for Win32 API calls (e.g. shell context
+    /// menu). Set once per frame when the `eframe::Frame` is available.
+    #[cfg(windows)]
+    hwnd: Option<windows::Win32::Foundation::HWND>,
     /// A row-drag that just started this frame, queued for
     /// `start_native_drag` once the current pane borrow ends.
     pending_native_drag: Option<(usize, Vec<PathBuf>, PathBuf)>,
@@ -450,6 +552,8 @@ enum SettingsPage {
     Shortcuts,
     Toolbar,
     CustomActions,
+    AppLauncher,
+    FileLauncher,
     FileTypes,
     ViewMode,
     Advanced,
@@ -555,6 +659,9 @@ impl FileManApp {
         let show_hidden = crate::config::get(&conn, current_user_id, "show_hidden")
             .map(|raw| raw == "true")
             .unwrap_or(false);
+        let shell_menu_hidden_text =
+            crate::config::get(&conn, current_user_id, "shell_menu_hidden").unwrap_or_default();
+        let shell_menu_hidden = parse_shell_menu_hidden(&shell_menu_hidden_text);
         let favourites = crate::db::get_favourites(&conn, current_user_id);
         let split_ratio = crate::db::get_split_ratio(&conn, current_user_id).unwrap_or(0.5);
         let tree_width = crate::db::get_tree_width(&conn, current_user_id).unwrap_or(200.0);
@@ -563,6 +670,8 @@ impl FileManApp {
         let shortcut_map = crate::actions::load_shortcut_map(&conn, current_user_id);
         let toolbar_actions = crate::actions::load_toolbar(&conn, current_user_id);
         let custom_actions = crate::actions::list_custom_actions(&conn, current_user_id);
+        let launcher_apps = crate::actions::list_launcher_apps(&conn, current_user_id);
+        let file_launches = crate::actions::list_file_launches(&conn, current_user_id);
         let mut panes = panes;
         if let Some(dir) = startup_dir {
             // Launched as the default folder explorer with a clicked folder.
@@ -581,6 +690,7 @@ impl FileManApp {
             clipboard: Vec::new(),
             clipboard_op: None,
             dialog: None,
+            dialog_just_opened: false,
             status: String::new(),
             theme_pref,
             show_settings: false,
@@ -612,6 +722,16 @@ impl FileManApp {
             toolbar_actions,
             custom_actions,
             custom_icons: HashMap::new(),
+            launcher_apps,
+            launcher_filter: String::new(),
+            launcher_icons: HashMap::new(),
+            new_launcher_label: String::new(),
+            new_launcher_exe: None,
+            new_launcher_args: String::new(),
+            file_launches,
+            file_launch_filter: String::new(),
+            new_file_launch_label: String::new(),
+            new_file_launch_file: None,
             file_icons: HashMap::new(),
             capturing_shortcut_for: None,
             new_custom_action_label: String::new(),
@@ -625,15 +745,21 @@ impl FileManApp {
             instance_slot,
             tips_enabled,
             show_hidden,
+            shell_menu_hidden,
+            shell_menu_hidden_text,
+            shell_menu_cache: None,
             tips: crate::tips::TipsCard::new(),
             dnd_pane_rects: [None, None],
             dnd_tab_rects: Vec::new(),
             tab_reorder: None,
             tree_subdirs_cache: HashMap::new(),
+            tree_subdirs_jobs: HashMap::new(),
             dnd_shared: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::native_drag::DndSharedState::default(),
             )),
             drop_target_registered: false,
+            #[cfg(windows)]
+            hwnd: None,
             pending_native_drag: None,
             universal_sort_col,
             universal_sort_asc,
@@ -693,6 +819,7 @@ impl FileManApp {
             }
         }
         self.tree_subdirs_cache.remove(dir);
+        self.tree_subdirs_jobs.remove(dir);
     }
 
     // ponytail: writes on every state-changing action rather than debouncing
@@ -847,6 +974,11 @@ impl FileManApp {
         self.shortcut_map = crate::actions::load_shortcut_map(&self.conn, user_id);
         self.toolbar_actions = crate::actions::load_toolbar(&self.conn, user_id);
         self.custom_actions = crate::actions::list_custom_actions(&self.conn, user_id);
+        self.launcher_apps = crate::actions::list_launcher_apps(&self.conn, user_id);
+        self.launcher_filter.clear();
+        self.launcher_icons.clear();
+        self.file_launches = crate::actions::list_file_launches(&self.conn, user_id);
+        self.file_launch_filter.clear();
         self.listing_jobs = [None, None];
         self.find_job = None;
         self.status = String::new();
@@ -864,12 +996,12 @@ impl FileManApp {
                 Action::Delete => self.delete_selection(),
                 Action::Rename => self.begin_rename(),
                 Action::NewFolder => {
-                    self.dialog = Some(Dialog::NewFolder {
+                    self.dialog_just_opened = true; self.dialog = Some(Dialog::NewFolder {
                         name: String::new(),
                     });
                 }
                 Action::NewFile => {
-                    self.dialog = Some(Dialog::NewFile {
+                    self.dialog_just_opened = true; self.dialog = Some(Dialog::NewFile {
                         name: String::new(),
                     });
                 }
@@ -917,10 +1049,11 @@ impl FileManApp {
                     let dir = self.active_tab_dir();
                     self.panes[self.active_pane].active_tab_mut().listing_dirty = true;
                     self.tree_subdirs_cache.remove(&dir);
+                    self.tree_subdirs_jobs.remove(&dir);
                 }
                 Action::Find => {
                     let search_path = self.active_tab_dir();
-                    self.dialog = Some(Dialog::Find {
+                    self.dialog_just_opened = true; self.dialog = Some(Dialog::Find {
                         query: String::new(),
                         results: Vec::new(),
                         search_path,
@@ -1043,13 +1176,44 @@ impl FileManApp {
             header = header.open(Some(false));
         }
         let response = header.show(ui, |ui| {
-            let subdirs = self
-                .tree_subdirs_cache
-                .entry(dir.to_path_buf())
-                .or_insert_with(|| crate::fs_entry::list_subdirs(dir).unwrap_or_default())
-                .clone();
-            for subdir in subdirs {
-                self.show_dir_node(ui, &subdir, None, active_path, force_expand);
+            if let Some(subdirs) = self.tree_subdirs_cache.get(dir).cloned() {
+                for subdir in subdirs {
+                    self.show_dir_node(ui, &subdir, None, active_path, force_expand);
+                }
+                return;
+            }
+            // Not cached yet: poll (or start) a background `list_subdirs`
+            // job rather than blocking here — a network folder's `read_dir`
+            // can take seconds, and this closure re-runs every frame the
+            // branch is expanded.
+            let mut resolved: Option<Vec<PathBuf>> = None;
+            if let Some(rx) = self.tree_subdirs_jobs.get(dir) {
+                match rx.try_recv() {
+                    Ok(result) => resolved = Some(result.unwrap_or_default()),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => resolved = Some(Vec::new()),
+                }
+            } else {
+                let (tx, rx) = mpsc::channel();
+                let job_dir = dir.to_path_buf();
+                thread::spawn(move || {
+                    let _ = tx.send(crate::fs_entry::list_subdirs(&job_dir));
+                });
+                self.tree_subdirs_jobs.insert(dir.to_path_buf(), rx);
+            }
+            if let Some(subdirs) = resolved {
+                self.tree_subdirs_jobs.remove(dir);
+                self.tree_subdirs_cache
+                    .insert(dir.to_path_buf(), subdirs.clone());
+                for subdir in subdirs {
+                    self.show_dir_node(ui, &subdir, None, active_path, force_expand);
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.add(egui::Spinner::new().size(12.0));
+                });
+                ui.ctx().request_repaint();
             }
         });
         if is_active {
@@ -1165,6 +1329,120 @@ impl FileManApp {
             .collect()
     }
 
+    /// Resolves the subdirectories of `dir` from the shared tree cache,
+    /// starting a background `list_subdirs` job when not cached yet (a
+    /// network folder's `read_dir` can block for seconds). Returns `None`
+    /// while the listing is still in flight. Shares the sidebar tree's
+    /// cache/jobs, so an already-expanded branch resolves instantly and
+    /// `mark_dir_dirty` invalidates both consumers at once.
+    fn poll_subdirs(
+        cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+        jobs: &mut HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>>,
+        dir: &Path,
+    ) -> Option<Vec<PathBuf>> {
+        if let Some(subdirs) = cache.get(dir) {
+            return Some(subdirs.clone());
+        }
+        let mut resolved: Option<Vec<PathBuf>> = None;
+        if let Some(rx) = jobs.get(dir) {
+            match rx.try_recv() {
+                Ok(result) => resolved = Some(result.unwrap_or_default()),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => resolved = Some(Vec::new()),
+            }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let job_dir = dir.to_path_buf();
+            thread::spawn(move || {
+                let _ = tx.send(crate::fs_entry::list_subdirs(&job_dir));
+            });
+            jobs.insert(dir.to_path_buf(), rx);
+        }
+        if let Some(subdirs) = resolved {
+            jobs.remove(dir);
+            cache.insert(dir.to_path_buf(), subdirs.clone());
+            Some(subdirs)
+        } else {
+            None
+        }
+    }
+
+    /// Clickable breadcrumb separator: looks like the plain ">" label but
+    /// opens a dropdown of `parent`'s subfolders on click, so any child can
+    /// be jumped to directly. The child that continues the current path (if
+    /// any) is highlighted. Returns the picked folder.
+    fn crumb_separator_menu(
+        ui: &mut egui::Ui,
+        font_id: &egui::FontId,
+        subdirs_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+        subdirs_jobs: &mut HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>>,
+        parent: &Path,
+        current_child: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let text_color = ui.visuals().text_color();
+        let galley = ui
+            .painter()
+            .layout_no_wrap(">".to_string(), font_id.clone(), text_color);
+        let (rect, resp) = ui.allocate_at_least(
+            egui::vec2(galley.size().x, ui.spacing().interact_size.y),
+            egui::Sense::click(),
+        );
+        let popup_id = resp.id.with("crumb_sep_menu");
+        let menu_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+        if resp.hovered() || menu_open {
+            ui.painter().rect_filled(
+                rect.expand(2.0),
+                3.0,
+                ui.visuals().widgets.open.weak_bg_fill,
+            );
+        }
+        let glyph_color = if resp.hovered() || menu_open {
+            ui.visuals().strong_text_color()
+        } else {
+            text_color
+        };
+        ui.painter().galley(
+            egui::pos2(rect.min.x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            glyph_color,
+        );
+        let resp = resp.on_hover_text("Show subfolders");
+        let mut picked = None;
+        let max_height = (ui.ctx().content_rect().max.y - rect.max.y - 12.0).clamp(120.0, 600.0);
+        egui::Popup::menu(&resp)
+            .id(popup_id)
+            .show(|ui| {
+                ui.set_min_width(180.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .show(ui, |ui| match Self::poll_subdirs(subdirs_cache, subdirs_jobs, parent) {
+                        Some(subdirs) if subdirs.is_empty() => {
+                            ui.label(egui::RichText::new("No subfolders").weak());
+                        }
+                        Some(subdirs) => {
+                            for sub in subdirs {
+                                let name = sub
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| sub.display().to_string());
+                                let on_path = current_child == Some(sub.as_path());
+                                if ui.selectable_label(on_path, name).clicked() {
+                                    picked = Some(sub);
+                                }
+                            }
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(12.0));
+                                ui.label("Loading…");
+                            });
+                            ui.ctx().request_repaint();
+                        }
+                    });
+            });
+        picked
+    }
+
     /// Copies the current folder path to the system clipboard.
     fn copy_folder_path(&mut self, ctx: &egui::Context) {
         let dir = self.active_tab_dir();
@@ -1191,12 +1469,30 @@ impl FileManApp {
     }
 
     fn paste_clipboard(&mut self) {
-        if self.clipboard.is_empty() {
-            self.status = "Clipboard is empty".into();
-            return;
-        }
+        // When the internal clipboard is empty (files were copied in Explorer
+        // or another app), try reading CF_HDROP from the Windows clipboard.
+        let clipboard_op = if self.clipboard.is_empty() {
+            if let Some(os_paths) = read_os_clipboard_hdrop() {
+                if os_paths.is_empty() {
+                    self.status = "Clipboard is empty".into();
+                    return;
+                }
+                self.status = format!(
+                    "Imported {} item(s) from clipboard",
+                    os_paths.len()
+                );
+                self.clipboard = os_paths;
+                self.clipboard_op = Some(ClipboardOp::Copy);
+                Some(ClipboardOp::Copy)
+            } else {
+                self.status = "Clipboard is empty".into();
+                return;
+            }
+        } else {
+            self.clipboard_op
+        };
         let dest = self.active_tab_dir();
-        let op = self.clipboard_op;
+        let op = clipboard_op;
 
         let mut items: Vec<PathBuf> = Vec::new();
         for src in &self.clipboard {
@@ -1239,7 +1535,7 @@ impl FileManApp {
         if conflicts.is_empty() {
             self.start_transfer(resolved, dest, op);
         } else {
-            self.dialog = Some(Dialog::PasteConflict {
+            self.dialog_just_opened = true; self.dialog = Some(Dialog::PasteConflict {
                 dest_dir: dest,
                 op,
                 conflicts,
@@ -1332,7 +1628,7 @@ impl FileManApp {
         if conflicts.is_empty() {
             self.start_transfer(resolved, dest_dir, op);
         } else {
-            self.dialog = Some(Dialog::PasteConflict {
+            self.dialog_just_opened = true; self.dialog = Some(Dialog::PasteConflict {
                 dest_dir,
                 op,
                 conflicts,
@@ -1375,6 +1671,10 @@ impl FileManApp {
             return;
         }
         if let Some(hwnd) = window_hwnd(frame) {
+            #[cfg(windows)]
+            {
+                self.hwnd = Some(hwnd);
+            }
             if crate::native_drag::register_drop_target(hwnd, self.dnd_shared.clone()).is_ok() {
                 self.drop_target_registered = true;
             }
@@ -1584,7 +1884,7 @@ impl FileManApp {
             self.status = "Nothing selected".into();
             return;
         }
-        self.dialog = Some(Dialog::ConfirmDelete { paths });
+        self.dialog_just_opened = true; self.dialog = Some(Dialog::ConfirmDelete { paths });
     }
 
     fn begin_rename(&mut self) {
@@ -1594,7 +1894,7 @@ impl FileManApp {
             return;
         }
         let name = tab.selected.iter().next().unwrap().clone();
-        self.dialog = Some(Dialog::Rename {
+        self.dialog_just_opened = true; self.dialog = Some(Dialog::Rename {
             path: tab.path.join(&name),
             name,
         });
@@ -1915,6 +2215,34 @@ impl FileManApp {
                 .small(),
         );
 
+        ui.add_space(14.0);
+        settings_group_label(ui, "Windows Explorer Menu");
+        ui.label(
+            egui::RichText::new(
+                "Hide items from the right-click \"Windows Explorer\" submenu by \
+                 label, one per line (must match exactly, including case).",
+            )
+            .weak()
+            .small(),
+        );
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut self.shell_menu_hidden_text)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g.\nOpen with\nGive access to"),
+        );
+        if resp.lost_focus() || resp.changed() {
+            self.shell_menu_hidden = parse_shell_menu_hidden(&self.shell_menu_hidden_text);
+        }
+        if resp.lost_focus() {
+            let _ = crate::config::set(
+                &self.conn,
+                crate::config::Scope::User(self.current_user_id),
+                "shell_menu_hidden",
+                &self.shell_menu_hidden_text,
+            );
+        }
+
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new("Changes apply immediately and are remembered per user.")
@@ -2172,6 +2500,249 @@ impl FileManApp {
         });
     }
 
+    /// Settings page: manage launcher apps that appear as quick-launch
+    /// buttons on the toolbar's second row.
+    fn settings_page_app_launcher(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Configure applications that appear as quick-launch buttons \
+                 on the toolbar. Use the search box on the toolbar to filter \
+                 and launch any configured app.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(10.0);
+
+        let mut remove: Option<i64> = None;
+        let mut toggle_show: Option<(i64, bool)> = None;
+        for app in self.launcher_apps.clone() {
+            if !self.launcher_icons.contains_key(&app.exe_path) {
+                let tex = crate::icon_cache::load_icon_texture(ctx, &app.exe_path);
+                self.launcher_icons.insert(app.exe_path.clone(), tex);
+            }
+            let icon = self.launcher_icons.get(&app.exe_path).cloned().flatten();
+            ui.horizontal(|ui| {
+                match &icon {
+                    Some(tex) => {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(20.0, 20.0),
+                        )));
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("\u{1F680}").weak());
+                    }
+                }
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&app.label).strong());
+                    let path_display = if app.args.is_empty() {
+                        app.exe_path.clone()
+                    } else {
+                        format!("{} {}", app.exe_path, app.args)
+                    };
+                    ui.label(egui::RichText::new(path_display).weak().small());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(app.id);
+                    }
+                    let mut show = app.show_button;
+                    if ui.checkbox(&mut show, "Show button").changed() {
+                        toggle_show = Some((app.id, show));
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.separator();
+        }
+        if let Some((id, show)) = toggle_show {
+            let _ = crate::actions::set_launcher_show_button(&self.conn, id, show);
+            self.launcher_apps =
+                crate::actions::list_launcher_apps(&self.conn, self.current_user_id);
+        }
+        if let Some(id) = remove {
+            let _ = crate::actions::remove_launcher_app(&self.conn, id);
+            self.launcher_apps =
+                crate::actions::list_launcher_apps(&self.conn, self.current_user_id);
+            self.status = "Launcher app removed".into();
+        }
+
+        // Add-app form.
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new("Add a launcher app").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Name").weak());
+                ui.add_space(8.0);
+                let name_edit = ui.add_sized(
+                    [240.0, 0.0],
+                    egui::TextEdit::singleline(&mut self.new_launcher_label),
+                );
+                if name_edit.changed() {
+                    self.dirty = true;
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Program").weak());
+                ui.add_space(8.0);
+                if ui.button("Browse\u{2026}").clicked() {
+                    self.new_launcher_exe = rfd::FileDialog::new()
+                        .set_title("Choose Executable")
+                        .pick_file();
+                }
+                match &self.new_launcher_exe {
+                    Some(exe) => {
+                        ui.label(egui::RichText::new(exe.display().to_string()).weak());
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("No program selected").weak());
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Arguments").weak());
+                ui.add_space(8.0);
+                ui.add_sized(
+                    [240.0, 0.0],
+                    egui::TextEdit::singleline(&mut self.new_launcher_args)
+                        .hint_text("optional"),
+                );
+            });
+            ui.add_space(8.0);
+            let can_add = !self.new_launcher_label.trim().is_empty()
+                && self.new_launcher_exe.is_some();
+            ui.add_enabled_ui(can_add, |ui| {
+                let add_btn = egui::Button::new("Add").fill(ui.visuals().selection.bg_fill);
+                if ui.add(add_btn).clicked() {
+                    if let Some(exe) = self.new_launcher_exe.take() {
+                        let label = std::mem::take(&mut self.new_launcher_label);
+                        let args = std::mem::take(&mut self.new_launcher_args);
+                        let _ = crate::actions::add_launcher_app(
+                            &self.conn,
+                            self.current_user_id,
+                            &label,
+                            &exe.display().to_string(),
+                            &args,
+                        );
+                        self.launcher_apps =
+                            crate::actions::list_launcher_apps(&self.conn, self.current_user_id);
+                        self.status = format!("Added launcher app \"{label}\"");
+                    }
+                }
+            });
+        });
+    }
+
+    /// Settings page: manage file launch shortcuts that open a specific
+    /// file with the default application for its extension.
+    fn settings_page_file_launcher(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Create shortcuts for specific files. Each shortcut opens \
+                 the file with the default application associated with its \
+                 extension. Buttons appear on the toolbar's second row.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(10.0);
+
+        let mut remove: Option<i64> = None;
+        let mut toggle_show: Option<(i64, bool)> = None;
+        for fl in self.file_launches.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("\u{1F4C4}").weak());
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&fl.label).strong());
+                    ui.label(egui::RichText::new(&fl.file_path).weak().small());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(fl.id);
+                    }
+                    let mut show = fl.show_button;
+                    if ui.checkbox(&mut show, "Show button").changed() {
+                        toggle_show = Some((fl.id, show));
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.separator();
+        }
+        if let Some((id, show)) = toggle_show {
+            let _ = crate::actions::set_file_launch_show_button(&self.conn, id, show);
+            self.file_launches =
+                crate::actions::list_file_launches(&self.conn, self.current_user_id);
+        }
+        if let Some(id) = remove {
+            let _ = crate::actions::remove_file_launch(&self.conn, id);
+            self.file_launches =
+                crate::actions::list_file_launches(&self.conn, self.current_user_id);
+            self.status = "File launch shortcut removed".into();
+        }
+
+        // Add form.
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new("Add a file launch shortcut").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Name").weak());
+                ui.add_space(8.0);
+                let name_edit = ui.add_sized(
+                    [240.0, 0.0],
+                    egui::TextEdit::singleline(&mut self.new_file_launch_label),
+                );
+                if name_edit.changed() {
+                    self.dirty = true;
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("File").weak());
+                ui.add_space(8.0);
+                if ui.button("Browse\u{2026}").clicked() {
+                    self.new_file_launch_file = rfd::FileDialog::new()
+                        .set_title("Choose File")
+                        .pick_file();
+                }
+                match &self.new_file_launch_file {
+                    Some(path) => {
+                        ui.label(egui::RichText::new(path.display().to_string()).weak());
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("No file selected").weak());
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            let can_add = !self.new_file_launch_label.trim().is_empty()
+                && self.new_file_launch_file.is_some();
+            ui.add_enabled_ui(can_add, |ui| {
+                let add_btn = egui::Button::new("Add").fill(ui.visuals().selection.bg_fill);
+                if ui.add(add_btn).clicked() {
+                    let file = self.new_file_launch_file.take().unwrap();
+                    let label = std::mem::take(&mut self.new_file_launch_label);
+                    let _ = crate::actions::add_file_launch(
+                        &self.conn,
+                        self.current_user_id,
+                        &label,
+                        &file.display().to_string(),
+                    );
+                    self.file_launches =
+                        crate::actions::list_file_launches(&self.conn, self.current_user_id);
+                    self.status = format!("Added file launch shortcut \"{label}\"");
+                }
+            });
+        });
+    }
+
     /// Settings page: per-extension "always open with" overrides.
     fn settings_page_file_types(&mut self, ui: &mut egui::Ui) {
         let overrides = crate::actions::list_ext_overrides(&self.conn, self.current_user_id);
@@ -2408,10 +2979,18 @@ impl FileManApp {
         self.show_hidden = crate::config::get(&self.conn, uid, "show_hidden")
             .map(|raw| raw == "true")
             .unwrap_or(false);
+        self.shell_menu_hidden_text =
+            crate::config::get(&self.conn, uid, "shell_menu_hidden").unwrap_or_default();
+        self.shell_menu_hidden = parse_shell_menu_hidden(&self.shell_menu_hidden_text);
         self.shortcut_map = crate::actions::load_shortcut_map(&self.conn, uid);
         self.toolbar_actions = crate::actions::load_toolbar(&self.conn, uid);
         self.custom_actions = crate::actions::list_custom_actions(&self.conn, uid);
         self.custom_icons.clear();
+        self.launcher_apps = crate::actions::list_launcher_apps(&self.conn, uid);
+        self.launcher_filter.clear();
+        self.launcher_icons.clear();
+        self.file_launches = crate::actions::list_file_launches(&self.conn, uid);
+        self.file_launch_filter.clear();
         // Force apply_fonts to run again even if the family string matches.
         self.fonts_applied_family = None;
     }
@@ -2455,6 +3034,8 @@ impl FileManApp {
                             (SettingsPage::Shortcuts, "Keyboard Shortcuts"),
                             (SettingsPage::Toolbar, "Toolbar"),
                             (SettingsPage::CustomActions, "Custom Actions"),
+                            (SettingsPage::AppLauncher, "App Launcher"),
+                            (SettingsPage::FileLauncher, "File Launcher"),
                             (SettingsPage::FileTypes, "File Types"),
                             (SettingsPage::ViewMode, "View"),
                             (SettingsPage::Advanced, "Advanced"),
@@ -2565,6 +3146,22 @@ impl FileManApp {
                                         "Open files with your favourite applications.",
                                     );
                                     self.settings_page_custom_actions(ctx, ui);
+                                }
+                                SettingsPage::AppLauncher => {
+                                    settings_header(
+                                        ui,
+                                        "App Launcher",
+                                        "Quick-launch buttons on the toolbar's second row.",
+                                    );
+                                    self.settings_page_app_launcher(ctx, ui);
+                                }
+                                SettingsPage::FileLauncher => {
+                                    settings_header(
+                                        ui,
+                                        "File Launcher",
+                                        "Quick-launch shortcuts for specific files on the toolbar.",
+                                    );
+                                    self.settings_page_file_launcher(ui);
                                 }
                                 SettingsPage::FileTypes => {
                                     settings_header(
@@ -2700,7 +3297,7 @@ impl FileManApp {
                 // Renaming is allowed even for pinned tabs — it only
                 // changes the label, not the folder.
                 if ui.button("Rename Tab").clicked() {
-                    self.dialog = Some(Dialog::RenameTab {
+                    self.dialog_just_opened = true; self.dialog = Some(Dialog::RenameTab {
                         pane_idx,
                         tab_idx,
                         name: label.clone(),
@@ -2738,7 +3335,7 @@ impl FileManApp {
         // Show tab context menu via dialog
         if let Some(idx) = result.context_menu {
             self.tab_menu_pos = result.menu_pos;
-            self.dialog = Some(Dialog::TabContext {
+            self.dialog_just_opened = true; self.dialog = Some(Dialog::TabContext {
                 pane_idx,
                 tab_idx: idx,
             });
@@ -2814,6 +3411,7 @@ impl FileManApp {
                             &mut hover,
                             drag_highlight == Some(tab_idx),
                             None,
+                            &tab.path,
                         );
                         tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
                         clicked = clicked.or(ev.clicked.then_some(tab_idx));
@@ -2901,6 +3499,7 @@ impl FileManApp {
                             &mut hover,
                             drag_highlight == Some(tab_idx),
                             Some(egui::vec2(row_w, row_h)),
+                            &tab.path,
                         );
                         tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
                         clicked = clicked.or(ev.clicked.then_some(tab_idx));
@@ -3007,6 +3606,10 @@ impl FileManApp {
         let mut deferred_toast: Option<String> = None;
         let mut became_active = false;
         let mut became_dirty = false;
+        // Disjoint field borrows so the closure below can poll the shared
+        // subdirs cache/jobs (breadcrumb dropdowns) while holding `pane`.
+        let subdirs_cache = &mut self.tree_subdirs_cache;
+        let subdirs_jobs = &mut self.tree_subdirs_jobs;
         egui::Frame::new()
             .fill(ui.visuals().window_fill())
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -3048,18 +3651,20 @@ impl FileManApp {
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 // Explorer's "Copy as path" wraps the path
                                 // in double quotes; accept both forms.
+                                // No synchronous existence check here: for a
+                                // network path, `Path::exists()` blocks the UI
+                                // thread on the OS's connection timeout (can
+                                // be tens of seconds). Navigate optimistically
+                                // and let the background listing job report
+                                // a bad path via `listing_error` instead.
                                 let typed = pane.address_bar.trim().trim_matches('"').trim();
                                 let target = PathBuf::from(typed);
-                                if target.exists() {
-                                    if pane.active_tab_mut().try_navigate(target) {
-                                        became_active = true;
-                                        became_dirty = true;
-                                    } else {
-                                        deferred_status =
-                                            Some("Tab is pinned — unpin it to navigate".to_string());
-                                    }
+                                if pane.active_tab_mut().try_navigate(target) {
+                                    became_active = true;
+                                    became_dirty = true;
                                 } else {
-                                    deferred_status = Some(format!("Path not found: {}", typed));
+                                    deferred_status =
+                                        Some("Tab is pinned — unpin it to navigate".to_string());
                                 }
                             }
                             pane.address_edit_mode = false;
@@ -3108,7 +3713,16 @@ impl FileManApp {
                                     .collect::<Vec<_>>()
                                     .join(" > "),
                             );
-                            ui.label(">");
+                            if let Some(target) = Self::crumb_separator_menu(
+                                ui,
+                                &font_id,
+                                subdirs_cache,
+                                subdirs_jobs,
+                                &crumbs[first_shown - 1].1,
+                                Some(crumbs[first_shown].1.as_path()),
+                            ) {
+                                nav_target = Some(target);
+                            }
                         }
                         let mut copy_clicked = false;
                         for (i, (label, full_path)) in crumbs.iter().enumerate().skip(first_shown) {
@@ -3153,8 +3767,17 @@ impl FileManApp {
                             } else if ui.button(label).clicked() {
                                 nav_target = Some(full_path.clone());
                             }
-                            if i != last_idx {
-                                ui.label(">");
+                            if i != last_idx
+                                && let Some(target) = Self::crumb_separator_menu(
+                                    ui,
+                                    &font_id,
+                                    subdirs_cache,
+                                    subdirs_jobs,
+                                    full_path,
+                                    crumbs.get(i + 1).map(|(_, p)| p.as_path()),
+                                )
+                            {
+                                nav_target = Some(target);
                             }
                         }
                         // The empty space past the last segment copies the
@@ -3310,354 +3933,377 @@ impl FileManApp {
                 let mut row_action: Option<RowAction> = None;
                 let mut drag_start: Option<String> = None;
 
-                match mode {
-                    ViewMode::Details => {
-                        let col_w = pane.active_tab().col_widths;
-                        // Row/header height scale with the font-size setting
-                        // so larger text never clips inside a fixed row.
-                        let row_height = (self.font_size + 10.0).max(20.0);
-                        let header_height = row_height + 2.0;
-                        let mut sort_clicked: Option<String> = None;
-                        let mut live_widths: Option<Vec<f32>> = None;
+                // A background listing job is still running and hasn't
+                // delivered a single entry yet — show a spinner instead of an
+                // empty pane so a slow network folder or a huge directory
+                // doesn't read as a frozen UI.
+                let loading_empty = entries.is_empty() && self.listing_jobs[pane_idx].is_some();
+                if loading_empty {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(48.0);
+                        ui.add(egui::Spinner::new().size(28.0));
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Loading…").weak());
+                    });
+                    ctx.request_repaint();
+                }
 
-                        egui::ScrollArea::horizontal()
-                            .id_salt(format!("file_scroll_pane_{pane_idx}"))
-                            .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                            .show(ui, |ui| {
-                                egui_extras::TableBuilder::new(ui)
-                                    .id_salt(format!("file_table_pane_{pane_idx}"))
-                                    .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                                    .striped(true)
-                                    .resizable(true)
-                                    .sense(egui::Sense::click_and_drag())
-                                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                                    .column(egui_extras::Column::initial(col_w[0]).clip(true))
-                                    .column(egui_extras::Column::initial(col_w[1]).clip(true))
-                                    .column(egui_extras::Column::initial(col_w[2]).clip(true))
-                                    .column(egui_extras::Column::initial(col_w[3]).clip(true))
-                                    .header(header_height, |mut header| {
-                                        header.col(|ui| {
-                                            sort_header(
-                                                ui,
-                                                "Name",
-                                                "name",
-                                                &sort_col,
-                                                sort_asc,
-                                                &mut sort_clicked,
-                                            );
-                                        });
-                                        header.col(|ui| {
-                                            sort_header(
-                                                ui,
-                                                "Modified",
-                                                "modified",
-                                                &sort_col,
-                                                sort_asc,
-                                                &mut sort_clicked,
-                                            );
-                                        });
-                                        header.col(|ui| {
-                                            sort_header(
-                                                ui,
-                                                "Size",
-                                                "size",
-                                                &sort_col,
-                                                sort_asc,
-                                                &mut sort_clicked,
-                                            );
-                                        });
-                                        header.col(|ui| {
-                                            sort_header(
-                                                ui,
-                                                "Attributes",
-                                                "archive",
-                                                &sort_col,
-                                                sort_asc,
-                                                &mut sort_clicked,
-                                            );
-                                        });
-                                    })
-                                    .body(|body| {
-                                        live_widths = Some(body.widths().to_vec());
-                                        body.rows(row_height, entries.len(), |mut row| {
-                                            let entry = &entries[row.index()];
-                                            let row_idx = row.index();
-                                            let is_selected =
-                                                pane.active_tab().selected.contains(&entry.name);
+                if !loading_empty {
+                    match mode {
+                        ViewMode::Details => {
+                            let col_w = pane.active_tab().col_widths;
+                            // Row/header height scale with the font-size setting
+                            // so larger text never clips inside a fixed row.
+                            let row_height = (self.font_size + 10.0).max(20.0);
+                            let header_height = row_height + 2.0;
+                            let mut sort_clicked: Option<String> = None;
+                            let mut live_widths: Option<Vec<f32>> = None;
 
-                                            row.set_selected(is_selected);
+                            egui::ScrollArea::horizontal()
+                                .id_salt(format!("file_scroll_pane_{pane_idx}"))
+                                .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                                .show(ui, |ui| {
+                                    egui_extras::TableBuilder::new(ui)
+                                        .id_salt(format!("file_table_pane_{pane_idx}"))
+                                        .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                                        .striped(true)
+                                        .resizable(true)
+                                        .sense(egui::Sense::click_and_drag())
+                                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                        .column(egui_extras::Column::initial(col_w[0]).clip(true))
+                                        .column(egui_extras::Column::initial(col_w[1]).clip(true))
+                                        .column(egui_extras::Column::initial(col_w[2]).clip(true))
+                                        .column(egui_extras::Column::initial(col_w[3]).clip(true))
+                                        .header(header_height, |mut header| {
+                                            header.col(|ui| {
+                                                sort_header(
+                                                    ui,
+                                                    "Name",
+                                                    "name",
+                                                    &sort_col,
+                                                    sort_asc,
+                                                    &mut sort_clicked,
+                                                );
+                                            });
+                                            header.col(|ui| {
+                                                sort_header(
+                                                    ui,
+                                                    "Modified",
+                                                    "modified",
+                                                    &sort_col,
+                                                    sort_asc,
+                                                    &mut sort_clicked,
+                                                );
+                                            });
+                                            header.col(|ui| {
+                                                sort_header(
+                                                    ui,
+                                                    "Size",
+                                                    "size",
+                                                    &sort_col,
+                                                    sort_asc,
+                                                    &mut sort_clicked,
+                                                );
+                                            });
+                                            header.col(|ui| {
+                                                sort_header(
+                                                    ui,
+                                                    "Attributes",
+                                                    "archive",
+                                                    &sort_col,
+                                                    sort_asc,
+                                                    &mut sort_clicked,
+                                                );
+                                            });
+                                        })
+                                        .body(|body| {
+                                            live_widths = Some(body.widths().to_vec());
+                                            body.rows(row_height, entries.len(), |mut row| {
+                                                let entry = &entries[row.index()];
+                                                let row_idx = row.index();
+                                                let is_selected =
+                                                    pane.active_tab().selected.contains(&entry.name);
 
-                                            row.col(|ui| {
-                                                // Folders keep their emoji glyph;
-                                                // files show the associated app
-                                                // icon for their type, falling
-                                                // back to bare text when none.
-                                                ui.horizontal(|ui| {
-                                                    if entry.is_dir {
-                                                        ui.label(
-                                                            egui::RichText::new("\u{1F4C1}")
+                                                row.set_selected(is_selected);
+
+                                                row.col(|ui| {
+                                                    // Folders keep their emoji glyph;
+                                                    // files show the associated app
+                                                    // icon for their type, falling
+                                                    // back to bare text when none.
+                                                    ui.horizontal(|ui| {
+                                                        if entry.is_dir {
+                                                            ui.label(
+                                                                egui::RichText::new("\u{1F4C1}")
+                                                                    .color(listing_text),
+                                                            );
+                                                        } else if let Some(tex) = &entry_icons[row_idx]
+                                                        {
+                                                            ui.add(egui::Image::new(
+                                                                egui::load::SizedTexture::new(
+                                                                    tex.id(),
+                                                                    egui::vec2(16.0, 16.0),
+                                                                ),
+                                                            ));
+                                                        }
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(
+                                                                    entry.name.as_str(),
+                                                                )
                                                                 .color(listing_text),
-                                                        );
-                                                    } else if let Some(tex) = &entry_icons[row_idx]
-                                                    {
-                                                        ui.add(egui::Image::new(
-                                                            egui::load::SizedTexture::new(
-                                                                tex.id(),
-                                                                egui::vec2(16.0, 16.0),
-                                                            ),
-                                                        ));
-                                                    }
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(
-                                                                entry.name.as_str(),
                                                             )
+                                                            .selectable(false),
+                                                        );
+                                                    });
+                                                });
+                                                row.col(|ui| {
+                                                    let text = entry
+                                                        .modified
+                                                        .map(|t| {
+                                                            chrono::DateTime::<chrono::Local>::from(t)
+                                                                .format("%Y-%m-%d %H:%M")
+                                                                .to_string()
+                                                        })
+                                                        .unwrap_or_default();
+                                                    ui.label(
+                                                        egui::RichText::new(text).color(listing_text),
+                                                    );
+                                                });
+                                                row.col(|ui| {
+                                                    let size_text = if entry.is_dir {
+                                                        String::new()
+                                                    } else {
+                                                        format_file_size(entry.size)
+                                                    };
+                                                    ui.label(
+                                                        egui::RichText::new(size_text)
                                                             .color(listing_text),
-                                                        )
-                                                        .selectable(false),
+                                                    );
+                                                });
+                                                row.col(|ui| {
+                                                    let mut attrs = String::new();
+                                                    if entry.readonly {
+                                                        attrs.push('R');
+                                                    }
+                                                    if entry.hidden {
+                                                        attrs.push('H');
+                                                    }
+                                                    if entry.system {
+                                                        attrs.push('S');
+                                                    }
+                                                    if entry.archive {
+                                                        attrs.push('A');
+                                                    }
+                                                    ui.label(
+                                                        egui::RichText::new(attrs)
+                                                            .color(listing_text),
+                                                    );
+                                                });
+
+                                                let row_resp = row.response();
+                                                if row_resp.clicked() {
+                                                    select_name = Some(entry.name.clone());
+                                                    select_index = Some(row_idx);
+                                                }
+                                                if row_resp.double_clicked() {
+                                                    if entry.is_dir {
+                                                        nav_target = Some(entry.path.clone());
+                                                    } else {
+                                                        open_target = Some(entry.path.clone());
+                                                    }
+                                                }
+                                                if row_resp.secondary_clicked() && !is_selected {
+                                                    select_name = Some(entry.name.clone());
+                                                    select_index = Some(row_idx);
+                                                }
+                                                // The table carries click_and_drag
+                                                // sense, so a row drag starts a
+                                                // copy/move gesture without
+                                                // interfering with clicks.
+                                                if row_resp.drag_started() {
+                                                    drag_start = Some(entry.name.clone());
+                                                }
+                                                styled_context_menu(&row_resp, |ui| {
+                                                    show_entry_context_menu(
+                                                        ui,
+                                                        &mut row_action,
+                                                        &entry.path,
+                                                        entry.is_dir,
+                                                        &self.shell_menu_hidden,
+                                                        &mut self.shell_menu_cache,
                                                     );
                                                 });
                                             });
-                                            row.col(|ui| {
-                                                let text = entry
-                                                    .modified
-                                                    .map(|t| {
-                                                        chrono::DateTime::<chrono::Local>::from(t)
-                                                            .format("%Y-%m-%d %H:%M")
-                                                            .to_string()
-                                                    })
-                                                    .unwrap_or_default();
-                                                ui.label(
-                                                    egui::RichText::new(text).color(listing_text),
-                                                );
-                                            });
-                                            row.col(|ui| {
-                                                let size_text = if entry.is_dir {
-                                                    String::new()
-                                                } else {
-                                                    format_file_size(entry.size)
-                                                };
-                                                ui.label(
-                                                    egui::RichText::new(size_text)
-                                                        .color(listing_text),
-                                                );
-                                            });
-                                            row.col(|ui| {
-                                                let mut attrs = String::new();
-                                                if entry.readonly {
-                                                    attrs.push('R');
-                                                }
-                                                if entry.hidden {
-                                                    attrs.push('H');
-                                                }
-                                                if entry.system {
-                                                    attrs.push('S');
-                                                }
-                                                if entry.archive {
-                                                    attrs.push('A');
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(attrs)
-                                                        .color(listing_text),
-                                                );
-                                            });
-
-                                            let row_resp = row.response();
-                                            if row_resp.clicked() {
-                                                select_name = Some(entry.name.clone());
-                                                select_index = Some(row_idx);
-                                            }
-                                            if row_resp.double_clicked() {
-                                                if entry.is_dir {
-                                                    nav_target = Some(entry.path.clone());
-                                                } else {
-                                                    open_target = Some(entry.path.clone());
-                                                }
-                                            }
-                                            if row_resp.secondary_clicked() && !is_selected {
-                                                select_name = Some(entry.name.clone());
-                                                select_index = Some(row_idx);
-                                            }
-                                            // The table carries click_and_drag
-                                            // sense, so a row drag starts a
-                                            // copy/move gesture without
-                                            // interfering with clicks.
-                                            if row_resp.drag_started() {
-                                                drag_start = Some(entry.name.clone());
-                                            }
-                                            styled_context_menu(&row_resp, |ui| {
-                                                show_entry_context_menu(
-                                                    ui,
-                                                    &mut row_action,
-                                                    &entry.path,
-                                                    entry.is_dir,
-                                                );
-                                            });
                                         });
-                                    });
-                            }); // end ScrollArea::horizontal
+                                }); // end ScrollArea::horizontal
 
-                        if let Some(widths) = live_widths {
-                            let w: [f32; 4] = [
-                                widths.first().copied().unwrap_or(col_w[0]),
-                                widths.get(1).copied().unwrap_or(col_w[1]),
-                                widths.get(2).copied().unwrap_or(col_w[2]),
-                                widths.get(3).copied().unwrap_or(col_w[3]),
-                            ];
-                            if (w[0] - col_w[0]).abs() > 0.5
-                                || (w[1] - col_w[1]).abs() > 0.5
-                                || (w[2] - col_w[2]).abs() > 0.5
-                                || (w[3] - col_w[3]).abs() > 0.5
-                            {
-                                pane.active_tab_mut().col_widths = w;
-                                self.dirty = true;
+                            if let Some(widths) = live_widths {
+                                let w: [f32; 4] = [
+                                    widths.first().copied().unwrap_or(col_w[0]),
+                                    widths.get(1).copied().unwrap_or(col_w[1]),
+                                    widths.get(2).copied().unwrap_or(col_w[2]),
+                                    widths.get(3).copied().unwrap_or(col_w[3]),
+                                ];
+                                if (w[0] - col_w[0]).abs() > 0.5
+                                    || (w[1] - col_w[1]).abs() > 0.5
+                                    || (w[2] - col_w[2]).abs() > 0.5
+                                    || (w[3] - col_w[3]).abs() > 0.5
+                                {
+                                    pane.active_tab_mut().col_widths = w;
+                                    self.dirty = true;
+                                }
+                            }
+                            if let Some(col) = sort_clicked {
+                                // Don't apply yet: the user first chooses whether
+                                // this sorting covers every open tab (and future
+                                // ones) or just this tab.
+                                let tab = pane.active_tab();
+                                let (new_col, new_asc) = next_sort(&tab.sort_col, tab.sort_asc, &col);
+                                self.dialog_just_opened = true; self.dialog = Some(Dialog::ApplySort {
+                                    col: new_col,
+                                    asc: new_asc,
+                                    pane_idx,
+                                });
                             }
                         }
-                        if let Some(col) = sort_clicked {
-                            // Don't apply yet: the user first chooses whether
-                            // this sorting covers every open tab (and future
-                            // ones) or just this tab.
-                            let tab = pane.active_tab();
-                            let (new_col, new_asc) = next_sort(&tab.sort_col, tab.sort_asc, &col);
-                            self.dialog = Some(Dialog::ApplySort {
-                                col: new_col,
-                                asc: new_asc,
-                                pane_idx,
-                            });
-                        }
-                    }
-                    ViewMode::List => {
-                        egui::ScrollArea::vertical()
-                            .id_salt(format!("file_list_pane_{pane_idx}"))
-                            .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                            .show(ui, |ui| {
-                                for (idx, entry) in entries.iter().enumerate() {
-                                    let is_selected =
-                                        pane.active_tab().selected.contains(&entry.name);
-                                    let resp = ui
-                                        .horizontal(|ui| {
-                                            if entry.is_dir {
-                                                ui.label(
-                                                    egui::RichText::new("\u{1F4C1}")
-                                                        .color(listing_text),
-                                                );
-                                            } else if let Some(tex) = &entry_icons[idx] {
-                                                ui.add(egui::Image::new(
-                                                    egui::load::SizedTexture::new(
-                                                        tex.id(),
-                                                        egui::vec2(16.0, 16.0),
-                                                    ),
-                                                ));
-                                            }
-                                            ui.selectable_label(
-                                                is_selected,
-                                                egui::RichText::new(entry.name.as_str())
-                                                    .color(listing_text),
-                                            )
-                                        })
-                                        .inner;
-                                    handle_entry_response(
-                                        &resp,
-                                        entry,
-                                        is_selected,
-                                        &mut select_name,
-                                        &mut select_index,
-                                        &mut nav_target,
-                                        &mut open_target,
-                                        idx,
-                                    );
-                                    let drag_zone = ui.interact(
-                                        resp.rect,
-                                        egui::Id::new(("entry_dnd", pane_idx, idx)),
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag_zone.drag_started() {
-                                        drag_start = Some(entry.name.clone());
-                                    }
-                                    styled_context_menu(&resp, |ui| {
-                                        show_entry_context_menu(
-                                            ui,
-                                            &mut row_action,
-                                            &entry.path,
-                                            entry.is_dir,
-                                        );
-                                    });
-                                }
-                            });
-                    }
-                    ViewMode::Icons => {
-                        egui::ScrollArea::vertical()
-                            .id_salt(format!("file_icons_pane_{pane_idx}"))
-                            .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
+                        ViewMode::List => {
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("file_list_pane_{pane_idx}"))
+                                .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                                .show(ui, |ui| {
                                     for (idx, entry) in entries.iter().enumerate() {
                                         let is_selected =
                                             pane.active_tab().selected.contains(&entry.name);
-                                        ui.allocate_ui(egui::vec2(76.0, 72.0), |ui| {
-                                            // Tile: associated app icon (or the
-                                            // generic glyph) above the filename.
-                                            // The union of both responses drives
-                                            // selection/opening so clicking either
-                                            // part works.
-                                            let resp = ui
-                                                .vertical_centered(|ui| {
-                                                    let img_resp = if entry.is_dir {
-                                                        ui.label(
-                                                            egui::RichText::new("🗀")
-                                                                .color(listing_text),
-                                                        )
-                                                    } else if let Some(tex) = &entry_icons[idx] {
-                                                        ui.add(egui::Image::new(
-                                                            egui::load::SizedTexture::new(
-                                                                tex.id(),
-                                                                egui::vec2(32.0, 32.0),
-                                                            ),
-                                                        ))
-                                                    } else {
-                                                        ui.label(
-                                                            egui::RichText::new("🗋")
-                                                                .color(listing_text),
-                                                        )
-                                                    };
-                                                    let text_resp = ui.selectable_label(
-                                                        is_selected,
-                                                        egui::RichText::new(entry.name.as_str())
+                                        let resp = ui
+                                            .horizontal(|ui| {
+                                                if entry.is_dir {
+                                                    ui.label(
+                                                        egui::RichText::new("\u{1F4C1}")
                                                             .color(listing_text),
                                                     );
-                                                    img_resp | text_resp
-                                                })
-                                                .inner;
-                                            handle_entry_response(
-                                                &resp,
-                                                entry,
-                                                is_selected,
-                                                &mut select_name,
-                                                &mut select_index,
-                                                &mut nav_target,
-                                                &mut open_target,
-                                                idx,
+                                                } else if let Some(tex) = &entry_icons[idx] {
+                                                    ui.add(egui::Image::new(
+                                                        egui::load::SizedTexture::new(
+                                                            tex.id(),
+                                                            egui::vec2(16.0, 16.0),
+                                                        ),
+                                                    ));
+                                                }
+                                                ui.selectable_label(
+                                                    is_selected,
+                                                    egui::RichText::new(entry.name.as_str())
+                                                        .color(listing_text),
+                                                )
+                                            })
+                                            .inner;
+                                        handle_entry_response(
+                                            &resp,
+                                            entry,
+                                            is_selected,
+                                            &mut select_name,
+                                            &mut select_index,
+                                            &mut nav_target,
+                                            &mut open_target,
+                                            idx,
+                                        );
+                                        let drag_zone = ui.interact(
+                                            resp.rect,
+                                            egui::Id::new(("entry_dnd", pane_idx, idx)),
+                                            egui::Sense::drag(),
+                                        );
+                                        if drag_zone.drag_started() {
+                                            drag_start = Some(entry.name.clone());
+                                        }
+                                        styled_context_menu(&resp, |ui| {
+                                            show_entry_context_menu(
+                                                ui,
+                                                &mut row_action,
+                                                &entry.path,
+                                                entry.is_dir,
+                                                &self.shell_menu_hidden,
+                                                &mut self.shell_menu_cache,
                                             );
-                                            let drag_zone = ui.interact(
-                                                resp.rect,
-                                                egui::Id::new(("entry_dnd", pane_idx, idx)),
-                                                egui::Sense::drag(),
-                                            );
-                                            if drag_zone.drag_started() {
-                                                drag_start = Some(entry.name.clone());
-                                            }
-                                            styled_context_menu(&resp, |ui| {
-                                                show_entry_context_menu(
-                                                    ui,
-                                                    &mut row_action,
-                                                    &entry.path,
-                                                    entry.is_dir,
-                                                );
-                                            });
                                         });
                                     }
                                 });
-                            });
+                        }
+                        ViewMode::Icons => {
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("file_icons_pane_{pane_idx}"))
+                                .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (idx, entry) in entries.iter().enumerate() {
+                                            let is_selected =
+                                                pane.active_tab().selected.contains(&entry.name);
+                                            ui.allocate_ui(egui::vec2(76.0, 72.0), |ui| {
+                                                // Tile: associated app icon (or the
+                                                // generic glyph) above the filename.
+                                                // The union of both responses drives
+                                                // selection/opening so clicking either
+                                                // part works.
+                                                let resp = ui
+                                                    .vertical_centered(|ui| {
+                                                        let img_resp = if entry.is_dir {
+                                                            ui.label(
+                                                                egui::RichText::new("🗀")
+                                                                    .color(listing_text),
+                                                            )
+                                                        } else if let Some(tex) = &entry_icons[idx] {
+                                                            ui.add(egui::Image::new(
+                                                                egui::load::SizedTexture::new(
+                                                                    tex.id(),
+                                                                    egui::vec2(32.0, 32.0),
+                                                                ),
+                                                            ))
+                                                        } else {
+                                                            ui.label(
+                                                                egui::RichText::new("🗋")
+                                                                    .color(listing_text),
+                                                            )
+                                                        };
+                                                        let text_resp = ui.selectable_label(
+                                                            is_selected,
+                                                            egui::RichText::new(entry.name.as_str())
+                                                                .color(listing_text),
+                                                        );
+                                                        img_resp | text_resp
+                                                    })
+                                                    .inner;
+                                                handle_entry_response(
+                                                    &resp,
+                                                    entry,
+                                                    is_selected,
+                                                    &mut select_name,
+                                                    &mut select_index,
+                                                    &mut nav_target,
+                                                    &mut open_target,
+                                                    idx,
+                                                );
+                                                let drag_zone = ui.interact(
+                                                    resp.rect,
+                                                    egui::Id::new(("entry_dnd", pane_idx, idx)),
+                                                    egui::Sense::drag(),
+                                                );
+                                                if drag_zone.drag_started() {
+                                                    drag_start = Some(entry.name.clone());
+                                                }
+                                                styled_context_menu(&resp, |ui| {
+                                                    show_entry_context_menu(
+                                                        ui,
+                                                        &mut row_action,
+                                                        &entry.path,
+                                                        entry.is_dir,
+                                                        &self.shell_menu_hidden,
+                                                        &mut self.shell_menu_cache,
+                                                    );
+                                                });
+                                            });
+                                        }
+                                    });
+                                });
+                        }
                     }
                 }
 
@@ -3737,12 +4383,12 @@ impl FileManApp {
                         RowAction::Rename => self.begin_rename(),
                         RowAction::Delete => self.delete_selection(),
                         RowAction::NewFolder => {
-                            self.dialog = Some(Dialog::NewFolder {
+                            self.dialog_just_opened = true; self.dialog = Some(Dialog::NewFolder {
                                 name: String::new(),
                             });
                         }
                         RowAction::NewFile => {
-                            self.dialog = Some(Dialog::NewFile {
+                            self.dialog_just_opened = true; self.dialog = Some(Dialog::NewFile {
                                 name: String::new(),
                             });
                         }
@@ -3786,6 +4432,12 @@ impl FileManApp {
                         }
                         RowAction::Properties(path) => {
                             crate::win_default::show_properties(&path);
+                        }
+                        RowAction::ShellCommand { id, path } => {
+                            #[cfg(windows)]
+                            if let Some(hwnd) = self.hwnd {
+                                crate::shell_menu::invoke(hwnd, &path, id);
+                            }
                         }
                     }
                 }
@@ -4348,7 +5000,7 @@ impl eframe::App for FileManApp {
                                 _ => continue,
                             };
                             ui.add_enabled_ui(enabled, |ui| {
-                                if toolbar_button(ui, label.to_owned(), None)
+                                if toolbar_button(ui, label.to_owned(), None, ButtonStyle::Blue)
                                     .on_hover_text(hover)
                                     .clicked()
                                 {
@@ -4368,7 +5020,7 @@ impl eframe::App for FileManApp {
                         .on_hover_text("User Manual")
                         .clicked()
                     {
-                        self.dialog = Some(Dialog::Help);
+                        self.dialog_just_opened = true; self.dialog = Some(Dialog::Help);
                     }
                     if ui
                         .button("⚙ Settings")
@@ -4406,19 +5058,120 @@ impl eframe::App for FileManApp {
                         self.switch_user(id);
                     }
                     if open_new_user {
-                        self.dialog = Some(Dialog::NewUser { name: String::new() });
+                        self.dialog_just_opened = true; self.dialog = Some(Dialog::NewUser { name: String::new() });
                     }
                 });
             });
 
-            // Second toolbar line: one button per user-defined custom
-            // "open with" action, launching the chosen application with the
-            // selected file as its argument. Each button shows the icon
-            // extracted from the target executable.
-            if !self.custom_actions.is_empty() {
+            // Second toolbar line: app launcher search + pinned launch
+            // buttons, file launch shortcuts, and custom "open with" action buttons.
+            let has_launcher = !self.launcher_apps.is_empty();
+            let has_file_launch = !self.file_launches.is_empty();
+            let has_custom = !self.custom_actions.is_empty();
+            if has_launcher || has_file_launch || has_custom {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    let mut launch: Option<i64> = None;
+                    // Search filter for launcher apps (left side).
+                    if has_launcher {
+                        let filter_edit = ui.add_sized(
+                            [160.0, 0.0],
+                            egui::TextEdit::singleline(&mut self.launcher_filter)
+                                .hint_text("Search apps..."),
+                        );
+                        if filter_edit.changed() {
+                            self.dirty = true;
+                        }
+                        ui.separator();
+                    }
+
+                    // Pinned launcher buttons (filtered by search text, only
+                    // those with show_button enabled).
+                    let filter_lower = self.launcher_filter.to_lowercase();
+                    let mut launch_app: Option<i64> = None;
+                    for app in &self.launcher_apps {
+                        if !app.show_button {
+                            continue;
+                        }
+                        let matches = filter_lower.is_empty()
+                            || app.label.to_lowercase().contains(&filter_lower);
+                        if !matches {
+                            continue;
+                        }
+                        if !self.launcher_icons.contains_key(&app.exe_path) {
+                            let tex =
+                                crate::icon_cache::load_icon_texture(&ctx.clone(), &app.exe_path);
+                            self.launcher_icons.insert(app.exe_path.clone(), tex);
+                        }
+                        let icon = self.launcher_icons.get(&app.exe_path).cloned().flatten();
+                        if toolbar_button(ui, app.label.clone(), icon.as_ref(), ButtonStyle::Blue)
+                            .on_hover_text(format!("Launch {}", app.exe_path))
+                            .clicked()
+                        {
+                            launch_app = Some(app.id);
+                        }
+                    }
+                    if let Some(id) = launch_app {
+                        if let Some(app) = self.launcher_apps.iter().find(|a| a.id == id) {
+                            let exe = app.exe_path.clone();
+                            let args = app.args.clone();
+                            let label = app.label.clone();
+                            let _ = std::process::Command::new(&exe)
+                                .args(args.split_whitespace())
+                                .spawn();
+                            self.status = format!("Launched {label}");
+                        }
+                    }
+
+                    // File launch shortcut buttons with search filter.
+                    if has_file_launch && has_launcher {
+                        ui.separator();
+                    }
+                    if has_file_launch {
+                        let fl_filter_edit = ui.add_sized(
+                            [140.0, 0.0],
+                            egui::TextEdit::singleline(&mut self.file_launch_filter)
+                                .hint_text("Search files..."),
+                        );
+                        if fl_filter_edit.changed() {
+                            self.dirty = true;
+                        }
+                        ui.separator();
+                    }
+                    let fl_filter_lower = self.file_launch_filter.to_lowercase();
+                    let mut launch_file: Option<i64> = None;
+                    for fl in &self.file_launches {
+                        if !fl.show_button {
+                            continue;
+                        }
+                        let matches = fl_filter_lower.is_empty()
+                            || fl.label.to_lowercase().contains(&fl_filter_lower)
+                            || fl.file_path.to_lowercase().contains(&fl_filter_lower);
+                        if !matches {
+                            continue;
+                        }
+                        if toolbar_button(ui, fl.label.clone(), None, ButtonStyle::Blue)
+                            .on_hover_text(format!("Open {}", fl.file_path))
+                            .clicked()
+                        {
+                            launch_file = Some(fl.id);
+                        }
+                    }
+                    if let Some(id) = launch_file {
+                        if let Some(fl) = self.file_launches.iter().find(|f| f.id == id) {
+                            let file = fl.file_path.clone();
+                            let label = fl.label.clone();
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/C", "start", "", &file])
+                                .spawn();
+                            self.status = format!("Opened {label}");
+                        }
+                    }
+
+                    // Custom "open with" action buttons (existing behavior).
+                    if has_custom && (has_launcher || has_file_launch) {
+                        ui.separator();
+                    }
+                    let mut launch_custom: Option<i64> = None;
                     for custom in &self.custom_actions {
                         if !self.custom_icons.contains_key(&custom.exe_path) {
                             let tex =
@@ -4426,17 +5179,17 @@ impl eframe::App for FileManApp {
                             self.custom_icons.insert(custom.exe_path.clone(), tex);
                         }
                         let icon = self.custom_icons.get(&custom.exe_path).cloned().flatten();
-                        if toolbar_button(ui, custom.label.clone(), icon.as_ref())
+                        if toolbar_button(ui, custom.label.clone(), icon.as_ref(), ButtonStyle::Green)
                             .on_hover_text(format!(
                                 "Open the selection with {}",
                                 custom.exe_path
                             ))
                             .clicked()
                         {
-                            launch = Some(custom.id);
+                            launch_custom = Some(custom.id);
                         }
                     }
-                    if let Some(id) = launch {
+                    if let Some(id) = launch_custom {
                         self.dispatch(&ctx, ActionRef::Custom(id));
                     }
                 });
@@ -4450,83 +5203,93 @@ impl eframe::App for FileManApp {
                 self.show_tab_context_menu(&ctx);
             }
 
-            // Progress modal for background operations
+            // Background operations: show a progress bar while running,
+            // then dismiss immediately and surface the result as a toast.
             let mut dismiss_op = false;
+            let mut newly_finished_dirs: Vec<PathBuf> = Vec::new();
             if let Some(ref mut op) = self.background_op {
                 let still_running = op.poll();
-                let title = if still_running {
-                    "Processing..."
-                } else {
-                    match &op.status {
-                        OpStatus::Completed(_) => "Done",
-                        OpStatus::Failed(_) => "Error",
-                        _ => "Done",
-                    }
-                };
-                let progress_text = format!(
-                    "{}/{} files — {}",
-                    op.progress.files_done, op.progress.files_total, op.progress.current_file
-                );
-                let fraction = if op.progress.files_total > 0 {
-                    op.progress.files_done as f32 / op.progress.files_total as f32
-                } else {
-                    0.0
-                };
-
-                egui::Window::new(title)
-                    .title_bar(true)
-                    .resizable(false)
-                    .collapsible(false)
-                    .auto_sized()
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(&ctx, |ui| {
-                        ui.set_width(360.0);
-                        ui.label(&progress_text);
-                        ui.add(egui::ProgressBar::new(fraction).animate(still_running));
-                        if !still_running {
-                            match &op.status {
-                                OpStatus::Completed(msg) => {
-                                    self.status = msg.clone();
-                                }
-                                OpStatus::Failed(msg) => {
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new("Error:").strong());
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("error_scroll")
-                                        .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                                        .max_height(120.0)
-                                        .show(ui, |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(msg.as_str())
-                                                        .monospace(),
-                                                )
-                                                .selectable(true),
-                                            );
-                                        });
-                                }
-                                _ => {}
-                            }
-                            ui.add_space(4.0);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 24.0),
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Close").clicked() {
-                                        dismiss_op = true;
-                                    }
-                                },
-                            );
-                        }
-                    });
-
-                if dismiss_op {
-                    self.background_op = None;
+                if !still_running {
+                    newly_finished_dirs = std::mem::take(&mut self.background_op_dirs);
                     self.dirty = true;
-                    for dir in std::mem::take(&mut self.background_op_dirs) {
-                        self.mark_dir_dirty(&dir);
+                    match &op.status {
+                        OpStatus::Completed(msg) => {
+                            self.status = msg.clone();
+                        }
+                        OpStatus::Failed(msg) => {
+                            self.status = format!("Error: {msg}");
+                        }
+                        _ => {}
                     }
+                    dismiss_op = true;
+                } else {
+                    // Show a small floating progress bar while the op runs.
+                    let progress_text = format!(
+                        "{}/{} files — {}",
+                        op.progress.files_done, op.progress.files_total, op.progress.current_file
+                    );
+                    let fraction = if op.progress.files_total > 0 {
+                        op.progress.files_done as f32 / op.progress.files_total as f32
+                    } else {
+                        0.0
+                    };
+                    let font = egui::FontId::proportional(self.font_size);
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("op_progress"),
+                    ));
+                    let galley = painter.layout_no_wrap(progress_text, font, egui::Color32::WHITE);
+                    let pad = 8.0;
+                    let bar_w = 240.0;
+                    let row_h = galley.size().y + pad * 2.0;
+                    let screen = ctx.input(|i| i.viewport_rect());
+                    let pos = egui::pos2(
+                        (screen.center().x - bar_w / 2.0).max(screen.left() + 8.0),
+                        screen.top() + 14.0,
+                    );
+                    let bg = egui::Color32::from_rgba_premultiplied(40, 40, 40, 230);
+                    let bar_bg = egui::Color32::from_rgb(70, 70, 70);
+                    let bar_fill = egui::Color32::from_rgb(100, 160, 255);
+                    // Background rect
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(pos, egui::vec2(bar_w, row_h)),
+                        6.0,
+                        bg,
+                    );
+                    // Label
+                    painter.galley(
+                        egui::pos2(pos.x + pad, pos.y + pad),
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                    // Progress bar track
+                    let bar_y = pos.y + row_h - pad - 4.0;
+                    let bar_rect = egui::Rect::from_min_size(
+                        egui::pos2(pos.x + pad, bar_y),
+                        egui::vec2(bar_w - pad * 2.0, 4.0),
+                    );
+                    painter.rect_filled(bar_rect, 2.0, bar_bg);
+                    // Progress bar fill
+                    let fill_w = (bar_w - pad * 2.0) * fraction;
+                    if fill_w > 0.0 {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                bar_rect.min,
+                                egui::vec2(fill_w, 4.0),
+                            ),
+                            2.0,
+                            bar_fill,
+                        );
+                    }
+                    ctx.request_repaint();
                 }
+            }
+            for dir in &newly_finished_dirs {
+                self.mark_dir_dirty(dir);
+            }
+            if dismiss_op {
+                self.background_op = None;
+                self.dirty = true;
             }
 
             // Modal dialogs (rename / new folder / new file / duplicate name / find).
@@ -5242,6 +6005,8 @@ impl eframe::App for FileManApp {
                                 if multiline {
                                     ui.label("One folder per line:");
                                 }
+                                let is_rename = title == "Rename";
+                                let just_opened = self.dialog_just_opened;
                                 let edit = if multiline {
                                     ui.add(
                                         egui::TextEdit::multiline(name)
@@ -5249,7 +6014,29 @@ impl eframe::App for FileManApp {
                                             .desired_width(260.0),
                                     )
                                 } else {
-                                    ui.text_edit_singleline(name)
+                                    let mut output = egui::TextEdit::singleline(name)
+                                        .desired_width(350.0)
+                                        .show(ui);
+                                    // On every open of a rename dialog,
+                                    // select the filename stem (everything
+                                    // before the last dot) so the user can
+                                    // immediately type a new name.
+                                    if is_rename
+                                        && just_opened
+                                        && let Some(dot_pos) = name.rfind('.')
+                                    {
+                                        let range = egui::text::CCursorRange::two(
+                                            egui::text::CCursor::new(0),
+                                            egui::text::CCursor::new(dot_pos),
+                                        );
+                                        output.state.cursor.set_char_range(Some(range));
+                                        egui::TextEdit::store_state(
+                                            ui.ctx(),
+                                            output.response.id,
+                                            output.state,
+                                        );
+                                    }
+                                    output.response.response
                                 };
                                 // Enter submits single-line dialogs; a
                                 // multiline folder-name box needs Enter to
@@ -5261,6 +6048,8 @@ impl eframe::App for FileManApp {
                                 commit = !multiline
                                     && edit.lost_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                // Esc closes any dialog.
+                                cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
                                 // Default keyboard focus goes to the input
                                 // box — but seed it ONLY while nothing else
                                 // holds focus (i.e. on open). Re-requesting
@@ -5280,6 +6069,7 @@ impl eframe::App for FileManApp {
                                 });
                             });
                     }
+                    self.dialog_just_opened = false;
                     if cancel {
                         self.dialog = None;
                     } else if commit {
@@ -5547,6 +6337,50 @@ fn paint_nav_icon(
             ];
             painter.add(egui::Shape::line(pts.to_vec(), stroke));
         }
+        SettingsPage::AppLauncher => {
+            // Rocket / launch icon: triangle body + two fins + circle exhaust.
+            // Body (upward triangle).
+            painter.add(egui::Shape::convex_polygon(
+                vec![p(0.50, 0.04), p(0.30, 0.70), p(0.70, 0.70)],
+                color,
+                egui::Stroke::NONE,
+            ));
+            // Left fin.
+            painter.add(egui::Shape::line(
+                vec![p(0.30, 0.70), p(0.16, 0.92), p(0.38, 0.78)],
+                stroke,
+            ));
+            // Right fin.
+            painter.add(egui::Shape::line(
+                vec![p(0.70, 0.70), p(0.84, 0.92), p(0.62, 0.78)],
+                stroke,
+            ));
+            // Exhaust circle.
+            painter.circle_filled(p(0.50, 0.88), r.width() * 0.10, color);
+        }
+        SettingsPage::FileLauncher => {
+            // Document with a small arrow: file + launch.
+            // Document body (folded-corner rectangle).
+            painter.add(egui::Shape::line(
+                vec![
+                    p(0.20, 0.06),
+                    p(0.58, 0.06),
+                    p(0.76, 0.24),
+                    p(0.76, 0.94),
+                    p(0.20, 0.94),
+                    p(0.20, 0.06),
+                ],
+                stroke,
+            ));
+            painter.line_segment([p(0.58, 0.06), p(0.58, 0.24)], stroke);
+            painter.line_segment([p(0.58, 0.24), p(0.76, 0.24)], stroke);
+            // Small right-pointing triangle (launch) in the lower-left.
+            painter.add(egui::Shape::convex_polygon(
+                vec![p(0.24, 0.50), p(0.24, 0.82), p(0.48, 0.66)],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
         SettingsPage::FileTypes => {
             // Small file/document with a folded corner.
             painter.add(egui::Shape::line(
@@ -5664,8 +6498,10 @@ enum RowAction {
     ExtractTo,
     FavouriteFolder(PathBuf),
     OpenWith(PathBuf),
+    #[allow(dead_code)]
     OpenInExplorer(PathBuf),
     Properties(PathBuf),
+    ShellCommand { id: u32, path: PathBuf },
 }
 
 /// Deferred action requested from a Find-results row. Applied after the
@@ -5793,6 +6629,7 @@ fn tab_strip_item(
     tab_hover: &mut Option<(usize, usize)>,
     is_being_dragged: bool,
     size: Option<egui::Vec2>,
+    path: &std::path::Path,
 ) -> TabItemEvents {
     // Both orientations use fully custom surfaces with click+drag sensing:
     // horizontal rows hug their label like the old selectable_label did, and
@@ -6020,13 +6857,15 @@ fn tab_strip_item(
     }
     // Explain the badge on renamed tabs: this label was set by the user,
     // not derived from the folder, and survives navigation.
+    let path_display = path.to_string_lossy();
     let tab_resp = if renamed {
-        tab_resp.on_hover_text(
-            "Custom name — this tab was renamed; it keeps its name while you \
-             navigate. Right-click \u{25B8} Rename Tab to change or clear it.",
-        )
+        tab_resp.on_hover_text(format!(
+            "{path_display}\n\nCustom name \u{2014} this tab was renamed; it \
+             keeps its name while you navigate. Right-click \u{25B8} Rename \
+             Tab to change or clear it.",
+        ))
     } else {
-        tab_resp
+        tab_resp.on_hover_text(path_display.as_ref())
     };
     TabItemEvents {
         clicked: tab_resp.clicked(),
@@ -6055,30 +6894,60 @@ fn context_menu_fill(theme: egui::Theme) -> egui::Color32 {
 }
 
 /// A toolbar command button with an accent-blue "ribbon" treatment so the
+/// Color variant for toolbar buttons, so different action categories are
+/// visually distinct at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonStyle {
+    /// Default blue ribbon — builtin toolbar actions and launcher apps.
+    Blue,
+    /// Green/teal tint — custom "open with" actions.
+    Green,
+}
+
+/// Styled toolbar command button with a ribbon-like 3D bevel effect so
 /// action rows read as commands rather than page content. Keeps the 3D
 /// bevel/hover-lift/press-in states via a scoped widget-style override.
 fn toolbar_button(
     ui: &mut egui::Ui,
     label: String,
     icon: Option<&egui::TextureHandle>,
+    style: ButtonStyle,
 ) -> egui::Response {
     let dark = ui.visuals().dark_mode;
     let (face, hover_face, active_face, border, hover_border) = if dark {
-        (
-            egui::Color32::from_rgb(45, 64, 84),
-            egui::Color32::from_rgb(58, 82, 106),
-            egui::Color32::from_rgb(30, 44, 58),
-            egui::Color32::from_rgb(17, 25, 34),
-            egui::Color32::from_rgb(104, 148, 190),
-        )
+        match style {
+            ButtonStyle::Blue => (
+                egui::Color32::from_rgb(45, 64, 84),
+                egui::Color32::from_rgb(58, 82, 106),
+                egui::Color32::from_rgb(30, 44, 58),
+                egui::Color32::from_rgb(17, 25, 34),
+                egui::Color32::from_rgb(104, 148, 190),
+            ),
+            ButtonStyle::Green => (
+                egui::Color32::from_rgb(30, 72, 60),
+                egui::Color32::from_rgb(42, 96, 80),
+                egui::Color32::from_rgb(20, 52, 42),
+                egui::Color32::from_rgb(14, 38, 30),
+                egui::Color32::from_rgb(80, 180, 148),
+            ),
+        }
     } else {
-        (
-            egui::Color32::from_rgb(232, 241, 250),
-            egui::Color32::WHITE,
-            egui::Color32::from_rgb(184, 212, 240),
-            egui::Color32::from_rgb(163, 197, 229),
-            egui::Color32::from_rgb(110, 165, 220),
-        )
+        match style {
+            ButtonStyle::Blue => (
+                egui::Color32::from_rgb(232, 241, 250),
+                egui::Color32::WHITE,
+                egui::Color32::from_rgb(184, 212, 240),
+                egui::Color32::from_rgb(163, 197, 229),
+                egui::Color32::from_rgb(110, 165, 220),
+            ),
+            ButtonStyle::Green => (
+                egui::Color32::from_rgb(220, 243, 235),
+                egui::Color32::WHITE,
+                egui::Color32::from_rgb(170, 220, 200),
+                egui::Color32::from_rgb(140, 195, 175),
+                egui::Color32::from_rgb(80, 160, 130),
+            ),
+        }
     };
     ui.scope(|ui| {
         let v = &mut ui.style_mut().visuals;
@@ -6144,6 +7013,8 @@ fn show_entry_context_menu(
     row_action: &mut Option<RowAction>,
     entry_path: &std::path::Path,
     is_dir: bool,
+    shell_menu_hidden: &std::collections::HashSet<String>,
+    shell_menu_cache: &mut Option<(std::path::PathBuf, Vec<crate::shell_menu::ShellMenuItem>)>,
 ) {
     ui.set_min_width(140.0);
     if ui.button("Copy").clicked() {
@@ -6207,16 +7078,89 @@ fn show_entry_context_menu(
         ui.close();
     }
     if is_dir {
-        ui.separator();
-        if ui.button("Open in Windows Explorer").clicked() {
-            *row_action = Some(RowAction::OpenInExplorer(entry_path.to_path_buf()));
-            ui.close();
-        }
         if ui.button("★ Add to Favourites").clicked() {
             *row_action = Some(RowAction::FavouriteFolder(entry_path.to_path_buf()));
             ui.close();
         }
     }
+
+    // Windows Explorer shell context menu sub-menu. `query_items` is a
+    // blocking shell/COM call, so it's cached per-path rather than re-run
+    // on every frame this menu stays open (see `shell_menu_cache`'s doc).
+    if shell_menu_cache
+        .as_ref()
+        .is_none_or(|(cached_path, _)| cached_path != entry_path)
+    {
+        *shell_menu_cache = Some((
+            entry_path.to_path_buf(),
+            crate::shell_menu::query_items(entry_path),
+        ));
+    }
+    let shell_items = &shell_menu_cache.as_ref().unwrap().1;
+    if shell_items
+        .iter()
+        .any(|item| item.separator || !shell_menu_hidden.contains(&item.label))
+    {
+        ui.separator();
+        ui.menu_button("Windows Explorer", |ui| {
+            ui.set_min_width(180.0);
+            render_shell_items(ui, row_action, entry_path, shell_items, shell_menu_hidden);
+        });
+    }
+}
+
+/// Recursively render shell menu items into an egui sub-menu, skipping any
+/// item whose label is in `shell_menu_hidden` (configured under Settings).
+fn render_shell_items(
+    ui: &mut egui::Ui,
+    row_action: &mut Option<RowAction>,
+    entry_path: &std::path::Path,
+    items: &[crate::shell_menu::ShellMenuItem],
+    shell_menu_hidden: &std::collections::HashSet<String>,
+) {
+    for item in items {
+        if item.separator {
+            ui.separator();
+            continue;
+        }
+        if shell_menu_hidden.contains(&item.label) {
+            continue;
+        }
+        if item.disabled {
+            ui.add_enabled(false, egui::Button::new(&item.label));
+            continue;
+        }
+        if !item.sub_items.is_empty() {
+            let label = item.label.clone();
+            let sub_items = item.sub_items.clone();
+            let path = entry_path.to_path_buf();
+            let ra = std::rc::Rc::new(std::cell::RefCell::new(None::<RowAction>));
+            let ra_clone = ra.clone();
+            ui.menu_button(&label, |ui| {
+                render_shell_items(ui, &mut *ra_clone.borrow_mut(), &path, &sub_items, shell_menu_hidden);
+            });
+            if let Some(action) = ra.borrow_mut().take() {
+                *row_action = Some(action);
+                ui.close();
+            }
+        } else if ui.button(&item.label).clicked() {
+            *row_action = Some(RowAction::ShellCommand {
+                id: item.id,
+                path: entry_path.to_path_buf(),
+            });
+            ui.close();
+        }
+    }
+}
+
+/// Parses the newline-separated `shell_menu_hidden` setting into a lookup
+/// set, trimming blank lines.
+fn parse_shell_menu_hidden(raw: &str) -> std::collections::HashSet<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn help_heading(ui: &mut egui::Ui, text: &str) {
@@ -6443,6 +7387,41 @@ mod tests {
         assert_eq!(parse_sort_col(""), None);
     }
 
+    #[test]
+    fn poll_subdirs_resolves_background_listing_then_caches() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("sub_b")).unwrap();
+        std::fs::create_dir(temp.path().join("sub_a")).unwrap();
+        std::fs::write(temp.path().join("file.txt"), b"x").unwrap();
+
+        let mut cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        let mut jobs: HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>> =
+            HashMap::new();
+        let dir = temp.path().to_path_buf();
+
+        let mut resolved = None;
+        for _ in 0..1000 {
+            if let Some(subdirs) = FileManApp::poll_subdirs(&mut cache, &mut jobs, &dir) {
+                resolved = Some(subdirs);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let subdirs = resolved.expect("background listing must resolve");
+        let names: Vec<String> = subdirs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["sub_a", "sub_b"], "only directories, sorted");
+        assert!(cache.contains_key(&dir), "resolved listing is cached");
+        assert!(jobs.is_empty(), "finished job is removed from the map");
+
+        let cached = FileManApp::poll_subdirs(&mut cache, &mut jobs, &dir)
+            .expect("cached listing resolves instantly");
+        assert_eq!(cached.len(), 2);
+        assert!(jobs.is_empty(), "cache hit must not spawn a job");
+    }
+
     /// Headless reproduction of the address-bar flow: edit mode on, the
     /// TextEdit acquires focus via the app's per-frame request_focus, the
     /// user pastes a path, presses Enter — navigation must run and the bar
@@ -6509,9 +7488,7 @@ mod tests {
                         if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let typed = address_bar.trim().trim_matches('"').trim();
                             let t = std::path::PathBuf::from(typed);
-                            if t.exists() {
-                                navigated_to = Some(t.display().to_string());
-                            }
+                            navigated_to = Some(t.display().to_string());
                         }
                         edit_mode = false;
                     }

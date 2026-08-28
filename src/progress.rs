@@ -15,6 +15,7 @@ pub struct ProgressUpdate {
 /// Status of a background operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpStatus {
+    #[allow(dead_code)]
     Idle,
     Running,
     Completed(String),

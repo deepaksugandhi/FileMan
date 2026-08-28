@@ -193,7 +193,7 @@ pub fn import_into(
     let mut summary = ImportSummary::default();
     let user_scope = scope_key_user(user_id);
 
-    let mut apply_cfg = |kvs: &[Kv], scope: crate::config::Scope, count: &mut usize| {
+    let apply_cfg = |kvs: &[Kv], scope: crate::config::Scope, count: &mut usize| {
         for kv in kvs {
             if crate::config::set(conn, scope, &kv.key, &kv.value).is_ok() {
                 *count += 1;

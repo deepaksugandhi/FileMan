@@ -11,6 +11,7 @@ mod icon_cache;
 mod migrate;
 mod monitor;
 mod native_drag;
+mod shell_menu;
 mod pane;
 mod progress;
 mod search;

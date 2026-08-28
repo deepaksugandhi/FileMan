@@ -22,10 +22,12 @@ impl KeyCombo {
         }
     }
 
+    #[allow(dead_code)]
     pub fn ctrl(key: egui::Key) -> Self {
         KeyCombo::new(true, false, false, key)
     }
 
+    #[allow(dead_code)]
     pub fn plain(key: egui::Key) -> Self {
         KeyCombo::new(false, false, false, key)
     }
@@ -319,6 +321,28 @@ pub struct CustomAction {
     pub exe_path: String,
 }
 
+/// A user-defined launcher app entry for the quick-launch toolbar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LauncherApp {
+    pub id: i64,
+    pub label: String,
+    pub exe_path: String,
+    pub args: String,
+    /// Whether this app shows a pinned button on the 2nd toolbar row.
+    /// When false the app is still searchable but not pinned.
+    pub show_button: bool,
+}
+
+/// A user-defined file launcher shortcut: opens a specific file with
+/// the default application associated with its extension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileLaunch {
+    pub id: i64,
+    pub label: String,
+    pub file_path: String,
+    pub show_button: bool,
+}
+
 /// Where a binding/layout row applies: a specific user, or the shared
 /// global default (used to seed new users and as the fallback tier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +385,21 @@ pub fn init_tables(conn: &Connection) -> Result<()> {
             ext TEXT NOT NULL,
             exe_path TEXT NOT NULL,
             PRIMARY KEY (user_id, ext)
+        );
+        CREATE TABLE IF NOT EXISTS launcher_apps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            exe_path TEXT NOT NULL,
+            args TEXT DEFAULT '',
+            show_button INTEGER DEFAULT 1,
+            scope TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS file_launches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            exe_path TEXT DEFAULT '',
+            scope TEXT NOT NULL
         );",
     )?;
 
@@ -393,6 +432,14 @@ pub fn init_tables(conn: &Connection) -> Result<()> {
             &default_toolbar.map(ActionRef::Builtin),
         )?;
     }
+
+    // Migration: add show_button column to launcher_apps if missing.
+    let _ = conn.execute_batch(
+        "ALTER TABLE launcher_apps ADD COLUMN show_button INTEGER DEFAULT 1",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE file_launches ADD COLUMN show_button INTEGER DEFAULT 1",
+    );
 
     Ok(())
 }
@@ -618,6 +665,133 @@ pub fn remove_ext_override(conn: &Connection, user_id: i64, ext: &str) -> Result
     Ok(())
 }
 
+/// Lists launcher apps for `user_id` (global + user-scoped), ordered by id.
+pub fn list_launcher_apps(conn: &Connection, user_id: i64) -> Vec<LauncherApp> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, label, exe_path, args, show_button FROM launcher_apps WHERE scope = 'global' OR scope = ?1 ORDER BY id",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(rusqlite::params![Scope::User(user_id).to_key()], |row| {
+        let show: i64 = row.get(4)?;
+        Ok(LauncherApp {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            exe_path: row.get(2)?,
+            args: row.get(3)?,
+            show_button: show != 0,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Adds a launcher app, scoped to `user_id`.
+pub fn add_launcher_app(
+    conn: &Connection,
+    user_id: i64,
+    label: &str,
+    exe_path: &str,
+    args: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO launcher_apps (label, exe_path, args, scope) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![label, exe_path, args, Scope::User(user_id).to_key()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Removes a launcher app by row id.
+pub fn remove_launcher_app(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM launcher_apps WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Updates a launcher app's fields by row id.
+pub fn update_launcher_app(
+    conn: &Connection,
+    id: i64,
+    label: &str,
+    exe_path: &str,
+    args: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE launcher_apps SET label = ?1, exe_path = ?2, args = ?3 WHERE id = ?4",
+        rusqlite::params![label, exe_path, args, id],
+    )?;
+    Ok(())
+}
+
+/// Toggles the `show_button` flag for a launcher app.
+pub fn set_launcher_show_button(conn: &Connection, id: i64, show: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE launcher_apps SET show_button = ?1 WHERE id = ?2",
+        rusqlite::params![show as i64, id],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File launches
+// ---------------------------------------------------------------------------
+
+/// Lists file launches for `user_id` (global + user-scoped), ordered by id.
+pub fn list_file_launches(conn: &Connection, user_id: i64) -> Vec<FileLaunch> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, label, file_path, show_button FROM file_launches WHERE scope = 'global' OR scope = ?1 ORDER BY id",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(rusqlite::params![Scope::User(user_id).to_key()], |row| {
+        let show: i64 = row.get(3)?;
+        Ok(FileLaunch {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            file_path: row.get(2)?,
+            show_button: show != 0,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Adds a file launch shortcut, scoped to `user_id`.
+pub fn add_file_launch(
+    conn: &Connection,
+    user_id: i64,
+    label: &str,
+    file_path: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO file_launches (label, file_path, exe_path, scope) VALUES (?1, ?2, '', ?3)",
+        rusqlite::params![label, file_path, Scope::User(user_id).to_key()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Removes a file launch shortcut by row id.
+pub fn remove_file_launch(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM file_launches WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Toggles the `show_button` flag for a file launch shortcut.
+pub fn set_file_launch_show_button(conn: &Connection, id: i64, show: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE file_launches SET show_button = ?1 WHERE id = ?2",
+        rusqlite::params![show as i64, id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +987,67 @@ mod tests {
 
         remove_custom_action(&conn, user1[0].id).unwrap();
         assert!(list_custom_actions(&conn, 1).is_empty());
+    }
+
+    #[test]
+    fn launcher_apps_are_scoped_to_their_user() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_tables(&conn).unwrap();
+
+        add_launcher_app(&conn, 1, "VS Code", "C:\\Code.exe", "").unwrap();
+        let user1 = list_launcher_apps(&conn, 1);
+        let user2 = list_launcher_apps(&conn, 2);
+        assert_eq!(user1.len(), 1);
+        assert_eq!(user2.len(), 0);
+
+        remove_launcher_app(&conn, user1[0].id).unwrap();
+        assert!(list_launcher_apps(&conn, 1).is_empty());
+    }
+
+    #[test]
+    fn launcher_app_update_round_trips() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_tables(&conn).unwrap();
+
+        let id = add_launcher_app(&conn, 1, "Old", "C:\\old.exe", "").unwrap();
+        update_launcher_app(&conn, id, "New", "C:\\new.exe", "--flag").unwrap();
+        let apps = list_launcher_apps(&conn, 1);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].label, "New");
+        assert_eq!(apps[0].exe_path, "C:\\new.exe");
+        assert_eq!(apps[0].args, "--flag");
+    }
+
+    #[test]
+    fn launcher_app_show_button_defaults_to_true() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_tables(&conn).unwrap();
+
+        let id = add_launcher_app(&conn, 1, "App", "C:\\app.exe", "").unwrap();
+        let apps = list_launcher_apps(&conn, 1);
+        assert!(apps[0].show_button);
+
+        set_launcher_show_button(&conn, id, false).unwrap();
+        let apps = list_launcher_apps(&conn, 1);
+        assert!(!apps[0].show_button);
+    }
+
+    #[test]
+    fn file_launches_are_scoped_to_their_user() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_tables(&conn).unwrap();
+
+        add_file_launch(&conn, 1, "My Report", "D:\\report.xlsx").unwrap();
+        let user1 = list_file_launches(&conn, 1);
+        let user2 = list_file_launches(&conn, 2);
+        assert_eq!(user1.len(), 1);
+        assert_eq!(user2.len(), 0);
+
+        remove_file_launch(&conn, user1[0].id).unwrap();
+        assert!(list_file_launches(&conn, 1).is_empty());
     }
 }
