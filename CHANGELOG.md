@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.8 (2026-08-28)
+
+- Custom Action buttons now send every selected file to the target app (e.g. merging several PDFs in Foxit), not just the first one.
+- Drag & drop now accepts attachments dragged straight from mail clients like Outlook, which hand over "virtual files" instead of real paths.
+- Creating a single new folder now selects it automatically; press Enter to open the selected file or folder.
+- An empty folder shows "There are no files/folder yet here." instead of a stray partial scrollbar.
+- Fixed the App/File Launcher search boxes on the toolbar sitting shorter and lower than the buttons beside them.
+
 ## v0.1.7 (2026-08-28)
 
 - App Launcher: configure quick-launch apps (Settings > App Launcher), each with an optional toolbar button and a searchable dropdown on the toolbar's second row.

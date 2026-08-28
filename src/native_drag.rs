@@ -141,8 +141,11 @@ mod imp {
     };
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::System::Com::{
-        CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL,
+        CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, IStream, TYMED_HGLOBAL,
+        TYMED_ISTREAM,
     };
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::{
         CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
         DoDragDrop, IDropSource, IDropSource_Impl, IDropTarget, IDropTarget_Impl, ReleaseStgMedium,
@@ -150,9 +153,10 @@ mod imp {
     use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        BHID_DataObject, ILCreateFromPathW, SHCreateShellItemArrayFromIDLists,
+        BHID_DataObject, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW, ILCreateFromPathW,
+        SHCreateShellItemArrayFromIDLists,
     };
-    use windows::core::{PCWSTR, implement};
+    use windows::core::{HSTRING, PCWSTR, implement};
 
     pub(super) fn register_drop_target(
         hwnd: windows::Win32::Foundation::HWND,
@@ -297,8 +301,20 @@ mod imp {
             None
         }
 
-        /// Reads the `CF_HDROP` file list out of a drop's data object.
+        /// Reads the dropped file list out of a drop's data object: real
+        /// files via `CF_HDROP` when present, else the "virtual file" pair
+        /// (`FileGroupDescriptorW` + `FileContents`) that mail clients like
+        /// Outlook use for attachments that don't exist on disk yet.
         fn extract_paths(data_obj: &IDataObject) -> Vec<std::path::PathBuf> {
+            let hdrop = Self::extract_hdrop_paths(data_obj);
+            if !hdrop.is_empty() {
+                return hdrop;
+            }
+            Self::extract_virtual_files(data_obj)
+        }
+
+        /// Reads the `CF_HDROP` file list out of a drop's data object.
+        fn extract_hdrop_paths(data_obj: &IDataObject) -> Vec<std::path::PathBuf> {
             unsafe {
                 let fmt = FORMATETC {
                     cfFormat: CF_HDROP.0,
@@ -326,6 +342,143 @@ mod imp {
                 out
             }
         }
+
+        /// Materializes "virtual file" attachments (no `CF_HDROP`, just a
+        /// name + a content stream/blob per item) into real temp files, so
+        /// the rest of the drop pipeline — which only understands paths —
+        /// can treat them like any other drop.
+        fn extract_virtual_files(data_obj: &IDataObject) -> Vec<std::path::PathBuf> {
+            unsafe {
+                let cf_descriptor =
+                    RegisterClipboardFormatW(&HSTRING::from("FileGroupDescriptorW"));
+                let fmt = FORMATETC {
+                    cfFormat: cf_descriptor as u16,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                let Ok(mut medium) = data_obj.GetData(&fmt) else {
+                    return Vec::new();
+                };
+                let hglobal = medium.u.hGlobal;
+                let ptr = GlobalLock(hglobal) as *const FILEGROUPDESCRIPTORW;
+                if ptr.is_null() {
+                    ReleaseStgMedium(&mut medium);
+                    return Vec::new();
+                }
+                let count = (*ptr).cItems;
+                let fgd_ptr = std::ptr::addr_of!((*ptr).fgd) as *const FILEDESCRIPTORW;
+                let names: Vec<String> = (0..count)
+                    .map(|i| {
+                        // Packed struct: copy the fixed-size name buffer out
+                        // to a local before indexing, since a reference into
+                        // the packed field would be unaligned (UB).
+                        let name_ptr = std::ptr::addr_of!((*fgd_ptr.add(i as usize)).cFileName)
+                            as *const u16;
+                        let name: [u16; 260] = std::ptr::read_unaligned(name_ptr as *const [u16; 260]);
+                        let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                        String::from_utf16_lossy(&name[..end])
+                    })
+                    .collect();
+                let _ = GlobalUnlock(hglobal);
+                ReleaseStgMedium(&mut medium);
+                if names.is_empty() {
+                    return Vec::new();
+                }
+
+                let cf_contents = RegisterClipboardFormatW(&HSTRING::from("FileContents")) as u16;
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let temp_dir = std::env::temp_dir().join(format!("fileman-dnd-{nanos}"));
+                if std::fs::create_dir_all(&temp_dir).is_err() {
+                    return Vec::new();
+                }
+
+                let mut out = Vec::with_capacity(names.len());
+                for (i, name) in names.iter().enumerate() {
+                    let Some(bytes) = Self::read_file_contents(data_obj, cf_contents, i as i32)
+                    else {
+                        continue;
+                    };
+                    let name = if name.trim().is_empty() {
+                        format!("attachment-{i}")
+                    } else {
+                        name.clone()
+                    };
+                    let path = temp_dir.join(name);
+                    if std::fs::write(&path, &bytes).is_ok() {
+                        out.push(path);
+                    }
+                }
+                out
+            }
+        }
+
+        /// Pulls item `index`'s bytes out of a `CFSTR_FILECONTENTS` medium,
+        /// which senders hand over either as a plain memory block or an
+        /// `IStream` — try both, in the order most senders (Outlook) use.
+        unsafe fn read_file_contents(
+            data_obj: &IDataObject,
+            cf_contents: u16,
+            index: i32,
+        ) -> Option<Vec<u8>> {
+            for tymed in [TYMED_ISTREAM, TYMED_HGLOBAL] {
+                let fmt = FORMATETC {
+                    cfFormat: cf_contents,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: index,
+                    tymed: tymed.0 as u32,
+                };
+                let Ok(mut medium) = (unsafe { data_obj.GetData(&fmt) }) else {
+                    continue;
+                };
+                let bytes = if tymed == TYMED_ISTREAM {
+                    unsafe { medium.u.pstm.as_ref() }.map(|s| unsafe { read_stream_to_end(s) })
+                } else {
+                    let hglobal = unsafe { medium.u.hGlobal };
+                    let src = unsafe { GlobalLock(hglobal) };
+                    if src.is_null() {
+                        None
+                    } else {
+                        let size = unsafe { GlobalSize(hglobal) };
+                        let data =
+                            unsafe { std::slice::from_raw_parts(src as *const u8, size) }.to_vec();
+                        let _ = unsafe { GlobalUnlock(hglobal) };
+                        Some(data)
+                    }
+                };
+                unsafe { ReleaseStgMedium(&mut medium) };
+                if bytes.is_some() {
+                    return bytes;
+                }
+            }
+            None
+        }
+    }
+
+    /// Reads an `IStream` fully into memory, 64KB at a time until it reports
+    /// zero bytes read (EOF) or errors.
+    unsafe fn read_stream_to_end(stream: &IStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            let mut read = 0u32;
+            let hr = unsafe {
+                stream.Read(chunk.as_mut_ptr() as *mut _, chunk.len() as u32, Some(&mut read))
+            };
+            if hr.is_err() || read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read as usize]);
+            if (read as usize) < chunk.len() {
+                break;
+            }
+        }
+        buf
     }
 
     #[allow(non_snake_case)]

@@ -14,6 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+/// Height of the launcher/file-launch search boxes on the toolbar's second
+/// row, matched to `toolbar_button`'s icon+text button height so the boxes
+/// don't sit shorter (and thus off-center) than the buttons beside them.
+const TOOLBAR_ROW2_HEIGHT: f32 = 24.0;
+
 /// Reads file paths from the Windows clipboard in `CF_HDROP` format.
 ///
 /// Returns `Some(paths)` when the clipboard holds file drop data (e.g. after
@@ -1070,11 +1075,12 @@ impl FileManApp {
             },
             ActionRef::Custom(id) => {
                 if let Some(custom) = self.custom_actions.iter().find(|c| c.id == id) {
-                    let mut cmd = std::process::Command::new(&custom.exe_path);
-                    if let Some(path) = self.selected_paths().into_iter().next() {
-                        cmd.arg(path);
+                    let paths = self.selected_paths();
+                    if !paths.is_empty() {
+                        let mut cmd = std::process::Command::new(&custom.exe_path);
+                        cmd.args(&paths);
+                        let _ = cmd.spawn();
                     }
-                    let _ = cmd.spawn();
                 }
             }
         }
@@ -1963,6 +1969,10 @@ impl FileManApp {
         };
         let parent = self.active_tab_dir();
         let mut dirty_dir: Option<PathBuf> = None;
+        // Set only when exactly one folder was created, so it can be
+        // selected once the listing refreshes — ambiguous (and skipped) for
+        // a multi-name paste into the New Folder box.
+        let mut created_folder_name: Option<String> = None;
         let result = match &dialog {
             Dialog::Rename { path, name } => fs_ops::rename_item(path, name)
                 .map(|_| format!("Renamed to {name}"))
@@ -1985,6 +1995,9 @@ impl FileManApp {
                         }
                     }
                     if errors.is_empty() {
+                        if names.len() == 1 {
+                            created_folder_name = Some(names[0].to_string());
+                        }
                         Ok(format!("Created {created} folder(s)"))
                     } else {
                         Err(format!(
@@ -2053,6 +2066,11 @@ impl FileManApp {
         }
         if let Some(dir) = dirty_dir {
             self.mark_dir_dirty(&dir);
+        }
+        if let Some(name) = created_folder_name {
+            let tab = self.panes[self.active_pane].active_tab_mut();
+            tab.select_only(&name);
+            self.last_selected_index = None;
         }
         self.status = match result {
             Ok(msg) if msg.is_empty() => self.status.clone(),
@@ -3948,7 +3966,16 @@ impl FileManApp {
                     ctx.request_repaint();
                 }
 
-                if !loading_empty {
+                if !loading_empty && entries.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(48.0);
+                        ui.label(
+                            egui::RichText::new("There are no files/folder yet here.").weak(),
+                        );
+                    });
+                }
+
+                if !loading_empty && !entries.is_empty() {
                     match mode {
                         ViewMode::Details => {
                             let col_w = pane.active_tab().col_widths;
@@ -4350,6 +4377,27 @@ impl FileManApp {
                         self.last_selected_index = Some(idx);
                     }
                     self.active_pane = pane_idx;
+                }
+                // Enter opens the single selected entry, same as a
+                // double-click — but only when this pane is the active one
+                // and no text field (rename box, address bar, filter…) is
+                // mid-edit, so it doesn't hijack their own Enter handling.
+                if nav_target.is_none()
+                    && open_target.is_none()
+                    && pane_idx == self.active_pane
+                    && ctx.memory(|m| m.focused()).is_none()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    let selected = &pane.active_tab().selected;
+                    if selected.len() == 1 {
+                        if let Some(entry) = entries.iter().find(|e| selected.contains(&e.name)) {
+                            if entry.is_dir {
+                                nav_target = Some(entry.path.clone());
+                            } else {
+                                open_target = Some(entry.path.clone());
+                            }
+                        }
+                    }
                 }
                 if let Some(target) = nav_target {
                     let pinned = pane.active_tab().locked;
@@ -5072,7 +5120,11 @@ impl eframe::App for FileManApp {
             let has_custom = !self.custom_actions.is_empty();
             if has_launcher || has_file_launch || has_custom {
                 ui.add_space(2.0);
-                ui.horizontal(|ui| {
+                // Center-aligned (not the default top-aligned) so the
+                // search boxes — shorter than the icon+text launch buttons
+                // sharing this row — sit on the same line as everything
+                // else instead of hugging the top of the row.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     // Search filter for launcher apps (left side).
                     let mut launch_app: Option<i64> = None;
                     if has_launcher {
@@ -5080,7 +5132,8 @@ impl eframe::App for FileManApp {
                             egui::TextEdit::singleline(&mut self.launcher_filter)
                                 .id(egui::Id::new("launcher_filter"))
                                 .hint_text("\u{26A1} Search apps...")
-                                .desired_width(140.0),
+                                .desired_width(140.0)
+                                .min_size(egui::vec2(140.0, TOOLBAR_ROW2_HEIGHT)),
                         );
                         if filter_edit.changed() {
                             self.dirty = true;
@@ -5169,7 +5222,8 @@ impl eframe::App for FileManApp {
                             egui::TextEdit::singleline(&mut self.file_launch_filter)
                                 .id(egui::Id::new("file_launch_filter"))
                                 .hint_text("\u{1F4C4} Search files...")
-                                .desired_width(140.0),
+                                .desired_width(140.0)
+                                .min_size(egui::vec2(140.0, TOOLBAR_ROW2_HEIGHT)),
                         );
                         if fl_filter_edit.changed() {
                             self.dirty = true;
@@ -7292,6 +7346,14 @@ fn help_content(ui: &mut egui::Ui) {
         ui,
         "Right-click any file or folder for the context menu with additional options: Extract, Copy Filename, Copy Folder Path, Open With, Open in Windows Explorer, and Add to Favourites.",
     );
+    w(
+        ui,
+        "Creating a single new folder selects it automatically — press Enter to open it right away. Enter also opens whatever single file or folder is currently selected.",
+    );
+    w(
+        ui,
+        "Files dragged in from a mail client (e.g. an Outlook attachment) are accepted the same as files dragged from Explorer.",
+    );
 
     help_heading(ui, "Favourites");
     w(
@@ -7347,7 +7409,10 @@ fn help_content(ui: &mut egui::Ui) {
         ui,
         "Backspace Go Up | Delete Delete | Alt+Left Back | Alt+Right Forward",
     );
-    w(ui, "Enter Confirm | Escape Cancel / Close dialog");
+    w(
+        ui,
+        "Enter Confirm dialog / Open selected file or folder | Escape Cancel / Close dialog",
+    );
 
     help_heading(ui, "Tips");
     w(

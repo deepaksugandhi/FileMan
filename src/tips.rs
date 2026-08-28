@@ -37,6 +37,7 @@ const TIPS: &[&str] = &[
     "Prefer stacked tabs? Switch between horizontal and vertical tab strips under Settings → Appearance.",
     "Large copies and moves run in the background with a progress window — you can keep browsing meanwhile.",
     "Pin your favourite apps or files as quick-launch buttons in Settings → App Launcher / File Launcher, then find them fast by typing into the search box on the second toolbar row.",
+    "Just created a folder? It's already selected — press Enter to jump straight in.",
 ];
 
 /// What the user did with the card during the last [`TipsCard::draw`].
