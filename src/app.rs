@@ -4289,11 +4289,13 @@ impl FileManApp {
                             }
                         }
                         ViewMode::List => {
+                            let row_height = (self.font_size + 10.0).max(20.0);
                             egui::ScrollArea::vertical()
                                 .id_salt(format!("file_list_pane_{pane_idx}"))
                                 .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                                .show(ui, |ui| {
-                                    for (idx, entry) in entries.iter().enumerate() {
+                                .show_rows(ui, row_height, entries.len(), |ui, range| {
+                                    for idx in range {
+                                        let entry = &entries[idx];
                                         let is_selected =
                                             pane.active_tab().selected.contains(&entry.name);
                                         let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
