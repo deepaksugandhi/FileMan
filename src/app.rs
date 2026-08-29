@@ -3994,16 +3994,20 @@ impl FileManApp {
             let tab = pane.active_tab();
             (tab.filter.clone(), tab.sort_col.clone(), tab.sort_asc)
         };
-        let listing_result: Result<Vec<crate::fs_entry::FsEntry>, String> =
-            match &pane.active_tab().listing_error {
-                Some(err) => Err(err.clone()),
-                None => Ok(pane
-                    .active_tab_mut()
-                    .display_entries(&query, &sort_col, sort_asc)
-                    .to_vec()),
-            };
-        match listing_result {
-            Ok(entries) => {
+        // Render from the cached listing without deep-cloning it every frame:
+        // move the cached vec out, render against a borrow, put it back.
+        let mut entries: Vec<crate::fs_entry::FsEntry> = Vec::new();
+        let listing_err = pane.active_tab().listing_error.clone();
+        if listing_err.is_none() {
+            pane.active_tab_mut()
+                .display_entries(&query, &sort_col, sort_asc);
+            if let Some((_, cached)) = &mut pane.active_tab_mut().display_cache {
+                entries = std::mem::take(cached);
+            }
+        }
+        if let Some(err) = listing_err {
+            ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
+        } else {
                 // Lazily extract+cache the shell-associated app icon for
                 // each file in this listing; slots align 1:1 with `entries`
                 // (None for folders and unresolvable types).
@@ -4556,6 +4560,12 @@ impl FileManApp {
                         }
                     }
                 }
+                // Put the entries back into the cache now that rendering is
+                // done — must happen before any self.* calls that conflict
+                // with the pane borrow.
+                if let Some((_, cached)) = &mut pane.active_tab_mut().display_cache {
+                    *cached = entries;
+                }
                 if let Some(target) = nav_target {
                     let pinned = pane.active_tab().locked;
                     if pinned {
@@ -4649,11 +4659,7 @@ impl FileManApp {
                                 crate::shell_menu::invoke(hwnd, &paths, id);
                             }
                         }
-                    }
                 }
-            }
-            Err(err) => {
-                ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
             }
         }
         // Flush deferred recent-item recordings now that `pane`'s borrow is released.
