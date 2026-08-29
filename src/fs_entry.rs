@@ -52,6 +52,13 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     Ok(entries)
 }
 
+/// Case-insensitive string comparison without allocating.
+fn name_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 /// Sorts entries in place. Directories always come first, sorted
 /// alphabetically by name (case-insensitive) regardless of the requested
 /// sort column. Files follow the user's chosen sort column.
@@ -61,14 +68,14 @@ pub fn sort_entries(entries: &mut [FsEntry], sort_col: &str, asc: bool) {
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             if a.is_dir {
                 // Dirs always sorted alphabetically, always ascending.
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                name_ci(&a.name, &b.name)
             } else {
                 // Files sorted by the requested column.
                 let ord = match sort_col {
                     "modified" => a.modified.cmp(&b.modified),
                     "size" => a.size.cmp(&b.size),
                     "archive" => a.archive.cmp(&b.archive),
-                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    _ => name_ci(&a.name, &b.name),
                 };
                 if asc { ord } else { ord.reverse() }
             }
