@@ -4008,14 +4008,13 @@ impl FileManApp {
         if let Some(err) = listing_err {
             ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
         } else {
-                // Lazily extract+cache the shell-associated app icon for
-                // each file in this listing; slots align 1:1 with `entries`
-                // (None for folders and unresolvable types).
-                let entry_icons =
-                    crate::icon_cache::ensure_entry_icons(&mut self.file_icons, ctx, &entries);
                 let ctrl = ui.input(|i| i.modifiers.ctrl);
                 let shift = ui.input(|i| i.modifiers.shift);
                 let mode = pane.active_tab().view_mode;
+                // Split the borrow: file_icons lives in a separate field from
+                // panes, so the closure can hold &mut file_icons while pane
+                // (from self.panes[pane_idx]) is also alive.
+                let file_icons = &mut self.file_icons;
                 // Maximum-contrast listing text: pure white on dark, pure
                 // black on light — the theme defaults are softer than ideal
                 // for long stretches of filenames.
@@ -4134,6 +4133,14 @@ impl FileManApp {
 
                                                 row.set_selected(is_selected);
 
+                                                let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
+                                                    let key = crate::icon_cache::file_icon_cache_key(&entry.path);
+                                                    if !file_icons.contains_key(&key) {
+                                                        let tex = crate::icon_cache::load_file_icon_texture(ctx, &entry.path);
+                                                        file_icons.insert(key.clone(), tex);
+                                                    }
+                                                    file_icons.get(&key).cloned().flatten()
+                                                };
                                                 row.col(|ui| {
                                                     // Folders keep their emoji glyph;
                                                     // files show the associated app
@@ -4145,7 +4152,7 @@ impl FileManApp {
                                                                 egui::RichText::new("\u{1F4C1}")
                                                                     .color(listing_text),
                                                             );
-                                                        } else if let Some(tex) = &entry_icons[row_idx]
+                                                        } else if let Some(tex) = &file_icon
                                                         {
                                                             ui.add(egui::Image::new(
                                                                 egui::load::SizedTexture::new(
@@ -4289,6 +4296,14 @@ impl FileManApp {
                                     for (idx, entry) in entries.iter().enumerate() {
                                         let is_selected =
                                             pane.active_tab().selected.contains(&entry.name);
+                                        let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
+                                                    let key = crate::icon_cache::file_icon_cache_key(&entry.path);
+                                                    if !file_icons.contains_key(&key) {
+                                                        let tex = crate::icon_cache::load_file_icon_texture(ctx, &entry.path);
+                                                        file_icons.insert(key.clone(), tex);
+                                                    }
+                                                    file_icons.get(&key).cloned().flatten()
+                                                };
                                         let resp = ui
                                             .horizontal(|ui| {
                                                 if entry.is_dir {
@@ -4296,7 +4311,7 @@ impl FileManApp {
                                                         egui::RichText::new("\u{1F4C1}")
                                                             .color(listing_text),
                                                     );
-                                                } else if let Some(tex) = &entry_icons[idx] {
+                                                } else if let Some(tex) = &file_icon {
                                                     ui.add(egui::Image::new(
                                                         egui::load::SizedTexture::new(
                                                             tex.id(),
@@ -4357,6 +4372,14 @@ impl FileManApp {
                                         for (idx, entry) in entries.iter().enumerate() {
                                             let is_selected =
                                                 pane.active_tab().selected.contains(&entry.name);
+                                            let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
+                                                    let key = crate::icon_cache::file_icon_cache_key(&entry.path);
+                                                    if !file_icons.contains_key(&key) {
+                                                        let tex = crate::icon_cache::load_file_icon_texture(ctx, &entry.path);
+                                                        file_icons.insert(key.clone(), tex);
+                                                    }
+                                                    file_icons.get(&key).cloned().flatten()
+                                                };
                                             ui.allocate_ui(egui::vec2(76.0, 72.0), |ui| {
                                                 // Tile: associated app icon (or the
                                                 // generic glyph) above the filename.
@@ -4370,7 +4393,7 @@ impl FileManApp {
                                                                 egui::RichText::new("🗀")
                                                                     .color(listing_text),
                                                             )
-                                                        } else if let Some(tex) = &entry_icons[idx] {
+                                                } else if let Some(tex) = &file_icon {
                                                             ui.add(egui::Image::new(
                                                                 egui::load::SizedTexture::new(
                                                                     tex.id(),

@@ -6,7 +6,6 @@
 //! - Arbitrary files: the shell's associated icon for that file — the same
 //!   icon Explorer shows for its type — via `SHGetFileInfoW`.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use eframe::egui;
@@ -40,31 +39,6 @@ pub fn file_icon_cache_key(path: &Path) -> String {
         Some(ext) => format!("ext:{ext}"),
         None => "ext:".to_string(),
     }
-}
-
-/// Lazily extracts (and caches) the shell-associated icon for each file
-/// entry. Returns one slot per entry aligned with `entries` (`None` for
-/// folders and for files whose icon could not be resolved — failed lookups
-/// are cached too so they are never retried every frame).
-pub fn ensure_entry_icons(
-    cache: &mut HashMap<String, Option<egui::TextureHandle>>,
-    ctx: &egui::Context,
-    entries: &[crate::fs_entry::FsEntry],
-) -> Vec<Option<egui::TextureHandle>> {
-    entries
-        .iter()
-        .map(|entry| {
-            if entry.is_dir {
-                return None;
-            }
-            let key = file_icon_cache_key(&entry.path);
-            if !cache.contains_key(&key) {
-                let tex = load_file_icon_texture(ctx, &entry.path);
-                cache.insert(key.clone(), tex);
-            }
-            cache.get(&key).cloned().flatten()
-        })
-        .collect()
 }
 
 /// Extracts the shell-associated icon for a file path (what Explorer shows
