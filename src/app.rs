@@ -174,6 +174,9 @@ pub struct FileManApp {
     panes: Vec<Pane>,
     active_pane: usize,
     dirty: bool,
+    /// Whether the window had focus last frame, so regaining it can trigger a
+    /// re-listing of both panes (files may have changed in another app).
+    was_focused: bool,
     last_size: egui::Vec2,
     clipboard: Vec<PathBuf>,
     clipboard_op: Option<ClipboardOp>,
@@ -230,6 +233,12 @@ pub struct FileManApp {
     /// the sidebar tree. Resolved once at startup — they're OS-wide, not
     /// per-user-profile, and the shell lookup isn't free.
     system_folders: Vec<(String, PathBuf)>,
+    /// Drive roots for the sidebar. `list_drives` stats all 26 letters, and
+    /// an offline mapped drive can block for hundreds of ms — so resolve it
+    /// once at startup rather than every frame.
+    // ponytail: never refreshed, so a drive plugged in mid-session needs a
+    // restart to appear. Add a WM_DEVICECHANGE hook if that becomes annoying.
+    drives: Vec<PathBuf>,
     /// Favourite folder paths for quick access.
     favourites: Vec<String>,
     /// Recently accessed files and folders, newest first.
@@ -704,6 +713,7 @@ impl FileManApp {
             panes,
             active_pane,
             dirty: false,
+            was_focused: true,
             last_size: egui::vec2(1200.0, 800.0),
             clipboard: Vec::new(),
             clipboard_op: None,
@@ -730,6 +740,7 @@ impl FileManApp {
             focused_address_pane: None,
             network_servers: tree::list_network_servers(),
             system_folders: tree::list_system_folders(),
+            drives: tree::list_drives(),
             favourites,
             recent_items,
             show_recent_popup: false,
@@ -5019,6 +5030,21 @@ impl eframe::App for FileManApp {
         self.dnd_pane_rects = [None, None];
         self.dnd_tab_rects.clear();
 
+        // Another app may have changed these folders while we were in the
+        // background, so re-list both panes the moment the window regains
+        // focus. Only on the false->true edge, not for every focused frame.
+        // ponytail: refresh-on-focus rather than a filesystem watcher — no
+        // extra threads or handles, and it covers the case that actually
+        // matters (edit a file elsewhere, alt-tab back). Add
+        // ReadDirectoryChangesW only if live updates while focused are needed.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.was_focused {
+            for pane in &mut self.panes {
+                pane.active_tab_mut().listing_dirty = true;
+            }
+        }
+        self.was_focused = focused;
+
         for pane_idx in 0..2 {
             self.poll_listing(pane_idx, &ctx);
         }
@@ -5108,7 +5134,7 @@ impl eframe::App for FileManApp {
                             ui.separator();
                         }
 
-                        for drive in tree::list_drives() {
+                        for drive in self.drives.clone() {
                             self.show_dir_node(ui, &drive, None, &active_path, force_expand);
                         }
                         let mut network_roots = self.network_servers.clone();
