@@ -5191,7 +5191,8 @@ impl eframe::App for FileManApp {
                 // current folder is already favourited. Every other action
                 // renders the same regardless of state.
                 let current_path = self.active_tab_dir();
-                let is_fav = crate::db::is_favourite(&self.conn, self.current_user_id, &current_path.display().to_string());
+                let current_path_str = current_path.display().to_string();
+                let is_fav = self.favourites.iter().any(|f| f == &current_path_str);
 
                 let toolbar_actions = self.toolbar_actions.clone();
                 let mut clicked: Option<ActionRef> = None;
