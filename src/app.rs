@@ -4225,25 +4225,25 @@ impl FileManApp {
                                                 // sense, so a row drag starts a
                                                 // copy/move gesture without
                                                 // interfering with clicks.
-                                                if row_resp.drag_started() {
-                                                    drag_start = Some(entry.name.clone());
-                                                }
-                                                let selection_paths = context_menu_paths(
-                                                    pane.active_tab(),
-                                                    entry,
-                                                    is_selected,
-                                                );
-                                                styled_context_menu(&row_resp, |ui| {
-                                                    show_entry_context_menu(
-                                                        ui,
-                                                        &mut row_action,
-                                                        &entry.path,
-                                                        entry.is_dir,
-                                                        &selection_paths,
-                                                        &self.shell_menu_hidden,
-                                                        &mut self.shell_menu_cache,
-                                                    );
-                                                });
+                                                 if row_resp.drag_started() {
+                                                     drag_start = Some(entry.name.clone());
+                                                 }
+                                                 styled_context_menu(&row_resp, |ui| {
+                                                     let selection_paths = context_menu_paths(
+                                                         pane.active_tab(),
+                                                         entry,
+                                                         is_selected,
+                                                     );
+                                                     show_entry_context_menu(
+                                                         ui,
+                                                         &mut row_action,
+                                                         &entry.path,
+                                                         entry.is_dir,
+                                                         &selection_paths,
+                                                         &self.shell_menu_hidden,
+                                                         &mut self.shell_menu_cache,
+                                                     );
+                                                 });
                                             });
                                         });
                                 }); // end ScrollArea::horizontal
@@ -4322,25 +4322,25 @@ impl FileManApp {
                                             egui::Id::new(("entry_dnd", pane_idx, idx)),
                                             egui::Sense::drag(),
                                         );
-                                        if drag_zone.drag_started() {
-                                            drag_start = Some(entry.name.clone());
-                                        }
-                                        let selection_paths = context_menu_paths(
-                                            pane.active_tab(),
-                                            entry,
-                                            is_selected,
-                                        );
-                                        styled_context_menu(&resp, |ui| {
-                                            show_entry_context_menu(
-                                                ui,
-                                                &mut row_action,
-                                                &entry.path,
-                                                entry.is_dir,
-                                                &selection_paths,
-                                                &self.shell_menu_hidden,
-                                                &mut self.shell_menu_cache,
-                                            );
-                                        });
+                                         if drag_zone.drag_started() {
+                                             drag_start = Some(entry.name.clone());
+                                         }
+                                         styled_context_menu(&resp, |ui| {
+                                             let selection_paths = context_menu_paths(
+                                                 pane.active_tab(),
+                                                 entry,
+                                                 is_selected,
+                                             );
+                                             show_entry_context_menu(
+                                                 ui,
+                                                 &mut row_action,
+                                                 &entry.path,
+                                                 entry.is_dir,
+                                                 &selection_paths,
+                                                 &self.shell_menu_hidden,
+                                                 &mut self.shell_menu_cache,
+                                             );
+                                         });
                                     }
                                 });
                         }
@@ -4402,25 +4402,25 @@ impl FileManApp {
                                                     egui::Id::new(("entry_dnd", pane_idx, idx)),
                                                     egui::Sense::drag(),
                                                 );
-                                                if drag_zone.drag_started() {
-                                                    drag_start = Some(entry.name.clone());
-                                                }
-                                                let selection_paths = context_menu_paths(
-                                                    pane.active_tab(),
-                                                    entry,
-                                                    is_selected,
-                                                );
-                                                styled_context_menu(&resp, |ui| {
-                                                    show_entry_context_menu(
-                                                        ui,
-                                                        &mut row_action,
-                                                        &entry.path,
-                                                        entry.is_dir,
-                                                        &selection_paths,
-                                                        &self.shell_menu_hidden,
-                                                        &mut self.shell_menu_cache,
-                                                    );
-                                                });
+                                                 if drag_zone.drag_started() {
+                                                     drag_start = Some(entry.name.clone());
+                                                 }
+                                                 styled_context_menu(&resp, |ui| {
+                                                     let selection_paths = context_menu_paths(
+                                                         pane.active_tab(),
+                                                         entry,
+                                                         is_selected,
+                                                     );
+                                                     show_entry_context_menu(
+                                                         ui,
+                                                         &mut row_action,
+                                                         &entry.path,
+                                                         entry.is_dir,
+                                                         &selection_paths,
+                                                         &self.shell_menu_hidden,
+                                                         &mut self.shell_menu_cache,
+                                                     );
+                                                 });
                                             });
                                         }
                                     });
