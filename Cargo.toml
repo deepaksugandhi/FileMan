@@ -28,5 +28,6 @@ tempfile = "3.27.0"
 winresource = "0.1"
 
 [profile.release]
-lto = true
+lto = "thin"
+codegen-units = 1
 
