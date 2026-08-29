@@ -178,6 +178,10 @@ pub struct FileManApp {
     /// `dirty` every frame, and each `persist()` is a full transaction with
     /// an fsync — so coalesce them instead of writing per frame.
     last_persist: std::time::Instant,
+    /// The `font_size` that was last applied to the egui style. The style
+    /// block rewrites 4 whole `Style` values per call; skip it when the
+    /// font size hasn't changed.
+    styles_applied_font_size: Option<f32>,
     /// Whether the window had focus last frame, so regaining it can trigger a
     /// re-listing of both panes (files may have changed in another app).
     was_focused: bool,
@@ -718,6 +722,7 @@ impl FileManApp {
             active_pane,
             dirty: false,
             last_persist: std::time::Instant::now(),
+            styles_applied_font_size: None,
             was_focused: true,
             last_size: egui::vec2(1200.0, 800.0),
             clipboard: Vec::new(),
@@ -4753,6 +4758,8 @@ impl eframe::App for FileManApp {
             }
         }
         ctx.set_theme(self.theme_pref);
+        if self.styles_applied_font_size != Some(self.font_size) {
+            self.styles_applied_font_size = Some(self.font_size);
         for theme in [egui::Theme::Dark, egui::Theme::Light] {
             ctx.style_mut_of(theme, |style| {
                 // Compact, Windows command-bar density.
@@ -4871,6 +4878,7 @@ impl eframe::App for FileManApp {
             v.widgets.active.bg_stroke =
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 150, 156));
         });
+        } // styles_applied_font_size guard
 
         if self.fonts_applied_family.as_deref() != Some(self.font_family.as_str()) {
             apply_fonts(&ctx, &self.font_family, &mut self.status);
