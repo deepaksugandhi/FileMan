@@ -174,6 +174,10 @@ pub struct FileManApp {
     panes: Vec<Pane>,
     active_pane: usize,
     dirty: bool,
+    /// When `dirty` was last flushed to SQLite. Window/divider drags set
+    /// `dirty` every frame, and each `persist()` is a full transaction with
+    /// an fsync — so coalesce them instead of writing per frame.
+    last_persist: std::time::Instant,
     /// Whether the window had focus last frame, so regaining it can trigger a
     /// re-listing of both panes (files may have changed in another app).
     was_focused: bool,
@@ -713,6 +717,7 @@ impl FileManApp {
             panes,
             active_pane,
             dirty: false,
+            last_persist: std::time::Instant::now(),
             was_focused: true,
             last_size: egui::vec2(1200.0, 800.0),
             clipboard: Vec::new(),
@@ -6663,6 +6668,16 @@ impl eframe::App for FileManApp {
             }
         }
 
+        if self.dirty
+            && self.last_persist.elapsed() >= std::time::Duration::from_millis(500)
+        {
+            self.persist();
+            self.last_persist = std::time::Instant::now();
+            self.dirty = false;
+        }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         if self.dirty {
             self.persist();
             self.dirty = false;
