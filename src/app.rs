@@ -813,34 +813,54 @@ impl FileManApp {
     /// job is already in flight. Requests a repaint while a job is pending
     /// so results land without waiting for user input.
     fn poll_listing(&mut self, pane_idx: usize, ctx: &egui::Context) {
-        let active_idx = self.panes[pane_idx].active_tab;
-        let dir = self.panes[pane_idx].tabs[active_idx].path.clone();
-
+        // First: try to pick up a completed job and apply its result to every
+        // tab whose path matches (there may be multiple open tabs showing the
+        // same directory, e.g. the source folder in a non-active tab after a
+        // move).
         if let Some(job) = &self.listing_jobs[pane_idx] {
             if let Ok(result) = job.rx.try_recv() {
-                if job.dir == dir {
-                    let tab = &mut self.panes[pane_idx].tabs[active_idx];
-                    match result {
-                        Ok(entries) => {
-                            tab.listing = if self.show_hidden {
-                                entries
-                            } else {
-                                entries.into_iter().filter(|e| !e.hidden).collect()
-                            };
-                            tab.listing_error = None;
-                            tab.listing_version += 1;
+                for tab in &mut self.panes[pane_idx].tabs {
+                    if tab.path == job.dir {
+                        match &result {
+                            Ok(entries) => {
+                                tab.listing = if self.show_hidden {
+                                    entries.clone()
+                                } else {
+                                    entries.iter().filter(|e| !e.hidden).cloned().collect()
+                                };
+                                tab.listing_error = None;
+                                tab.listing_version += 1;
+                            }
+                            Err(e) => tab.listing_error = Some(e.to_string()),
                         }
-                        Err(e) => tab.listing_error = Some(e.to_string()),
                     }
                 }
                 self.listing_jobs[pane_idx] = None;
             }
         }
 
-        let tab = &mut self.panes[pane_idx].tabs[active_idx];
-        if self.listing_jobs[pane_idx].is_none() && tab.listing_dirty {
-            tab.listing_dirty = false;
-            self.listing_jobs[pane_idx] = Some(spawn_listing_job(dir));
+        // Second: if no job is in flight, pick the first dirty tab (active
+        // preferred, but any dirty tab will do) and spawn a listing job for it.
+        if self.listing_jobs[pane_idx].is_none() {
+            // Prefer the active tab so the user sees an immediate refresh.
+            let active_idx = self.panes[pane_idx].active_tab;
+            let active_dirty = self.panes[pane_idx].tabs[active_idx].listing_dirty;
+            if active_dirty {
+                let dir = self.panes[pane_idx].tabs[active_idx].path.clone();
+                self.panes[pane_idx].tabs[active_idx].listing_dirty = false;
+                self.listing_jobs[pane_idx] = Some(spawn_listing_job(dir));
+            } else {
+                // Check non-active tabs: a move/copy may have dirtied a
+                // background tab (e.g. the source folder).
+                for tab in &mut self.panes[pane_idx].tabs {
+                    if tab.listing_dirty {
+                        let dir = tab.path.clone();
+                        tab.listing_dirty = false;
+                        self.listing_jobs[pane_idx] = Some(spawn_listing_job(dir));
+                        break;
+                    }
+                }
+            }
         }
 
         if self.listing_jobs[pane_idx].is_some() {
