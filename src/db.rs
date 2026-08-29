@@ -207,6 +207,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             key TEXT NOT NULL,
             value TEXT,
             PRIMARY KEY (user_id, key)
+        );
+        CREATE TABLE IF NOT EXISTS recent_items (
+            user_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            is_dir INTEGER NOT NULL DEFAULT 0,
+            accessed_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, path)
         );",
     )?;
     for (key, value) in [
@@ -309,6 +316,85 @@ pub fn is_favourite(conn: &Connection, user_id: i64, path: &str) -> bool {
     )
     .unwrap_or(0)
         > 0
+}
+
+// ---------------------------------------------------------------------------
+// Recent items
+// ---------------------------------------------------------------------------
+
+/// A recently accessed file or folder.
+#[derive(Debug, Clone)]
+pub struct RecentItem {
+    pub path: String,
+    pub is_dir: bool,
+    #[allow(dead_code)]
+    pub accessed_at: String,
+}
+
+const RECENT_LIMIT: i64 = 50;
+
+/// Records a path as recently accessed, updating the timestamp if it already
+/// exists. Trims the oldest entries beyond [`RECENT_LIMIT`].
+pub fn add_recent_item(conn: &Connection, user_id: i64, path: &str, is_dir: bool) {
+    let _ = conn.execute(
+        "INSERT INTO recent_items (user_id, path, is_dir, accessed_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(user_id, path) DO UPDATE SET
+             is_dir = excluded.is_dir,
+             accessed_at = excluded.accessed_at",
+        rusqlite::params![user_id, path, is_dir as i64],
+    );
+    // Trim oldest entries beyond the cap.
+    let _ = conn.execute(
+        "DELETE FROM recent_items
+         WHERE user_id = ?1
+           AND path NOT IN (
+               SELECT path FROM recent_items
+               WHERE user_id = ?1
+               ORDER BY accessed_at DESC
+               LIMIT ?2
+           )",
+        rusqlite::params![user_id, RECENT_LIMIT],
+    );
+}
+
+/// Returns the most recently accessed items for `user_id`, newest first.
+pub fn get_recent_items(conn: &Connection, user_id: i64, limit: usize) -> Vec<RecentItem> {
+    let mut stmt = match conn.prepare(
+        "SELECT path, is_dir, accessed_at FROM recent_items
+         WHERE user_id = ?1
+         ORDER BY accessed_at DESC
+         LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(rusqlite::params![user_id, limit as i64], |row| {
+        Ok(RecentItem {
+            path: row.get(0)?,
+            is_dir: row.get::<_, i64>(1)? != 0,
+            accessed_at: row.get(2)?,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Removes a single item from the recent list.
+#[allow(dead_code)]
+pub fn remove_recent_item(conn: &Connection, user_id: i64, path: &str) {
+    let _ = conn.execute(
+        "DELETE FROM recent_items WHERE user_id = ?1 AND path = ?2",
+        rusqlite::params![user_id, path],
+    );
+}
+
+/// Clears all recent items for `user_id`.
+pub fn clear_recent_items(conn: &Connection, user_id: i64) {
+    let _ = conn.execute(
+        "DELETE FROM recent_items WHERE user_id = ?1",
+        rusqlite::params![user_id],
+    );
 }
 
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {
@@ -476,6 +562,44 @@ mod tests {
         add_favourite(&conn, 2, "C:\\two").unwrap();
         assert_eq!(get_favourites(&conn, 1), vec!["C:\\one".to_string()]);
         assert_eq!(get_favourites(&conn, 2), vec!["C:\\two".to_string()]);
+    }
+
+    #[test]
+    fn recent_items_are_scoped_per_user() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, created_at) VALUES (2, 'Alice', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        add_recent_item(&conn, 1, "C:\\folder", true);
+        add_recent_item(&conn, 2, "D:\\other", false);
+        let u1 = get_recent_items(&conn, 1, 50);
+        let u2 = get_recent_items(&conn, 2, 50);
+        assert_eq!(u1.len(), 1);
+        assert_eq!(u1[0].path, "C:\\folder");
+        assert!(u1[0].is_dir);
+        assert_eq!(u2.len(), 1);
+        assert_eq!(u2[0].path, "D:\\other");
+        assert!(!u2[0].is_dir);
+    }
+
+    #[test]
+    fn recent_items_are_capped_at_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for i in 0..60 {
+            add_recent_item(&conn, 1, &format!("C:\\dir{i}"), true);
+        }
+        let items = get_recent_items(&conn, 1, 100);
+        assert!(
+            items.len() <= RECENT_LIMIT as usize,
+            "expected at most {RECENT_LIMIT} items, got {}",
+            items.len()
+        );
     }
 
     #[test]

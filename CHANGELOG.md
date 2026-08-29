@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.10 (2026-08-29)
+
+- New "🕒 Recent" toolbar button: a dropdown of recently opened files and folders (per user, capped at 50), click an entry to jump straight there, or Clear Recent to wipe the list.
+- Recent history is stored in SQLite and seeded with the startup folder so it's never blank on first launch.
+
 ## v0.1.9 (2026-08-28)
 
 - The "Windows Explorer" right-click submenu now acts on your whole selection instead of only the row you clicked — fixes shell commands like "Combine files in Foxit PDF" only picking up the first file.

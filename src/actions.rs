@@ -712,6 +712,7 @@ pub fn remove_launcher_app(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// Updates a launcher app's fields by row id.
+#[allow(dead_code)]
 pub fn update_launcher_app(
     conn: &Connection,
     id: i64,

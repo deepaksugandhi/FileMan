@@ -232,6 +232,10 @@ pub struct FileManApp {
     system_folders: Vec<(String, PathBuf)>,
     /// Favourite folder paths for quick access.
     favourites: Vec<String>,
+    /// Recently accessed files and folders, newest first.
+    recent_items: Vec<crate::db::RecentItem>,
+    /// Whether the Recent dropdown popup is open.
+    show_recent_popup: bool,
     /// In-flight background directory listing per pane (only the active
     /// tab of each pane needs a live listing job at a time).
     listing_jobs: [Option<ListingJob>; 2],
@@ -678,12 +682,21 @@ impl FileManApp {
         let launcher_apps = crate::actions::list_launcher_apps(&conn, current_user_id);
         let file_launches = crate::actions::list_file_launches(&conn, current_user_id);
         let mut panes = panes;
-        if let Some(dir) = startup_dir {
+        let startup_path = if let Some(dir) = startup_dir {
             // Launched as the default folder explorer with a clicked folder.
             let first = &mut panes[0].tabs[0];
-            first.path = dir;
+            first.path = dir.clone();
             first.listing_dirty = true;
+            Some(dir)
+        } else {
+            Some(panes[0].tabs[0].path.clone())
+        };
+        // Record the initial directory in the recent list so it's not blank
+        // on first launch.
+        if let Some(ref p) = startup_path {
+            crate::db::add_recent_item(&conn, current_user_id, &p.display().to_string(), p.is_dir());
         }
+        let recent_items = crate::db::get_recent_items(&conn, current_user_id, 50);
         FileManApp {
             conn,
             current_user_id,
@@ -718,6 +731,8 @@ impl FileManApp {
             network_servers: tree::list_network_servers(),
             system_folders: tree::list_system_folders(),
             favourites,
+            recent_items,
+            show_recent_popup: false,
             listing_jobs: [None, None],
             background_op_dirs: Vec::new(),
             split_ratio,
@@ -878,10 +893,11 @@ impl FileManApp {
     fn open_tab_with_default_sort(&mut self, pane_idx: usize, path: PathBuf) {
         let (col, asc) = (self.universal_sort_col.clone(), self.universal_sort_asc);
         let pane = &mut self.panes[pane_idx];
-        pane.open_tab(path);
+        pane.open_tab(path.clone());
         let tab = pane.active_tab_mut();
         tab.sort_col = col;
         tab.sort_asc = asc;
+        self.record_recent(&path, path.is_dir());
     }
 
     /// Applies `col`/`asc` to every open tab in both panes and stores them as
@@ -925,6 +941,27 @@ impl FileManApp {
             self.favourites = crate::db::get_favourites(&self.conn, self.current_user_id);
             self.status = format!("Removed from favourites");
         }
+    }
+
+    /// Records a file or folder as recently accessed.
+    fn record_recent(&mut self, path: &std::path::Path, is_dir: bool) {
+        let path_str = path.display().to_string();
+        crate::db::add_recent_item(&self.conn, self.current_user_id, &path_str, is_dir);
+        self.recent_items = crate::db::get_recent_items(&self.conn, self.current_user_id, 50);
+    }
+
+    /// Removes a single item from the recent list.
+    #[allow(dead_code)]
+    fn remove_recent(&mut self, path: &str) {
+        crate::db::remove_recent_item(&self.conn, self.current_user_id, path);
+        self.recent_items = crate::db::get_recent_items(&self.conn, self.current_user_id, 50);
+    }
+
+    /// Clears all recent items.
+    fn clear_recent(&mut self) {
+        crate::db::clear_recent_items(&self.conn, self.current_user_id);
+        self.recent_items.clear();
+        self.status = "Recent history cleared".to_string();
     }
 
     /// Persists current state, switches to `user_id`'s session (loading its
@@ -976,6 +1013,7 @@ impl FileManApp {
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(150.0);
         self.favourites = crate::db::get_favourites(&self.conn, user_id);
+        self.recent_items = crate::db::get_recent_items(&self.conn, user_id, 50);
         self.shortcut_map = crate::actions::load_shortcut_map(&self.conn, user_id);
         self.toolbar_actions = crate::actions::load_toolbar(&self.conn, user_id);
         self.custom_actions = crate::actions::list_custom_actions(&self.conn, user_id);
@@ -1020,6 +1058,8 @@ impl FileManApp {
                     if pane.active_tab().locked {
                         self.status = "Tab is pinned — unpin it to navigate".to_string();
                     } else if pane.active_tab_mut().go_back() {
+                        let path = pane.active_tab().path.clone();
+                        self.record_recent(&path, path.is_dir());
                         self.dirty = true;
                     }
                 }
@@ -1028,6 +1068,8 @@ impl FileManApp {
                     if pane.active_tab().locked {
                         self.status = "Tab is pinned — unpin it to navigate".to_string();
                     } else if pane.active_tab_mut().go_forward() {
+                        let path = pane.active_tab().path.clone();
+                        self.record_recent(&path, path.is_dir());
                         self.dirty = true;
                     }
                 }
@@ -1114,7 +1156,8 @@ impl FileManApp {
             self.status = PINNED.to_string();
             return false;
         }
-        self.panes[pane_idx].active_tab_mut().try_navigate(path);
+        self.panes[pane_idx].active_tab_mut().try_navigate(path.clone());
+        self.record_recent(&path, path.is_dir());
         true
     }
 
@@ -2066,6 +2109,15 @@ impl FileManApp {
         }
         if let Some(dir) = dirty_dir {
             self.mark_dir_dirty(&dir);
+        }
+        // After a successful rename, select the renamed file so the user
+        // can immediately see and interact with it.
+        if result.is_ok() {
+            if let Dialog::Rename { name, .. } = &dialog {
+                let tab = self.panes[self.active_pane].active_tab_mut();
+                tab.select_only(name);
+                self.last_selected_index = None;
+            }
         }
         if let Some(name) = created_folder_name {
             let tab = self.panes[self.active_pane].active_tab_mut();
@@ -3622,6 +3674,7 @@ impl FileManApp {
         let mut focused_address_pane = self.focused_address_pane;
         let mut deferred_status: Option<String> = None;
         let mut deferred_toast: Option<String> = None;
+        let mut deferred_recent: Vec<(PathBuf, bool)> = Vec::new();
         let mut became_active = false;
         let mut became_dirty = false;
         // Disjoint field borrows so the closure below can poll the shared
@@ -3677,9 +3730,10 @@ impl FileManApp {
                                 // a bad path via `listing_error` instead.
                                 let typed = pane.address_bar.trim().trim_matches('"').trim();
                                 let target = PathBuf::from(typed);
-                                if pane.active_tab_mut().try_navigate(target) {
+                                if pane.active_tab_mut().try_navigate(target.clone()) {
                                     became_active = true;
                                     became_dirty = true;
+                                    deferred_recent.push((target.clone(), target.is_dir()));
                                 } else {
                                     deferred_status =
                                         Some("Tab is pinned — unpin it to navigate".to_string());
@@ -3815,9 +3869,10 @@ impl FileManApp {
                             deferred_toast = Some("Path copied to clipboard".to_string());
                         }
                         if let Some(target) = nav_target {
-                            if pane.active_tab_mut().try_navigate(target) {
+                            if pane.active_tab_mut().try_navigate(target.clone()) {
                                 became_active = true;
                                 became_dirty = true;
+                                deferred_recent.push((target, true));
                             } else {
                                 deferred_status =
                                     Some("Tab is pinned — unpin it to navigate".to_string());
@@ -3850,6 +3905,8 @@ impl FileManApp {
                 if pane.active_tab().locked {
                     self.status = "Tab is pinned — unpin it to navigate".to_string();
                 } else if pane.active_tab_mut().go_back() {
+                    let path = pane.active_tab().path.clone();
+                    deferred_recent.push((path.clone(), path.is_dir()));
                     self.dirty = true;
                 }
             }
@@ -3857,13 +3914,17 @@ impl FileManApp {
                 if pane.active_tab().locked {
                     self.status = "Tab is pinned — unpin it to navigate".to_string();
                 } else if pane.active_tab_mut().go_forward() {
+                    let path = pane.active_tab().path.clone();
+                    deferred_recent.push((path.clone(), path.is_dir()));
                     self.dirty = true;
                 }
             }
             if ui.button("⬆").on_hover_text("Up").clicked() {
                 if let Some(parent) = current_path.parent() {
-                    if pane.active_tab_mut().try_navigate(parent.to_path_buf()) {
+                    let parent_path = parent.to_path_buf();
+                    if pane.active_tab_mut().try_navigate(parent_path.clone()) {
                         self.dirty = true;
+                        deferred_recent.push((parent_path, true));
                     } else {
                         self.status = "Tab is pinned — unpin it to navigate".to_string();
                     }
@@ -3947,7 +4008,7 @@ impl FileManApp {
                 let mut select_name: Option<String> = None;
                 let mut select_index: Option<usize> = None;
                 let mut nav_target: Option<PathBuf> = None;
-                let mut open_target: Option<PathBuf> = None;
+                let mut open_targets: Option<Vec<PathBuf>> = None;
                 let mut row_action: Option<RowAction> = None;
                 let mut drag_start: Option<String> = None;
 
@@ -4137,7 +4198,7 @@ impl FileManApp {
                                                     if entry.is_dir {
                                                         nav_target = Some(entry.path.clone());
                                                     } else {
-                                                        open_target = Some(entry.path.clone());
+                                                        open_targets = Some(vec![entry.path.clone()]);
                                                     }
                                                 }
                                                 if row_resp.secondary_clicked() && !is_selected {
@@ -4237,7 +4298,7 @@ impl FileManApp {
                                             &mut select_name,
                                             &mut select_index,
                                             &mut nav_target,
-                                            &mut open_target,
+                                            &mut open_targets,
                                             idx,
                                         );
                                         let drag_zone = ui.interact(
@@ -4317,7 +4378,7 @@ impl FileManApp {
                                                     &mut select_name,
                                                     &mut select_index,
                                                     &mut nav_target,
-                                                    &mut open_target,
+                                                    &mut open_targets,
                                                     idx,
                                                 );
                                                 let drag_zone = ui.interact(
@@ -4396,24 +4457,86 @@ impl FileManApp {
                     }
                     self.active_pane = pane_idx;
                 }
-                // Enter opens the single selected entry, same as a
-                // double-click — but only when this pane is the active one
-                // and no text field (rename box, address bar, filter…) is
-                // mid-edit, so it doesn't hijack their own Enter handling.
+                // Enter opens selected entries, same as a double-click.
+                // Directories are navigated into; files are opened with
+                // their default associated application.
                 if nav_target.is_none()
-                    && open_target.is_none()
+                    && open_targets.is_none()
                     && pane_idx == self.active_pane
                     && ctx.memory(|m| m.focused()).is_none()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
                 {
                     let selected = &pane.active_tab().selected;
-                    if selected.len() == 1 {
-                        if let Some(entry) = entries.iter().find(|e| selected.contains(&e.name)) {
-                            if entry.is_dir {
-                                nav_target = Some(entry.path.clone());
-                            } else {
-                                open_target = Some(entry.path.clone());
+                    if !selected.is_empty() {
+                        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+                        let mut files: Vec<std::path::PathBuf> = Vec::new();
+                        for entry in &entries {
+                            if selected.contains(&entry.name) {
+                                if entry.is_dir {
+                                    dirs.push(entry.path.clone());
+                                } else {
+                                    files.push(entry.path.clone());
+                                }
                             }
+                        }
+                        // If exactly one directory is selected, navigate into it.
+                        // Otherwise open all selected files.
+                        if dirs.len() == 1 && files.is_empty() {
+                            nav_target = Some(dirs.into_iter().next().unwrap());
+                        } else if !files.is_empty() {
+                            open_targets = Some(files);
+                        }
+                    }
+                }
+                // Arrow keys move/extend the single selection through the
+                // list (Explorer-style): Up/Down move, Shift+Up/Down extends
+                // from a fixed anchor, Left goes up a folder, Right opens
+                // the selected folder (mirrors Enter, but directories only).
+                if pane_idx == self.active_pane
+                    && ctx.memory(|m| m.focused()).is_none()
+                    && !entries.is_empty()
+                {
+                    let arrow_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                    let arrow_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                    if arrow_down || arrow_up {
+                        let cur = pane
+                            .active_tab()
+                            .selected
+                            .iter()
+                            .next()
+                            .and_then(|n| entries.iter().position(|e| &e.name == n));
+                        let next_idx = match cur {
+                            Some(i) if arrow_down => (i + 1).min(entries.len() - 1),
+                            Some(i) => i.saturating_sub(1),
+                            None => 0,
+                        };
+                        if shift {
+                            let anchor = self.last_selected_index.unwrap_or(cur.unwrap_or(next_idx));
+                            let (start, end) = (anchor.min(next_idx), anchor.max(next_idx));
+                            let range_names: Vec<String> =
+                                entries[start..=end].iter().map(|e| e.name.clone()).collect();
+                            pane.active_tab_mut().clear_selection();
+                            pane.active_tab_mut().select_range(&range_names);
+                            self.last_selected_index = Some(anchor);
+                        } else {
+                            pane.active_tab_mut().select_only(&entries[next_idx].name);
+                            self.last_selected_index = Some(next_idx);
+                        }
+                        self.active_pane = pane_idx;
+                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                        if let Some(parent) = pane.active_tab().path.parent().map(|p| p.to_path_buf())
+                            && pane.active_tab_mut().try_navigate(parent.clone())
+                        {
+                            self.dirty = true;
+                            deferred_recent.push((parent, true));
+                        }
+                    } else if nav_target.is_none() && ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                        let selected = &pane.active_tab().selected;
+                        if selected.len() == 1
+                            && let Some(entry) = entries.iter().find(|e| selected.contains(&e.name))
+                            && entry.is_dir
+                        {
+                            nav_target = Some(entry.path.clone());
                         }
                     }
                 }
@@ -4424,7 +4547,7 @@ impl FileManApp {
                         // tab placed right beside it instead.
                         let (def_col, def_asc) =
                             (self.universal_sort_col.clone(), self.universal_sort_asc);
-                        let mut new_tab = crate::tab::Tab::new(target);
+                        let mut new_tab = crate::tab::Tab::new(target.clone());
                         new_tab.sort_col = def_col;
                         new_tab.sort_asc = def_asc;
                         let insert_at = pane.active_tab + 1;
@@ -4432,13 +4555,18 @@ impl FileManApp {
                         pane.active_tab = insert_at;
                         self.active_pane = pane_idx;
                         self.dirty = true;
-                    } else if pane.active_tab_mut().try_navigate(target) {
+                        deferred_recent.push((target, true));
+                    } else if pane.active_tab_mut().try_navigate(target.clone()) {
                         self.active_pane = pane_idx;
                         self.dirty = true;
+                        deferred_recent.push((target, true));
                     }
                 }
-                if let Some(target) = open_target {
-                    self.open_path(&target);
+                if let Some(targets) = open_targets {
+                    for target in &targets {
+                        deferred_recent.push((target.clone(), false));
+                        self.open_path(target);
+                    }
                 }
                 if let Some(action) = row_action {
                     self.active_pane = pane_idx;
@@ -4511,6 +4639,10 @@ impl FileManApp {
             Err(err) => {
                 ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
             }
+        }
+        // Flush deferred recent-item recordings now that `pane`'s borrow is released.
+        for (path, is_dir) in deferred_recent {
+            self.record_recent(&path, is_dir);
         }
     }
 }
@@ -5032,6 +5164,84 @@ impl eframe::App for FileManApp {
 
                 let toolbar_actions = self.toolbar_actions.clone();
                 let mut clicked: Option<ActionRef> = None;
+
+                // 🕒 Recent button — always the first toolbar button.
+                let recent_btn = toolbar_button(
+                    ui,
+                    "🕒 Recent".to_string(),
+                    None,
+                    ButtonStyle::Blue,
+                );
+                if recent_btn.clicked() {
+                    self.show_recent_popup = !self.show_recent_popup;
+                }
+                let popup_id = recent_btn.id.with("recent_popup");
+                if self.show_recent_popup {
+                    let recent = self.recent_items.clone();
+                    let folders: Vec<_> = recent.iter().filter(|i| i.is_dir).take(15).collect();
+                    let files: Vec<_> = recent.iter().filter(|i| !i.is_dir).take(15).collect();
+                    let area_resp = egui::Area::new(popup_id)
+                        .fixed_pos(recent_btn.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                        .order(egui::Order::Foreground)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(260.0);
+                                if folders.is_empty() && files.is_empty() {
+                                    ui.label(egui::RichText::new("No recent items").weak());
+                                } else {
+                                    if !folders.is_empty() {
+                                        ui.label(egui::RichText::new("Folders").strong());
+                                        for item in &folders {
+                                            let path = std::path::Path::new(&item.path);
+                                            let name = path
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| item.path.clone());
+                                            let btn = ui.button(format!("\u{1F4C1} {name}"));
+                                            if btn.clicked() {
+                                                if self.try_navigate_active(self.active_pane, path.to_path_buf()) {
+                                                    self.dirty = true;
+                                                }
+                                                self.show_recent_popup = false;
+                                            }
+                                        }
+                                    }
+                                    if !folders.is_empty() && !files.is_empty() {
+                                        ui.separator();
+                                    }
+                                    if !files.is_empty() {
+                                        ui.label(egui::RichText::new("Files").strong());
+                                        for item in &files {
+                                            let path = std::path::Path::new(&item.path);
+                                            let name = path
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| item.path.clone());
+                                            let btn = ui.button(format!("\u{1F4C4} {name}"));
+                                            if btn.clicked() {
+                                                self.record_recent(path, false);
+                                                self.open_path(path);
+                                                self.show_recent_popup = false;
+                                            }
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("Clear Recent").clicked() {
+                                        self.clear_recent();
+                                        self.show_recent_popup = false;
+                                    }
+                                }
+                            });
+                        });
+                    // Close on click-away: any click that is NOT inside the
+                    // popup area and NOT on the Recent button itself.
+                    let pointer = ui.input(|i| i.pointer.clone());
+                    if pointer.any_click() && !area_resp.response.rect.contains(pointer.interact_pos().unwrap_or_default()) && !recent_btn.rect.contains(pointer.interact_pos().unwrap_or_default()) {
+                        self.show_recent_popup = false;
+                    }
+                }
+
                 for action_ref in &toolbar_actions {
                     match action_ref {
                         // Custom actions get their own second row below the
@@ -5718,6 +5928,7 @@ impl eframe::App for FileManApp {
                 if let Some(action) = find_row_action {
                     match action {
                         FindRowAction::Open(path) => {
+                            self.record_recent(&path, false);
                             self.open_path(&path);
                         }
                         FindRowAction::Reveal(parent) => {
@@ -6144,33 +6355,60 @@ impl eframe::App for FileManApp {
                         egui::Window::new(title)
                             // Modal-style placement: pinned to screen centre.
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            // Windows are fixed-size (Resize-backed) unless
+                            // told otherwise, so a longer name on reopen was
+                            // clipped to whatever size the dialog last had.
+                            .auto_sized()
                             .show(&ctx, |ui| {
                                 if multiline {
                                     ui.label("One folder per line:");
                                 }
                                 let is_rename = title == "Rename";
                                 let just_opened = self.dialog_just_opened;
+                                let dialog_text_id = egui::Id::new("dialog_rename_text");
                                 let edit = if multiline {
                                     ui.add(
                                         egui::TextEdit::multiline(name)
+                                            .id(dialog_text_id)
                                             .desired_rows(4)
                                             .desired_width(260.0),
                                     )
                                 } else {
+                                    // Auto-size the rename input: measure text
+                                    // width via the painter and clamp to
+                                    // 80% of available width so long
+                                    // filenames (with extension) fit.
+                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                    let text_width = ui.painter().layout_no_wrap(
+                                        name.clone(),
+                                        font_id,
+                                        egui::Color32::WHITE,
+                                    ).size().x;
+                                    // Fixed generous ceiling, not derived from
+                                    // `ui.available_width()`: inside a
+                                    // freshly (re)opened auto-sized Window,
+                                    // that reflects the *previous* frame's
+                                    // remembered size, so it stayed clamped
+                                    // to whatever a shorter name last used.
+                                    let desired = (text_width + 80.0).clamp(260.0, 1000.0);
                                     let mut output = egui::TextEdit::singleline(name)
-                                        .desired_width(350.0)
+                                        .id(dialog_text_id)
+                                        .desired_width(desired)
                                         .show(ui);
                                     // On every open of a rename dialog,
                                     // select the filename stem (everything
                                     // before the last dot) so the user can
                                     // immediately type a new name.
-                                    if is_rename
-                                        && just_opened
-                                        && let Some(dot_pos) = name.rfind('.')
-                                    {
+                                    let is_rename_tab = title == "Rename Tab";
+                                    if just_opened && (is_rename || is_rename_tab) {
+                                        let end = if is_rename {
+                                            name.rfind('.').unwrap_or(name.len())
+                                        } else {
+                                            name.len()
+                                        };
                                         let range = egui::text::CCursorRange::two(
                                             egui::text::CCursor::new(0),
-                                            egui::text::CCursor::new(dot_pos),
+                                            egui::text::CCursor::new(end),
                                         );
                                         output.state.cursor.set_char_range(Some(range));
                                         egui::TextEdit::store_state(
@@ -6217,6 +6455,19 @@ impl eframe::App for FileManApp {
                         self.dialog = None;
                     } else if commit {
                         self.commit_dialog();
+                    }
+                    // After the dialog closes, clear egui focus so that
+                    // keyboard shortcuts (Delete, F2, etc.)
+                    // work immediately without the user having to click
+                    // the file list first.
+                    if self.dialog.is_none() {
+                        // Unconditional clear (not surrender_focus, which
+                        // only acts if the id still matches) — guarantees
+                        // keyboard shortcuts work again even if focus moved
+                        // elsewhere in the dialog before it closed.
+                        ctx.memory_mut(|m| {
+                            m.stop_text_input();
+                        });
                     }
                 }
             }
@@ -6609,14 +6860,14 @@ fn register_entry_click(
     select_name: &mut Option<String>,
     select_index: &mut Option<usize>,
     nav_target: &mut Option<PathBuf>,
-    open_target: &mut Option<PathBuf>,
+    open_targets: &mut Option<Vec<PathBuf>>,
     index: usize,
 ) {
     if resp.double_clicked() {
         if entry.is_dir {
             *nav_target = Some(entry.path.clone());
         } else {
-            *open_target = Some(entry.path.clone());
+            *open_targets = Some(vec![entry.path.clone()]);
         }
     } else if resp.clicked() {
         *select_name = Some(entry.name.clone());
@@ -6669,7 +6920,7 @@ fn handle_entry_response(
     select_name: &mut Option<String>,
     select_index: &mut Option<usize>,
     nav_target: &mut Option<PathBuf>,
-    open_target: &mut Option<PathBuf>,
+    open_targets: &mut Option<Vec<PathBuf>>,
     index: usize,
 ) {
     register_entry_click(
@@ -6678,7 +6929,7 @@ fn handle_entry_response(
         select_name,
         select_index,
         nav_target,
-        open_target,
+        open_targets,
         index,
     );
     if resp.secondary_clicked() && !is_selected {
@@ -7361,6 +7612,10 @@ fn help_content(ui: &mut egui::Ui) {
     w(
         ui,
         "Tabs — each pane supports multiple tabs. Open a new tab with + Tab, or close one with the x on hover. Pinned tabs resist accidental navigation.",
+    );
+    w(
+        ui,
+        "🕒 Recent — the first toolbar button. Shows recently opened files and folders; click one to jump straight there, or Clear Recent to wipe the list.",
     );
 
     help_heading(ui, "View Modes");
