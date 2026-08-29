@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.11 (2026-08-29)
+
+- Performance: cached drive list at startup (was querying every frame), debounced session persist to 500ms coalescing, moved context-menu path construction inside menu closures, replaced per-frame SQL `is_favourite` lookup with in-memory set, eliminated `to_vec()` deep-clone of cached listings per frame, resolved file icons lazily per drawn row instead of bulk pre-resolving, added `show_rows` virtual scrolling to the List view, applied egui style block only when font size changes, eliminated `to_lowercase()` allocations in sort comparisons, cheaper sidebar tree nodes (pass `&Path` directly as id salt, take/put-back of child vecs), and enabled LTO for the release profile.
+
 ## v0.1.10 (2026-08-29)
 
 - New "🕒 Recent" toolbar button: a dropdown of recently opened files and folders (per user, capped at 50), click an entry to jump straight there, or Clear Recent to wipe the list.
