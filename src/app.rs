@@ -1236,7 +1236,7 @@ impl FileManApp {
             egui::RichText::new(label)
         };
         let mut header =
-            egui::CollapsingHeader::new(header_text).id_salt(format!("tree_{}", dir.display()));
+            egui::CollapsingHeader::new(header_text)            .id_salt(dir);
         if force_expand && is_ancestor {
             header = header.open(Some(true));
         } else if self.tree_collapse_frames > 0 && !is_ancestor {
@@ -1246,10 +1246,13 @@ impl FileManApp {
             header = header.open(Some(false));
         }
         let response = header.show(ui, |ui| {
-            if let Some(subdirs) = self.tree_subdirs_cache.get(dir).cloned() {
-                for subdir in subdirs {
-                    self.show_dir_node(ui, &subdir, None, active_path, force_expand);
+            // Take the vec out of the cache, iterate, then put it back — avoids
+            // cloning every child `Vec<PathBuf>` per frame.
+            if let Some(subdirs) = self.tree_subdirs_cache.remove(dir) {
+                for subdir in &subdirs {
+                    self.show_dir_node(ui, subdir, None, active_path, force_expand);
                 }
+                self.tree_subdirs_cache.insert(dir.to_path_buf(), subdirs);
                 return;
             }
             // Not cached yet: poll (or start) a background `list_subdirs`
@@ -1273,11 +1276,11 @@ impl FileManApp {
             }
             if let Some(subdirs) = resolved {
                 self.tree_subdirs_jobs.remove(dir);
-                self.tree_subdirs_cache
-                    .insert(dir.to_path_buf(), subdirs.clone());
-                for subdir in subdirs {
-                    self.show_dir_node(ui, &subdir, None, active_path, force_expand);
+                for subdir in &subdirs {
+                    self.show_dir_node(ui, subdir, None, active_path, force_expand);
                 }
+                self.tree_subdirs_cache
+                    .insert(dir.to_path_buf(), subdirs);
             } else {
                 ui.horizontal(|ui| {
                     ui.add_space(18.0);
