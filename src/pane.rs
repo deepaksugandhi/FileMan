@@ -29,6 +29,16 @@ impl Pane {
         &mut self.tabs[self.active_tab]
     }
 
+    /// Switches the active tab index and marks the newly activated tab as
+    /// needing a fresh listing, so external file-system changes that arrived
+    /// while the tab was in the background become visible immediately.
+    pub fn set_active_tab(&mut self, idx: usize) {
+        if idx != self.active_tab && idx < self.tabs.len() {
+            self.tabs[idx].listing_dirty = true;
+        }
+        self.active_tab = idx;
+    }
+
     pub fn open_tab(&mut self, path: PathBuf) {
         self.tabs.push(Tab::new(path));
         self.active_tab = self.tabs.len() - 1;

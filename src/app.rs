@@ -1875,7 +1875,7 @@ impl FileManApp {
         self.active_pane = pane;
         if let Some(tab_idx) = tab {
             if self.panes[pane].active_tab != tab_idx {
-                self.panes[pane].active_tab = tab_idx;
+                self.panes[pane].set_active_tab(tab_idx);
                 self.dirty = true;
             }
         }
@@ -3386,7 +3386,7 @@ impl FileManApp {
                     tab.listing_dirty = true;
                     self.panes[1 - pane_idx].tabs.push(tab);
                     let new_idx = self.panes[1 - pane_idx].tabs.len() - 1;
-                    self.panes[1 - pane_idx].active_tab = new_idx;
+                    self.panes[1 - pane_idx].set_active_tab(new_idx);
                     self.active_pane = 1 - pane_idx;
                     self.dirty = true;
                     self.dialog = None;
@@ -3457,7 +3457,7 @@ impl FileManApp {
         {
             let pane = &mut self.panes[pane_idx];
             if let Some(idx) = result.clicked {
-                pane.active_tab = idx;
+                pane.set_active_tab(idx);
             }
             if let Some(idx) = result.closed {
                 if pane.tabs[idx].locked {
@@ -3501,6 +3501,11 @@ impl FileManApp {
         let mut context_menu = None;
         let mut menu_pos: Option<egui::Pos2> = None;
         let mut hover: Option<(usize, usize)> = None;
+        // Drives the tab-strip search highlight: the pane's own active-tab
+        // filter text, matched against every tab's folder path and (possibly
+        // renamed) label, so switching to an already-open match is one click
+        // away instead of retyping the path from scratch.
+        let query = self.panes[pane_idx].active_tab().filter.to_lowercase();
         match self.tab_orientation {
             TabOrientation::Horizontal => {
                 let mut tab_rects: Vec<((usize, usize), egui::Rect, bool)> = Vec::new();
@@ -3514,6 +3519,9 @@ impl FileManApp {
                     for (tab_idx, tab) in pane.tabs.iter().enumerate() {
                         let label = tab.display_label();
                         let is_tab_active = tab_idx == pane.active_tab;
+                        let search_match = !query.is_empty()
+                            && (label.to_lowercase().contains(&query)
+                                || tab.path.to_string_lossy().to_lowercase().contains(&query));
                         let ev = tab_strip_item(
                             ui,
                             &label,
@@ -3526,6 +3534,7 @@ impl FileManApp {
                             drag_highlight == Some(tab_idx),
                             None,
                             &tab.path,
+                            search_match,
                         );
                         tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
                         clicked = clicked.or(ev.clicked.then_some(tab_idx));
@@ -3602,6 +3611,9 @@ impl FileManApp {
                             > text_w;
                         let row_h = if needs_two_lines { double_h } else { single_h };
                         let is_tab_active = tab_idx == pane.active_tab;
+                        let search_match = !query.is_empty()
+                            && (label.to_lowercase().contains(&query)
+                                || tab.path.to_string_lossy().to_lowercase().contains(&query));
                         let ev = tab_strip_item(
                             ui,
                             &label,
@@ -3614,6 +3626,7 @@ impl FileManApp {
                             drag_highlight == Some(tab_idx),
                             Some(egui::vec2(row_w, row_h)),
                             &tab.path,
+                            search_match,
                         );
                         tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
                         clicked = clicked.or(ev.clicked.then_some(tab_idx));
@@ -3989,6 +4002,17 @@ impl FileManApp {
                     .text_color(ui.visuals().strong_text_color());
             }
             let search_resp = ui.add(text_edit);
+            // egui's own focus system already surrenders focus on Escape
+            // *before* any app code runs this frame (Memory::begin_pass), so
+            // by the time we get here the widget already reads as
+            // unfocused — `ctx.memory`'s focus state can't tell us Escape
+            // was the reason. `lost_focus()` combined with the Escape key
+            // still being down this frame is egui's own idiom for detecting
+            // exactly that case.
+            if search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                tab.filter.clear();
+                ctx.request_repaint();
+            }
             if filter_active {
                 let rect = search_resp.rect.expand(1.0);
                 ui.painter().rect_stroke(
@@ -4000,6 +4024,7 @@ impl FileManApp {
             }
             if search_resp.changed() {
                 tab.clear_selection();
+                ctx.request_repaint();
             }
             if filter_active {
                 if ui
@@ -4010,6 +4035,7 @@ impl FileManApp {
                     .clicked()
                 {
                     tab.filter.clear();
+                    ctx.request_repaint();
                 }
             }
         });
@@ -4631,7 +4657,7 @@ impl FileManApp {
                         new_tab.sort_asc = def_asc;
                         let insert_at = pane.active_tab + 1;
                         pane.tabs.insert(insert_at, new_tab);
-                        pane.active_tab = insert_at;
+                        pane.set_active_tab(insert_at);
                         self.active_pane = pane_idx;
                         self.dirty = true;
                         deferred_recent.push((target, true));
@@ -5050,29 +5076,51 @@ impl eframe::App for FileManApp {
                     || id == egui::Id::new("file_launch_filter")
             })
         });
-        // '*' jumps straight to the filter box, wherever focus currently is
-        // (but not while already typing in some other text field, where '*'
-        // should just be typed normally).
-        if self.dialog.is_none() && self.capturing_shortcut_for.is_none() && !text_focused {
-            // Consume (not just read) the '*' event: this runs before the
+        // Type-to-search: any printed character typed while no dialog or the
+        // Settings window is open and no text field has focus goes straight
+        // into the active tab's filter box, Explorer-style — the user no
+        // longer has to click into the filter box first. '*' used to be a
+        // special case that jumped to the (empty) filter box; it's now just
+        // one more character.
+        if self.dialog.is_none()
+            && self.capturing_shortcut_for.is_none()
+            && !self.show_settings
+            && !text_focused
+        {
+            // Consume (not just read) the text events: this runs before the
             // filter box is drawn this frame, and requesting focus takes
-            // effect immediately — if the event were left in the queue, the
-            // now-focused TextEdit would see it later this same frame and
-            // insert a literal '*'.
-            let star_pressed = ctx.input_mut(|i| {
-                let before = i.events.len();
-                i.events
-                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == "*"));
-                i.events.len() != before
+            // effect immediately — if the events were left in the queue, the
+            // now-focused TextEdit would see them later this same frame and
+            // insert the characters a second time.
+            let typed = ctx.input_mut(|i| {
+                let text: String = i
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+                text
             });
-            if star_pressed {
+            if !typed.is_empty() {
+                self.panes[self.active_pane]
+                    .active_tab_mut()
+                    .filter
+                    .push_str(&typed);
                 ctx.memory_mut(|m| {
                     m.request_focus(egui::Id::new(("filter_input", self.active_pane)))
                 });
+                ctx.request_repaint();
             }
         }
 
-        if self.dialog.is_none() && self.capturing_shortcut_for.is_none() && !text_focused {
+        if self.dialog.is_none()
+            && self.capturing_shortcut_for.is_none()
+            && !self.show_settings
+            && !text_focused
+        {
             let triggered = ctx.input(|i| {
                 self.shortcut_map
                     .iter()
@@ -7128,6 +7176,7 @@ fn tab_strip_item(
     is_being_dragged: bool,
     size: Option<egui::Vec2>,
     path: &std::path::Path,
+    search_match: bool,
 ) -> TabItemEvents {
     // Both orientations use fully custom surfaces with click+drag sensing:
     // horizontal rows hug their label like the old selectable_label did, and
@@ -7174,16 +7223,27 @@ fn tab_strip_item(
         }
     };
     let rect = tab_resp.rect;
+    // A tab whose folder path or (possibly renamed) label matches the
+    // pane's current filter text wears a distinct amber wash instead of its
+    // usual fill, so the user can spot an already-open match while typing a
+    // search instead of only narrowing the active tab's own listing.
+    let search_highlight = search_match.then(|| {
+        if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(97, 78, 8)
+        } else {
+            egui::Color32::from_rgb(255, 240, 168)
+        }
+    });
     // Explorer/Windows-11 tab treatment: the active tab is a raised card
     // (lighter surface, top-rounded, connected to the content below) with a
     // thin orange accent strip on the active pane; inactive tabs are a faint
     // wash so they read as tabs without heavy boxes.
     if is_tab_active {
-        let fill = if is_active_pane {
+        let fill = search_highlight.unwrap_or(if is_active_pane {
             ui.visuals().window_fill()
         } else {
             ui.visuals().extreme_bg_color
-        };
+        });
         ui.painter().rect_filled(
             rect,
             egui::CornerRadius {
@@ -7233,7 +7293,13 @@ fn tab_strip_item(
         // mode, near-white in dark) instead of relying on the washed-out
         // widget text underneath.
         let dark = ui.visuals().dark_mode;
-        let (fill, hovered_fill, text) = if dark {
+        let (fill, hovered_fill, text) = if let Some(h) = search_highlight {
+            (h, h.gamma_multiply(1.15), if dark {
+                egui::Color32::from_rgb(240, 240, 240)
+            } else {
+                egui::Color32::BLACK
+            })
+        } else if dark {
             (
                 egui::Color32::from_rgb(56, 56, 56),
                 egui::Color32::from_rgb(68, 68, 68),

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.12 (2026-09-01)
+
+- The file listing now auto-filters as you type, Explorer-style — no need to click into the filter box first. Typed characters jump straight into the active tab's filter and give it focus.
+- Tabs in the same pane whose folder path or (possibly renamed) label match the current filter text are highlighted with a distinct amber fill, so an already-open match is one click away.
+- Fixed Esc not clearing the filter box's text (it only exited focus before).
+- Switching to a background tab now marks it dirty so it re-lists immediately, picking up any external changes made while it wasn't active.
+
 ## v0.1.11 (2026-08-29)
 
 - Performance: cached drive list at startup (was querying every frame), debounced session persist to 500ms coalescing, moved context-menu path construction inside menu closures, replaced per-frame SQL `is_favourite` lookup with in-memory set, eliminated `to_vec()` deep-clone of cached listings per frame, resolved file icons lazily per drawn row instead of bulk pre-resolving, added `show_rows` virtual scrolling to the List view, applied egui style block only when font size changes, eliminated `to_lowercase()` allocations in sort comparisons, cheaper sidebar tree nodes (pass `&Path` directly as id salt, take/put-back of child vecs), and enabled LTO for the release profile.
