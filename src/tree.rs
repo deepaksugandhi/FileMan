@@ -12,6 +12,162 @@ pub fn list_drives() -> Vec<PathBuf> {
         .collect()
 }
 
+/// What kind of storage a drive root is, per `GetDriveTypeW` — distinguishes
+/// removable media (USB sticks, SD cards, external drives without a fixed
+/// interface) from fixed disks so the sidebar can group them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveKind {
+    Removable,
+    Fixed,
+    Network,
+    CdRom,
+    Other,
+}
+
+/// Classifies a drive root (e.g. `E:\`) via `GetDriveTypeW`.
+pub fn drive_kind(path: &Path) -> DriveKind {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+        use windows::core::PCWSTR;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        return match unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) } {
+            2 => DriveKind::Removable,
+            3 => DriveKind::Fixed,
+            4 => DriveKind::Network,
+            5 => DriveKind::CdRom,
+            _ => DriveKind::Other,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        DriveKind::Other
+    }
+}
+
+/// The volume label for a drive root (e.g. "Data"), via
+/// `GetVolumeInformationW`. `None` if the drive has no label or can't be
+/// read (e.g. an empty card reader slot).
+pub fn volume_label(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+        use windows::core::PCWSTR;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut name_buf = [0u16; 128];
+        let ok = unsafe {
+            GetVolumeInformationW(
+                PCWSTR(wide.as_ptr()),
+                Some(&mut name_buf),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if ok.is_ok() {
+            let len = name_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            let label = String::from_utf16_lossy(&name_buf[..len]);
+            if !label.is_empty() {
+                return Some(label);
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Attempts to safely eject a removable drive: lock the volume, dismount it,
+/// then eject the physical media — the same sequence Explorer's "Eject"
+/// menu item performs. Returns a human-readable error on failure (most
+/// commonly because a file on the drive is still open somewhere).
+pub fn eject_drive(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows::Win32::System::Ioctl::{
+            FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, IOCTL_STORAGE_EJECT_MEDIA,
+        };
+        use windows::Win32::System::IO::DeviceIoControl;
+        use windows::core::PCWSTR;
+
+        // Volume handles use `\\.\E:` (no trailing backslash), not the
+        // `E:\` root path used everywhere else in this app.
+        let drive_letter = path
+            .to_string_lossy()
+            .chars()
+            .next()
+            .ok_or_else(|| "Not a drive".to_string())?;
+        let wide: Vec<u16> = format!("\\\\.\\{drive_letter}:")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let handle = CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            .map_err(|_| "Couldn't open the drive".to_string())?;
+
+            let lock_ok =
+                DeviceIoControl(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0, None, None).is_ok();
+            if !lock_ok {
+                let _ = CloseHandle(handle);
+                return Err(
+                    "Drive is busy — close any open files on it and try again".to_string()
+                );
+            }
+            let _ = DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, None, None);
+            let eject_ok = DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_EJECT_MEDIA,
+                None,
+                0,
+                None,
+                0,
+                None,
+                None,
+            )
+            .is_ok();
+            let _ = CloseHandle(handle);
+            if eject_ok {
+                Ok(())
+            } else {
+                Err("Dismounted — it's safe to unplug now".to_string())
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("Eject is only supported on Windows".to_string())
+    }
+}
+
 /// The user's shell-known folders (Desktop, Documents, Downloads, …) as
 /// `(label, path)` pairs, resolved through `SHGetKnownFolderPath` so
 /// redirected folders (OneDrive, custom locations) resolve to where they

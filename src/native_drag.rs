@@ -62,6 +62,9 @@ pub struct PendingDrop {
     pub pane: usize,
     /// `Some` when the drop landed precisely on a tab header.
     pub tab: Option<usize>,
+    /// `Some` when the drop landed on a folder entry — the file should be
+    /// moved/copied *into* that folder rather than the pane's current dir.
+    pub into_folder: Option<PathBuf>,
     /// MOVE vs COPY. Only ever true for a self-drop (Shift held); an
     /// external drop always copies — the source isn't ours to move from.
     pub is_move: bool,
@@ -77,6 +80,9 @@ pub struct DndSharedState {
     pub pixels_per_point: f32,
     pub pane_rects: [Option<(f32, f32, f32, f32)>; 2],
     pub tab_rects: Vec<((usize, usize), (f32, f32, f32, f32))>,
+    /// Folder-entry rects within pane bodies, `(pane, rect, path)`. Checked
+    /// before pane rects so a drop *on* a folder lands inside it.
+    pub folder_rects: Vec<(usize, (f32, f32, f32, f32), PathBuf)>,
     /// True while a row-drag started by `app.rs` is in flight, so `Drop`
     /// knows whether Shift means MOVE (internal move) or to force COPY (an
     /// external drop always copies).
@@ -296,6 +302,34 @@ mod imp {
                     if x >= *l && x <= *r && y >= *t && y <= *b {
                         return Some((pane, None));
                     }
+                }
+            }
+            None
+        }
+
+        /// Returns the folder path if `pt` is over a folder entry, else
+        /// `None`. Called from `Drop` after `hit_test` succeeds so the
+        /// dropped item lands *inside* the hovered folder.
+        fn hit_test_folder(
+            &self,
+            pt: &windows::Win32::Foundation::POINTL,
+        ) -> Option<PathBuf> {
+            let mut p = POINT { x: pt.x, y: pt.y };
+            unsafe {
+                let _ = ScreenToClient(self.hwnd, &mut p);
+            }
+            let st = self.state.lock().unwrap();
+            if st.pixels_per_point <= 0.0 {
+                return None;
+            }
+            let (x, y) = (
+                p.x as f32 / st.pixels_per_point,
+                p.y as f32 / st.pixels_per_point,
+            );
+            for &(pane, (l, t, r, b), ref path) in &st.folder_rects {
+                let _ = pane; // already filtered by pane from hit_test
+                if x >= l && x <= r && y >= t && y <= b {
+                    return Some(path.clone());
                 }
             }
             None
@@ -540,10 +574,12 @@ mod imp {
             }
             let own_drag = self.state.lock().unwrap().own_drag;
             let is_move = own_drag && (grfkeystate & MK_SHIFT) != MODIFIERKEYS_FLAGS(0);
+            let into_folder = self.hit_test_folder(pt);
             self.state.lock().unwrap().pending_drop = Some(PendingDrop {
                 paths,
                 pane,
                 tab,
+                into_folder,
                 is_move,
             });
             unsafe {
