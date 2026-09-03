@@ -23,7 +23,7 @@ const TIPS: &[&str] = &[
     "Use F3 to copy full file path & F4 to copy folder path.",
     "Delete sends the selection to the Recycle Bin, so slips of the mouse are always recoverable.",
     "Create a unique profile for each user/scenario. Click dropdown besides Settings button.",
-    "Press Ctrl+F to search a folder tree recursively, press * & then narrow the hits with the name and folder filters.",
+    "Press Ctrl+F to search a folder tree recursively, or just press * to jump straight into the filter box and narrow the list by name.",
 	"Rename tabs for easy identification. They appear witha green dot.",
     "Right-click any tab to duplicate or close it — handy for comparing two folders side by side.",
     "Drag the divider between the two panes to give either side more room.",
@@ -40,6 +40,7 @@ const TIPS: &[&str] = &[
     "Just created a folder? It's already selected — press Enter to jump straight in.",
     "Click 🕒 Recent on the toolbar to jump back to files and folders you've opened recently.",
     "Select several files, then use the \"Windows Explorer\" right-click submenu — commands like combining PDFs see your whole selection, not just the file you clicked.",
+    "Click a tab in the other pane to switch focus — you don't need to click on a file row first.",
 ];
 
 /// What the user did with the card during the last [`TipsCard::draw`].

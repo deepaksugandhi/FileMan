@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.13 (2026-09-03)
+
+- Pressing `*` anywhere activates the filter input — the asterisk is no longer inserted into the filter text, it just gives the filter box focus so you can start typing immediately.
+- Clicking a tab in the opposite pane now switches focus to that pane (previously only clicking on a file row switched panes).
+- Paste conflict dialog gains an edit-name mode: click "Save as Copy" to rename the incoming file before confirming.
+
 ## v0.1.12 (2026-09-01)
 
 - The file listing now auto-filters as you type, Explorer-style — no need to click into the filter box first. Typed characters jump straight into the active tab's filter and give it focus.
