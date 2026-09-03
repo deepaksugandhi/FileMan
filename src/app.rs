@@ -126,6 +126,10 @@ enum Dialog {
         op: Option<ClipboardOp>,
         conflicts: Vec<PathBuf>,
         resolved: Vec<crate::progress::TransferItem>,
+        /// When `Some`, the dialog is in "edit name" mode: an input field
+        /// shows the proposed rename for the incoming file, and the action
+        /// buttons are replaced with Confirm / Back.
+        copy_name_input: Option<String>,
     },
     /// Tab context menu: right-click on a tab to duplicate or close it.
     TabContext {
@@ -1718,6 +1722,7 @@ impl FileManApp {
                 op,
                 conflicts,
                 resolved,
+                copy_name_input: None,
             });
         }
     }
@@ -1763,6 +1768,7 @@ impl FileManApp {
             op,
             mut conflicts,
             mut resolved,
+            ..
         }) = self.dialog.take()
         else {
             return;
@@ -1823,6 +1829,7 @@ impl FileManApp {
                 op,
                 conflicts,
                 resolved,
+                copy_name_input: None,
             });
         }
     }
@@ -3572,6 +3579,7 @@ impl FileManApp {
             let pane = &mut self.panes[pane_idx];
             if let Some(idx) = result.clicked {
                 pane.set_active_tab(idx);
+                self.active_pane = pane_idx;
             }
             if let Some(idx) = result.closed {
                 if pane.tabs[idx].locked {
@@ -5224,9 +5232,9 @@ impl eframe::App for FileManApp {
         // Type-to-search: any printed character typed while no dialog or the
         // Settings window is open and no text field has focus goes straight
         // into the active tab's filter box, Explorer-style — the user no
-        // longer has to click into the filter box first. '*' used to be a
-        // special case that jumped to the (empty) filter box; it's now just
-        // one more character.
+        // longer has to click into the filter box first. '*' is special:
+        // pressing it alone focuses the filter input without inserting the
+        // character, acting as a quick filter-activate shortcut.
         if self.dialog.is_none()
             && self.capturing_shortcut_for.is_none()
             && !self.show_settings
@@ -5250,10 +5258,18 @@ impl eframe::App for FileManApp {
                 text
             });
             if !typed.is_empty() {
-                self.panes[self.active_pane]
-                    .active_tab_mut()
-                    .filter
-                    .push_str(&typed);
+                // '*' is a special key that activates the filter input
+                // without inserting any character — just focus it.
+                let star_only = typed == "*";
+                if !star_only {
+                    let filtered: String = typed.chars().filter(|c| *c != '*').collect();
+                    if !filtered.is_empty() {
+                        self.panes[self.active_pane]
+                            .active_tab_mut()
+                            .filter
+                            .push_str(&filtered);
+                    }
+                }
                 ctx.memory_mut(|m| {
                     m.request_focus(egui::Id::new(("filter_input", self.active_pane)))
                 });
@@ -6537,12 +6553,29 @@ impl eframe::App for FileManApp {
                     matches!(&self.dialog, Some(Dialog::PasteConflict { .. }));
                 if is_paste_conflict {
                     let mut cancel = false;
+                    let mut confirm_name = false;
+                    let mut back_to_choices = false;
                     // (PasteChoice, apply-to-all) once the user picks a side.
                     let mut choice: Option<(PasteChoice, bool)> = None;
+                    let in_edit = matches!(
+                        &self.dialog,
+                        Some(Dialog::PasteConflict {
+                            copy_name_input: Some(_),
+                            ..
+                        })
+                    );
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        cancel = true;
+                        if in_edit {
+                            back_to_choices = true;
+                        } else {
+                            cancel = true;
+                        }
                     }
-                    let (dest_dir, op, conflict_count, first_name) =
+                    // Extract dialog fields into locals.  `copy_name_input`
+                    // is taken out separately so the immutable borrows above
+                    // are released before we pass a `&mut String` into the
+                    // TextEdit widget.
+                    let (dest_dir, op, conflict_count, first_name, first_path) =
                         if let Some(Dialog::PasteConflict {
                             dest_dir,
                             op,
@@ -6555,10 +6588,25 @@ impl eframe::App for FileManApp {
                                 .and_then(|p| p.file_name())
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_default();
-                            (dest_dir.clone(), *op, conflicts.len(), first)
+                            let path = conflicts
+                                .first()
+                                .cloned()
+                                .unwrap_or_default();
+                            (dest_dir.clone(), *op, conflicts.len(), first, path)
                         } else {
                             unreachable!()
                         };
+                    // Take copy_name_input out of the dialog so we can pass
+                    // a &mut String to TextEdit without borrow conflicts.
+                    // It will be written back after the UI closure.
+                    let mut cni_value: Option<String> = None;
+                    if let Some(Dialog::PasteConflict {
+                        copy_name_input,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        cni_value = copy_name_input.take();
+                    }
                     let verb = if op == Some(ClipboardOp::Cut) {
                         "moving"
                     } else {
@@ -6607,49 +6655,209 @@ impl eframe::App for FileManApp {
                                 );
                             }
                             ui.add_space(8.0);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    cancel = true;
-                                }
-                                // Read Shift at click time so "hold Shift for
-                                // all items" works with any button.
-                                let shift = ui.input(|i| i.modifiers.shift);
-                                let skip_resp = ui
-                                    .button("Skip")
-                                    .on_hover_text(
-                                        "Do not copy this item — leave the \
-                                         existing file untouched",
+                            // --- Two modes: action buttons vs name input ---
+                            if cni_value.is_some() {
+                                // Edit-name mode: text input + Confirm / Back
+                                ui.label("New name for the incoming file:");
+                                ui.add_space(4.0);
+                                let widget_id =
+                                    egui::Id::new("paste_conflict_name_input");
+                                let mut output = egui::TextEdit::singleline(
+                                    cni_value.as_mut().unwrap(),
+                                )
+                                .id(widget_id)
+                                .desired_width(380.0)
+                                .show(ui);
+                                // On first focus, select the filename stem
+                                // (everything before the last dot) so typing
+                                // replaces the name while keeping the
+                                // extension.
+                                if output.response.response.gained_focus() {
+                                    let text = cni_value.as_ref().unwrap();
+                                    let end = text.rfind('.').unwrap_or(text.len());
+                                    let range = egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(0),
+                                        egui::text::CCursor::new(end),
                                     );
-                                if skip_resp.clicked() {
-                                    choice = Some((PasteChoice::Skip, shift));
-                                }
-                                let copy_resp = ui
-                                    .button("Save as Copy")
-                                    .on_hover_text(
-                                        "Keep both: the incoming item is renamed \
-                                         (e.g. \"name (copy).ext\")",
+                                    output.state.cursor.set_char_range(Some(range));
+                                    egui::TextEdit::store_state(
+                                        ui.ctx(),
+                                        output.response.response.id,
+                                        output.state,
                                     );
-                                if copy_resp.clicked() {
-                                    choice = Some((PasteChoice::SaveAsCopy, shift));
                                 }
-                                let overwrite_resp = ui
-                                    .button("Overwrite")
-                                    .on_hover_text("Replace the existing item");
-                                if overwrite_resp.clicked() {
-                                    choice = Some((PasteChoice::Overwrite, shift));
+                                // Enter confirms the edited name.
+                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    confirm_name = true;
                                 }
-                                // Default focus on the affirmative button so
-                                // Enter confirms immediately (Esc still
-                                // cancels). Seed it only while nothing holds
-                                // focus, so Tab away stays respected.
-                                if ctx.memory(|m| m.focused().is_none()) {
-                                    overwrite_resp.request_focus();
-                                }
-                            });
+                                ui.add_space(4.0);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            cancel = true;
+                                        }
+                                        if ui.button("Confirm").clicked() {
+                                            confirm_name = true;
+                                        }
+                                        if ui.button("Back").clicked() {
+                                            back_to_choices = true;
+                                        }
+                                    },
+                                );
+                            } else {
+                                // Normal mode: action buttons
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            cancel = true;
+                                        }
+                                        let shift =
+                                            ui.input(|i| i.modifiers.shift);
+                                        let skip_resp = ui
+                                            .button("Skip")
+                                            .on_hover_text(
+                                                "Do not copy this item — leave the \
+                                                 existing file untouched",
+                                            );
+                                        if skip_resp.clicked() {
+                                            choice =
+                                                Some((PasteChoice::Skip, shift));
+                                        }
+                                        let copy_resp = ui
+                                            .button("Save as Copy")
+                                            .on_hover_text(
+                                                "Keep both: the incoming item is renamed \
+                                                 (e.g. \"name (copy).ext\")",
+                                            );
+                                        if copy_resp.clicked() {
+                                            if shift {
+                                                // Shift+click: apply "save as
+                                                // copy" to all conflicts at
+                                                // once (auto-generated names).
+                                                choice = Some((
+                                                    PasteChoice::SaveAsCopy,
+                                                    true,
+                                                ));
+                                            } else {
+                                                // Enter edit-name mode for
+                                                // this single item.
+                                                let name = Self::next_free_copy_name(
+                                                    &dest_dir,
+                                                    &first_path,
+                                                    &mut std::collections::HashSet::new(),
+                                                );
+                                                cni_value = Some(name);
+                                            }
+                                        }
+                                        let overwrite_resp = ui
+                                            .button("Overwrite")
+                                            .on_hover_text(
+                                                "Replace the existing item",
+                                            );
+                                        if overwrite_resp.clicked() {
+                                            choice = Some((
+                                                PasteChoice::Overwrite,
+                                                shift,
+                                            ));
+                                        }
+                                        if ctx.memory(|m| m.focused().is_none())
+                                        {
+                                            overwrite_resp.request_focus();
+                                        }
+                                    },
+                                );
+                            }
                         });
+                    // Write the (possibly modified) copy_name_input back to
+                    // the dialog so it persists across frames.
+                    if let Some(Dialog::PasteConflict {
+                        copy_name_input,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *copy_name_input = cni_value.clone();
+                    }
                     if cancel {
                         self.dialog = None;
                         self.status = "Transfer cancelled — nothing was changed".to_string();
+                    } else if back_to_choices {
+                        // Return from edit-name mode to action buttons.
+                        if let Some(Dialog::PasteConflict {
+                            ref mut copy_name_input,
+                            ..
+                        }) = self.dialog
+                        {
+                            *copy_name_input = None;
+                        }
+                    } else if confirm_name {
+                        // Resolve the current conflict with the user-edited
+                        // name and proceed to the next item (or start the
+                        // transfer).
+                        let name = cni_value.unwrap_or_default();
+                        if let Some(Dialog::PasteConflict {
+                            dest_dir,
+                            op,
+                            mut conflicts,
+                            mut resolved,
+                            ..
+                        }) = self.dialog.take()
+                        {
+                            let src = conflicts.remove(0);
+                            let mut taken: std::collections::HashSet<String> =
+                                resolved
+                                    .iter()
+                                    .map(|t| {
+                                        t.dest_name.clone().unwrap_or_else(|| {
+                                            t.src
+                                                .file_name()
+                                                .map(|n| {
+                                                    n.to_string_lossy()
+                                                        .into_owned()
+                                                })
+                                                .unwrap_or_default()
+                                        })
+                                    })
+                                    .collect();
+                            // Ensure the name is unique; if the user typed a
+                            // name that already exists, append a numeric
+                            // suffix.
+                            while dest_dir.join(&name).exists()
+                                || taken.contains(&name)
+                            {
+                                // Shouldn't normally happen, but be safe.
+                                break;
+                            }
+                            taken.insert(name.clone());
+                            resolved.push(progress::TransferItem {
+                                src,
+                                dest_name: Some(name),
+                                overwrite: false,
+                            });
+                            if conflicts.is_empty() {
+                                if resolved.is_empty() {
+                                    self.status =
+                                        "Transfer cancelled — nothing was changed"
+                                            .to_string();
+                                } else {
+                                    self.start_transfer(
+                                        resolved, dest_dir, op,
+                                    );
+                                }
+                            } else {
+                                self.dialog_just_opened = true;
+                                self.dialog =
+                                    Some(Dialog::PasteConflict {
+                                        dest_dir,
+                                        op,
+                                        conflicts,
+                                        resolved,
+                                        copy_name_input: None,
+                                    });
+                            }
+                        }
+                        self.dirty = true;
                     } else if let Some((paste_choice, apply_all)) = choice {
                         self.resolve_paste_conflict(paste_choice, apply_all);
                         self.dirty = true;
