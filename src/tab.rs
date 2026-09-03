@@ -10,6 +10,24 @@ pub enum ViewMode {
     Icons,
 }
 
+/// Distinguishes a normal folder-browsing tab from a pinned file-link tab.
+/// File-link tabs display the file's parent folder but open the file itself
+/// when activated (double-click / Enter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    /// Regular directory tab — shows folder contents.
+    Folder,
+    /// Pinned file shortcut — parent folder is listed, but activating the
+    /// tab opens the target file with its default application.
+    File,
+}
+
+impl Default for TabKind {
+    fn default() -> Self {
+        TabKind::Folder
+    }
+}
+
 impl ViewMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -31,6 +49,10 @@ impl ViewMode {
 #[derive(Debug, Clone)]
 pub struct Tab {
     pub path: PathBuf,
+    /// For `TabKind::File` this holds the full path to the target file;
+    /// for `TabKind::Folder` it is `None`.
+    pub file_target: Option<PathBuf>,
+    pub kind: TabKind,
     history_back: Vec<PathBuf>,
     history_forward: Vec<PathBuf>,
     pub sort_col: String,
@@ -76,6 +98,8 @@ impl Tab {
     pub fn new(path: PathBuf) -> Self {
         Tab {
             path,
+            file_target: None,
+            kind: TabKind::Folder,
             history_back: Vec::new(),
             history_forward: Vec::new(),
             sort_col: "name".to_string(),
@@ -92,6 +116,24 @@ impl Tab {
             locked: false,
             custom_name: None,
         }
+    }
+
+    /// Creates a file-link tab: `path` is set to the file's parent directory
+    /// so the listing still works, and `file_target` records the actual file.
+    pub fn new_file(file_path: PathBuf) -> Self {
+        let parent = file_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("C:\\"));
+        let file_name = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut tab = Tab::new(parent);
+        tab.kind = TabKind::File;
+        tab.file_target = Some(file_path);
+        tab.custom_name = Some(file_name);
+        tab
     }
 
     /// The filtered+sorted view for `filter`/`sort_col`/`sort_asc`, recomputed
@@ -118,13 +160,22 @@ impl Tab {
     }
 
     /// The tab's display label: the custom name if one was set, otherwise
-    /// the current folder's name.
+    /// the current folder's name (for folder tabs) or the file name (for
+    /// file-link tabs).
     pub fn display_label(&self) -> String {
         self.custom_name.clone().unwrap_or_else(|| {
-            self.path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.path.display().to_string())
+            if self.kind == TabKind::File {
+                self.file_target
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.path.display().to_string())
+            } else {
+                self.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.path.display().to_string())
+            }
         })
     }
 

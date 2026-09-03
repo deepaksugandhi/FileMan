@@ -5,6 +5,9 @@
 - Pressing `*` anywhere activates the filter input — the asterisk is no longer inserted into the filter text, it just gives the filter box focus so you can start typing immediately.
 - Clicking a tab in the opposite pane now switches focus to that pane (previously only clicking on a file row switched panes).
 - Paste conflict dialog gains an edit-name mode: click "Save as Copy" to rename the incoming file before confirming.
+- Bulk Rename: select two or more files, right-click, and choose "Bulk Rename..." — two modes: **Find & Replace** (replace specific characters with another character or blank) and **Edit Names** (scrollable list of input boxes to rename each file individually).
+- Fixed a terminal/console window briefly flashing when launching files or apps through FileMan (cmd.exe, openwith.exe, custom actions, app/file launchers now use `CREATE_NO_WINDOW`).
+- **File-link tabs**: right-click any file and choose "Pin as Tab" to pin a quick-launch file link alongside your folder tabs. File tabs show a 📄 icon and open the file when clicked. Right-click a file tab and choose "Pin Tab" to lock it and prevent accidental removal. File tabs persist across sessions.
 
 ## v0.1.12 (2026-09-01)
 

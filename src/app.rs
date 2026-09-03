@@ -10,6 +10,7 @@ use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -180,6 +181,28 @@ enum Dialog {
         asc: bool,
         pane_idx: usize,
     },
+    /// Bulk rename: rename multiple selected files at once. Two modes:
+    /// find-and-replace text, or edit each name individually in a list.
+    BulkRename {
+        entries: Vec<BulkRenameEntry>,
+        mode: BulkRenameMode,
+        find_text: String,
+        replace_text: String,
+    },
+}
+
+/// Which tab is active in the BulkRename dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkRenameMode {
+    FindReplace,
+    ListEdit,
+}
+
+/// One row in the bulk-rename list: the original name and the proposed new name.
+#[derive(Debug, Clone)]
+struct BulkRenameEntry {
+    original: String,
+    new_name: String,
 }
 
 pub struct FileManApp {
@@ -414,6 +437,9 @@ pub struct FileManApp {
     universal_sort_col: String,
     /// Direction of `universal_sort_col`; `true` is ascending.
     universal_sort_asc: bool,
+    /// Set for one frame after type-to-filter gives the filter input focus,
+    /// so the cursor is placed at the *end* of the text (not the start).
+    filter_focus_pending: bool,
 }
 
 /// Resolves the raw HWND of the app window. `None` on non-Windows or if the
@@ -832,6 +858,7 @@ impl FileManApp {
             pending_native_drag: None,
             universal_sort_col,
             universal_sort_asc,
+            filter_focus_pending: false,
         }
     }
 
@@ -985,11 +1012,15 @@ impl FileManApp {
             .and_then(|ext| crate::actions::get_ext_override(&self.conn, self.current_user_id, ext));
         match ext {
             Some(exe) => {
-                let _ = std::process::Command::new(exe).arg(path).spawn();
+                let _ = std::process::Command::new(exe)
+                    .arg(path)
+                    .creation_flags(0x08000000)
+                    .spawn();
             }
             None => {
                 let _ = std::process::Command::new("cmd")
                     .args(["/C", "start", "", &path.to_string_lossy()])
+                    .creation_flags(0x08000000)
                     .spawn();
             }
         }
@@ -1005,6 +1036,19 @@ impl FileManApp {
         tab.sort_col = col;
         tab.sort_asc = asc;
         self.record_recent(&path, path.is_dir());
+    }
+
+    /// Opens a file-link tab: lists the file's parent folder but marks the
+    /// tab so that activating it (double-click / Enter) opens the file.
+    fn open_file_tab(&mut self, pane_idx: usize, file_path: PathBuf) {
+        let (col, asc) = (self.universal_sort_col.clone(), self.universal_sort_asc);
+        let pane = &mut self.panes[pane_idx];
+        let mut tab = crate::tab::Tab::new_file(file_path.clone());
+        tab.sort_col = col;
+        tab.sort_asc = asc;
+        pane.tabs.push(tab);
+        pane.active_tab = pane.tabs.len() - 1;
+        self.record_recent(&file_path, false);
     }
 
     /// Applies `col`/`asc` to every open tab in both panes and stores them as
@@ -1144,7 +1188,14 @@ impl FileManApp {
                 Action::Cut => self.cut_selection(ctx),
                 Action::Paste => self.paste_clipboard(),
                 Action::Delete => self.delete_selection(),
-                Action::Rename => self.begin_rename(),
+                Action::Rename => {
+                    let count = self.panes[self.active_pane].active_tab().selected.len();
+                    if count >= 2 {
+                        self.begin_bulk_rename();
+                    } else {
+                        self.begin_rename();
+                    }
+                }
                 Action::NewFolder => {
                     self.dialog_just_opened = true; self.dialog = Some(Dialog::NewFolder {
                         name: String::new(),
@@ -1226,9 +1277,10 @@ impl FileManApp {
                 if let Some(custom) = self.custom_actions.iter().find(|c| c.id == id) {
                     let paths = self.selected_paths();
                     if !paths.is_empty() {
-                        let mut cmd = std::process::Command::new(&custom.exe_path);
-                        cmd.args(&paths);
-                        let _ = cmd.spawn();
+                        let _ = std::process::Command::new(&custom.exe_path)
+                            .args(&paths)
+                            .creation_flags(0x08000000)
+                            .spawn();
                     }
                 }
             }
@@ -2114,6 +2166,31 @@ impl FileManApp {
         });
     }
 
+    /// Opens the bulk-rename dialog for all selected files.
+    fn begin_bulk_rename(&mut self) {
+        let tab = self.panes[self.active_pane].active_tab();
+        if tab.selected.len() < 2 {
+            self.status = "Select two or more items to bulk-rename".into();
+            return;
+        }
+        let mut entries: Vec<BulkRenameEntry> = tab
+            .selected
+            .iter()
+            .map(|name| BulkRenameEntry {
+                original: name.clone(),
+                new_name: name.clone(),
+            })
+            .collect();
+        entries.sort_by(|a, b| a.original.cmp(&b.original));
+        self.dialog_just_opened = true;
+        self.dialog = Some(Dialog::BulkRename {
+            entries,
+            mode: BulkRenameMode::FindReplace,
+            find_text: String::new(),
+            replace_text: String::new(),
+        });
+    }
+
     /// Extracts the selected archive into the current directory.
     fn extract_here(&mut self) {
         let paths = self.selected_paths();
@@ -2257,11 +2334,35 @@ impl FileManApp {
             | Dialog::ConfirmDelete { .. }
             | Dialog::PasteConflict { .. }
             | Dialog::ApplySort { .. } => Ok(String::new()),
+            Dialog::BulkRename { entries, .. } => {
+                let mut renamed = 0;
+                let mut errors = Vec::new();
+                for entry in entries {
+                    if entry.original == entry.new_name {
+                        continue;
+                    }
+                    let src = parent.join(&entry.original);
+                    match fs_ops::rename_item(&src, &entry.new_name) {
+                        Ok(_) => renamed += 1,
+                        Err(err) => errors.push(format!("{}: {err}", entry.original)),
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(format!("Renamed {renamed} file(s)"))
+                } else {
+                    Err(format!(
+                        "Renamed {renamed}/{}; {}",
+                        entries.len(),
+                        errors.join("; ")
+                    ))
+                }
+            }
         };
         if result.is_ok() {
             dirty_dir = match &dialog {
                 Dialog::Rename { path, .. } => path.parent().map(|p| p.to_path_buf()),
                 Dialog::NewFolder { .. } | Dialog::NewFile { .. } => Some(parent.clone()),
+                Dialog::BulkRename { .. } => Some(parent.clone()),
                 Dialog::TabContext { .. }
                 | Dialog::Find { .. }
                 | Dialog::NewUser { .. }
@@ -3485,6 +3586,16 @@ impl FileManApp {
                 win = win.fixed_pos(pos);
             }
             win.show(&ctx, |ui| {
+                // For file-link tabs, offer a direct "Open File" action.
+                if self.panes[pane_idx].tabs[tab_idx].kind == crate::tab::TabKind::File {
+                    if let Some(target) = &self.panes[pane_idx].tabs[tab_idx].file_target {
+                        let target = target.clone();
+                        if ui.button("\u{1F4C4} Open File").clicked() {
+                            self.open_path(&target);
+                            self.dialog = None;
+                        }
+                    }
+                }
                 if ui.button("Duplicate Tab").clicked() {
                     self.open_tab_with_default_sort(pane_idx, path.clone());
                     self.dirty = true;
@@ -3575,6 +3686,16 @@ impl FileManApp {
                 tab_idx: idx,
             });
         }
+        // Extract file-tab info before the mutable borrow of `pane`.
+        let file_tab_to_open: Option<PathBuf> = result.clicked.and_then(|idx| {
+            let pane = &self.panes[pane_idx];
+            let tab = &pane.tabs[idx];
+            if tab.kind == crate::tab::TabKind::File {
+                tab.file_target.clone()
+            } else {
+                None
+            }
+        });
         {
             let pane = &mut self.panes[pane_idx];
             if let Some(idx) = result.clicked {
@@ -3595,6 +3716,10 @@ impl FileManApp {
                 self.open_tab_with_default_sort(pane_idx, current_path);
                 self.dirty = true;
             }
+        }
+        // File-link tabs open the target file when clicked.
+        if let Some(path) = file_tab_to_open {
+            self.open_path(&path);
         }
 
         match result.content_rect {
@@ -3639,7 +3764,10 @@ impl FileManApp {
                 ui.horizontal(|ui| {
                     let pane = &mut self.panes[pane_idx];
                     for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-                        let label = tab.display_label();
+                        let mut label = tab.display_label();
+                        if tab.kind == crate::tab::TabKind::File {
+                            label = format!("\u{1F4C4} {label}");
+                        }
                         let is_tab_active = tab_idx == pane.active_tab;
                         let search_match = !query.is_empty()
                             && (label.to_lowercase().contains(&query)
@@ -3720,7 +3848,10 @@ impl FileManApp {
                     let double_h = single_h.max(self.font_size * 2.0 + 10.0);
                     let text_w = (row_w - 6.0 - 20.0).max(1.0);
                     for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-                        let label = tab.display_label();
+                        let mut label = tab.display_label();
+                        if tab.kind == crate::tab::TabKind::File {
+                            label = format!("\u{1F4C4} {label}");
+                        }
                         let needs_two_lines = ui
                             .painter()
                             .layout_no_wrap(
@@ -4123,7 +4254,22 @@ impl FileManApp {
                     .background_color(accent.gamma_multiply(0.18))
                     .text_color(ui.visuals().strong_text_color());
             }
-            let search_resp = ui.add(text_edit);
+            let mut output = text_edit.show(ui);
+            // When type-to-filter just gave this input focus, place the
+            // cursor at the end so the next character appends instead of
+            // prepending.
+            if self.filter_focus_pending && output.response.has_focus() {
+                let end = egui::text::CCursor::new(tab.filter.len());
+                output.state.cursor.set_char_range(Some(
+                    egui::text::CCursorRange::one(end),
+                ));
+                egui::TextEdit::store_state(
+                    ui.ctx(),
+                    output.response.id,
+                    output.state,
+                );
+                self.filter_focus_pending = false;
+            }
             // egui's own focus system already surrenders focus on Escape
             // *before* any app code runs this frame (Memory::begin_pass), so
             // by the time we get here the widget already reads as
@@ -4131,12 +4277,12 @@ impl FileManApp {
             // was the reason. `lost_focus()` combined with the Escape key
             // still being down this frame is egui's own idiom for detecting
             // exactly that case.
-            if search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if output.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 tab.filter.clear();
                 ctx.request_repaint();
             }
             if filter_active {
-                let rect = search_resp.rect.expand(1.0);
+                let rect = output.response.rect.expand(1.0);
                 ui.painter().rect_stroke(
                     rect,
                     egui::CornerRadius::same(3),
@@ -4144,7 +4290,7 @@ impl FileManApp {
                     egui::StrokeKind::Outside,
                 );
             }
-            if search_resp.changed() {
+            if output.response.changed() {
                 tab.clear_selection();
                 ctx.request_repaint();
             }
@@ -4826,6 +4972,7 @@ impl FileManApp {
                         RowAction::Cut => self.cut_selection(ctx),
                         RowAction::Paste => self.paste_clipboard(),
                         RowAction::Rename => self.begin_rename(),
+                        RowAction::BulkRename => self.begin_bulk_rename(),
                         RowAction::Delete => self.delete_selection(),
                         RowAction::NewFolder => {
                             self.dialog_just_opened = true; self.dialog = Some(Dialog::NewFolder {
@@ -4870,6 +5017,7 @@ impl FileManApp {
                             // shows the chooser.
                             let _ = std::process::Command::new("openwith.exe")
                                 .arg(&path)
+                                .creation_flags(0x08000000)
                                 .spawn();
                         }
                         RowAction::OpenInExplorer(path) => {
@@ -4882,6 +5030,16 @@ impl FileManApp {
                             #[cfg(windows)]
                             if let Some(hwnd) = self.hwnd {
                                 crate::shell_menu::invoke(hwnd, &paths, id);
+                            }
+                        }
+                        RowAction::PinAsTab => {
+                            // Pin the selected file as a file-link tab in the active pane.
+                            let pane = &self.panes[self.active_pane];
+                            if let Some(sel) = pane.active_tab().selected.iter().next() {
+                                let file_path = pane.active_tab().path.join(sel);
+                                self.open_file_tab(self.active_pane, file_path.clone());
+                                self.status =
+                                    format!("Pinned as tab: {}", file_path.display());
                             }
                         }
                 }
@@ -5273,6 +5431,7 @@ impl eframe::App for FileManApp {
                 ctx.memory_mut(|m| {
                     m.request_focus(egui::Id::new(("filter_input", self.active_pane)))
                 });
+                self.filter_focus_pending = true;
                 ctx.request_repaint();
             }
         }
@@ -5638,51 +5797,16 @@ impl eframe::App for FileManApp {
                     {
                         self.show_settings = true;
                     }
-
-                    let current_name = self
-                        .users
-                        .iter()
-                        .find(|u| u.id == self.current_user_id)
-                        .map(|u| u.name.clone())
-                        .unwrap_or_else(|| "User".to_string());
-                    let mut switch_to: Option<i64> = None;
-                    let mut open_new_user = false;
-                    egui::ComboBox::from_id_salt("user_combo")
-                        .selected_text(format!("👤 {current_name}"))
-                        .show_ui(ui, |ui| {
-                            for user in &self.users {
-                                if ui
-                                    .selectable_label(user.id == self.current_user_id, &user.name)
-                                    .clicked()
-                                {
-                                    switch_to = Some(user.id);
-                                }
-                            }
-                            ui.separator();
-                            if ui.button("New User…").clicked() {
-                                open_new_user = true;
-                            }
-                        });
-                    if let Some(id) = switch_to {
-                        self.switch_user(id);
-                    }
-                    if open_new_user {
-                        self.dialog_just_opened = true; self.dialog = Some(Dialog::NewUser { name: String::new() });
-                    }
                 });
             });
 
-            // Second toolbar line: app launcher search + pinned launch
-            // buttons, file launch shortcuts, and custom "open with" action buttons.
+            // Second toolbar line: user profile selector (right-aligned),
+            // app launcher search, file launch shortcuts, and custom actions.
             let has_launcher = !self.launcher_apps.is_empty();
             let has_file_launch = !self.file_launches.is_empty();
             let has_custom = !self.custom_actions.is_empty();
-            if has_launcher || has_file_launch || has_custom {
-                ui.add_space(2.0);
-                // `horizontal` already center-aligns cross-axis (unlike
-                // `with_layout`, which would claim the panel's full
-                // remaining height for this row instead of just one line).
-                ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
                     // Search filter for launcher apps (left side).
                     let mut launch_app: Option<i64> = None;
                     if has_launcher {
@@ -5764,6 +5888,7 @@ impl eframe::App for FileManApp {
                             let label = app.label.clone();
                             let _ = std::process::Command::new(&exe)
                                 .args(args.split_whitespace())
+                                .creation_flags(0x08000000)
                                 .spawn();
                             self.status = format!("Launched {label}");
                             self.launcher_filter.clear();
@@ -5844,6 +5969,7 @@ impl eframe::App for FileManApp {
                             let label = fl.label.clone();
                             let _ = std::process::Command::new("cmd")
                                 .args(["/C", "start", "", &file])
+                                .creation_flags(0x08000000)
                                 .spawn();
                             self.status = format!("Opened {label}");
                             self.file_launch_filter.clear();
@@ -5876,8 +6002,47 @@ impl eframe::App for FileManApp {
                     if let Some(id) = launch_custom {
                         self.dispatch(&ctx, ActionRef::Custom(id));
                     }
+
+                    // User profile selector — right-aligned on the second
+                    // toolbar row so it never overlaps action buttons.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let current_name = self
+                            .users
+                            .iter()
+                            .find(|u| u.id == self.current_user_id)
+                            .map(|u| u.name.clone())
+                            .unwrap_or_else(|| "User".to_string());
+                        let mut switch_to: Option<i64> = None;
+                        let mut open_new_user = false;
+                        egui::ComboBox::from_id_salt("user_combo")
+                            .selected_text(format!("\u{1F464} {current_name}"))
+                            .show_ui(ui, |ui| {
+                                for user in &self.users {
+                                    if ui
+                                        .selectable_label(
+                                            user.id == self.current_user_id,
+                                            &user.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        switch_to = Some(user.id);
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("New User\u{2026}").clicked() {
+                                    open_new_user = true;
+                                }
+                            });
+                        if let Some(id) = switch_to {
+                            self.switch_user(id);
+                        }
+                        if open_new_user {
+                            self.dialog_just_opened = true;
+                            self.dialog =
+                                Some(Dialog::NewUser { name: String::new() });
+                        }
+                    });
                 });
-            }
 
             // Office-style settings dialog (nav rail + content pages).
             self.show_settings_window(&ctx);
@@ -6863,6 +7028,232 @@ impl eframe::App for FileManApp {
                         self.dirty = true;
                     }
                 }
+                // ── Bulk Rename dialog ──────────────────────────────────
+                let is_bulk_rename =
+                    matches!(&self.dialog, Some(Dialog::BulkRename { .. }));
+                if is_bulk_rename {
+                    let mut cancel = false;
+                    let mut apply = false;
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                    // Take mode/find/replace out of the dialog so we can
+                    // pass &mut references into TextEdit / ScrollArea
+                    // without borrow conflicts.
+                    let (
+                        mut entries,
+                        mut mode,
+                        mut find_text,
+                        mut replace_text,
+                    ) = if let Some(Dialog::BulkRename {
+                        entries,
+                        mode,
+                        find_text,
+                        replace_text,
+                    }) = self.dialog.take()
+                    {
+                        (entries, mode, find_text, replace_text)
+                    } else {
+                        unreachable!()
+                    };
+                    let entry_count = entries.len();
+                    egui::Window::new("Bulk Rename")
+                        .id(egui::Id::new("bulk_rename_window"))
+                        .title_bar(true)
+                        .resizable(true)
+                        .collapsible(false)
+                        .default_size(egui::vec2(520.0, 420.0))
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(&ctx, |ui| {
+                            // ── Mode tabs ─────────────────────────────
+                            ui.horizontal(|ui| {
+                                let find_btn = ui.selectable_label(
+                                    mode == BulkRenameMode::FindReplace,
+                                    "Find & Replace",
+                                );
+                                if find_btn.clicked() {
+                                    mode = BulkRenameMode::FindReplace;
+                                }
+                                let list_btn = ui.selectable_label(
+                                    mode == BulkRenameMode::ListEdit,
+                                    "Edit Names",
+                                );
+                                if list_btn.clicked() {
+                                    mode = BulkRenameMode::ListEdit;
+                                }
+                            });
+                            ui.separator();
+                            // ── Find & Replace mode ───────────────────
+                            if mode == BulkRenameMode::FindReplace {
+                                ui.horizontal(|ui| {
+                                    ui.label("Find:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut find_text)
+                                            .id(egui::Id::new("bulk_find"))
+                                            .desired_width(180.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Replace:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut replace_text)
+                                            .id(egui::Id::new("bulk_replace"))
+                                            .desired_width(180.0),
+                                    );
+                                });
+                                ui.add_space(4.0);
+                                // Preview
+                                if !find_text.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Preview:")
+                                            .strong()
+                                            .small(),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("bulk_find_preview")
+                                        .max_height(200.0)
+                                        .show(ui, |ui| {
+                                            let mut any_match = false;
+                                            for entry in &mut entries {
+                                                if entry.original.contains(&find_text) {
+                                                    any_match = true;
+                                                    entry.new_name = entry
+                                                        .original
+                                                        .replace(&find_text, &replace_text);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                &entry.original,
+                                                            )
+                                                            .strikethrough()
+                                                            .weak(),
+                                                        );
+                                                        ui.label("\u{2192}");
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                &entry.new_name,
+                                                            )
+                                                            .strong(),
+                                                        );
+                                                    });
+                                                }
+                                            }
+                                            if !any_match {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "No files match the search text.",
+                                                    )
+                                                    .weak()
+                                                    .italics(),
+                                                );
+                                            }
+                                        });
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Type text above to find and replace \
+                                             across all selected file names.",
+                                        )
+                                        .weak()
+                                        .italics(),
+                                    );
+                                }
+                            }
+                            // ── Edit Names mode ───────────────────────
+                            if mode == BulkRenameMode::ListEdit {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("bulk_edit_scroll")
+                                    .max_height(340.0)
+                                    .show(ui, |ui| {
+                                        for (i, entry) in entries.iter_mut().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        &entry.original,
+                                                    )
+                                                    .weak(),
+                                                );
+                                                ui.label("\u{2192}");
+                                                let _resp = ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut entry.new_name,
+                                                    )
+                                                    .id(egui::Id::new((
+                                                        "bulk_edit_row",
+                                                        i,
+                                                    )))
+                                                    .desired_width(200.0),
+                                                );
+                                                // Mark visually when the
+                                                // name differs from original.
+                                                if entry.new_name
+                                                    != entry.original
+                                                {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "\u{2713}",
+                                                        )
+                                                        .color(
+                                                            egui::Color32::from_rgb(
+                                                                80, 180, 80,
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                            ui.add_space(6.0);
+                            // ── Action buttons ────────────────────────
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        cancel = true;
+                                    }
+                                    let apply_resp = ui.button("Apply");
+                                    if apply_resp.clicked() {
+                                        apply = true;
+                                    }
+                                    let count = entries
+                                        .iter()
+                                        .filter(|e| e.original != e.new_name)
+                                        .count();
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{count}/{entry_count} will be renamed"
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                    if ctx.memory(|m| m.focused().is_none()) {
+                                        apply_resp.request_focus();
+                                    }
+                                },
+                            );
+                        });
+                    if cancel {
+                        self.dialog = None;
+                    } else if apply {
+                        // Write entries back, then commit.
+                        self.dialog = Some(Dialog::BulkRename {
+                            entries,
+                            mode,
+                            find_text,
+                            replace_text,
+                        });
+                        self.commit_dialog();
+                    } else {
+                        // Put the (possibly modified) state back.
+                        self.dialog = Some(Dialog::BulkRename {
+                            entries,
+                            mode,
+                            find_text,
+                            replace_text,
+                        });
+                    }
+                }
                 let is_find = matches!(&self.dialog, Some(Dialog::Find { .. }));
                 if self.dialog.is_some()
                     && !find_close
@@ -6871,6 +7262,7 @@ impl eframe::App for FileManApp {
                     && !is_confirm_delete
                     && !is_paste_conflict
                     && !is_apply_sort
+                    && !is_bulk_rename
                 {
                     let mut commit = false;
                     let mut cancel = false;
@@ -6884,7 +7276,7 @@ impl eframe::App for FileManApp {
                             Dialog::RenameTab { name, .. } => ("Rename Tab", name),
                             Dialog::Find { .. } | Dialog::TabContext { .. } | Dialog::Help
                             | Dialog::ConfirmDelete { .. } | Dialog::PasteConflict { .. }
-                            | Dialog::ApplySort { .. } => {
+                            | Dialog::ApplySort { .. } | Dialog::BulkRename { .. } => {
                                 unreachable!()
                             }
                         };
@@ -7489,6 +7881,8 @@ enum RowAction {
     OpenInExplorer(PathBuf),
     Properties(PathBuf),
     ShellCommand { id: u32, paths: Vec<PathBuf> },
+    BulkRename,
+    PinAsTab,
 }
 
 /// Deferred action requested from a Find-results row. Applied after the
@@ -8060,9 +8454,21 @@ fn show_entry_context_menu(
         *row_action = Some(RowAction::Rename);
         ui.close();
     }
+    if selection_paths.len() > 1 {
+        if ui.button("Bulk Rename...").clicked() {
+            *row_action = Some(RowAction::BulkRename);
+            ui.close();
+        }
+    }
     if ui.button("Delete").clicked() {
         *row_action = Some(RowAction::Delete);
         ui.close();
+    }
+    if !is_dir {
+        if ui.button("\u{1F4CC} Pin as Tab").clicked() {
+            *row_action = Some(RowAction::PinAsTab);
+            ui.close();
+        }
     }
     ui.separator();
     if ui.button("New Folder").clicked() {

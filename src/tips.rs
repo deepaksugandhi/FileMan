@@ -41,6 +41,8 @@ const TIPS: &[&str] = &[
     "Click 🕒 Recent on the toolbar to jump back to files and folders you've opened recently.",
     "Select several files, then use the \"Windows Explorer\" right-click submenu — commands like combining PDFs see your whole selection, not just the file you clicked.",
     "Click a tab in the other pane to switch focus — you don't need to click on a file row first.",
+    "Select two or more files, right-click, and choose \"Bulk Rename...\" to find-and-replace text or edit each name individually.",
+    "Right-click a file and choose \"Pin as Tab\" to pin quick-launch file links alongside your folder tabs — they show a 📄 icon and open the file when clicked. Pin (lock) a file tab to prevent accidental removal.",
 ];
 
 /// What the user did with the card during the last [`TipsCard::draw`].

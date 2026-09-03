@@ -83,9 +83,13 @@ pub fn save_session(
     tx.execute("DELETE FROM panes WHERE user_id = ?1", params![user_id])?;
     for (pane_idx, pane) in panes.iter().enumerate() {
         for (tab_idx, tab) in pane.tabs.iter().enumerate() {
+            let tab_kind = match tab.kind {
+                crate::tab::TabKind::Folder => "folder",
+                crate::tab::TabKind::File => "file",
+            };
             tx.execute(
-                "INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO panes (user_id, pane_index, tab_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name, tab_kind, file_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     user_id,
                     pane_idx as i64,
@@ -98,6 +102,8 @@ pub fn save_session(
                     tab.view_mode.as_str(),
                     tab.locked as i64,
                     tab.custom_name,
+                    tab_kind,
+                    tab.file_target.as_ref().map(|p| p.to_string_lossy().to_string()),
                 ],
             )?;
         }
@@ -131,7 +137,7 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         .ok();
 
     let mut stmt = conn.prepare(
-        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name
+        "SELECT pane_index, path, is_active_tab, sort_col, sort_asc, col_widths, view_mode, locked, custom_name, tab_kind, file_target
          FROM panes WHERE user_id = ?1 ORDER BY pane_index, tab_index",
     )?;
     let rows: Vec<(
@@ -143,6 +149,8 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         String,
         String,
         i64,
+        Option<String>,
+        String,
         Option<String>,
     )> = stmt
         .query_map(params![user_id], |row| {
@@ -156,6 +164,8 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
                 row.get(6)?,
                 row.get(7)?,
                 row.get(8)?,
+                row.get::<_, String>(9).unwrap_or_else(|_| "folder".to_string()),
+                row.get(10)?,
             ))
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -177,6 +187,8 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
         view_mode,
         locked,
         custom_name,
+        tab_kind,
+        file_target,
     ) in rows
     {
         let pane_idx = pane_idx as usize;
@@ -187,7 +199,14 @@ pub fn load_session(conn: &Connection, user_id: i64) -> Result<Option<LoadedSess
             address_edit_mode: false,
         });
         let resolved_path = nearest_existing_ancestor(&PathBuf::from(path));
-        let mut tab = Tab::new(resolved_path);
+        let mut tab = if tab_kind == "file" {
+            let target = file_target
+                .map(PathBuf::from)
+                .unwrap_or_else(|| resolved_path.clone());
+            crate::tab::Tab::new_file(target)
+        } else {
+            Tab::new(resolved_path)
+        };
         tab.sort_col = sort_col;
         tab.sort_asc = sort_asc;
         tab.col_widths = parse_col_widths(&col_widths);

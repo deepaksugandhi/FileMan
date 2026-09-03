@@ -103,6 +103,20 @@ fn migrate_to_multi_user(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Adds `tab_kind` and `file_target` columns to the `panes` table for
+/// file-link tabs.  Idempotent via `has_column`.
+fn migrate_add_tab_kind(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "panes", "tab_kind") {
+        conn.execute_batch(
+            "
+            ALTER TABLE panes ADD COLUMN tab_kind TEXT NOT NULL DEFAULT 'folder';
+            ALTER TABLE panes ADD COLUMN file_target TEXT;
+            ",
+        )?;
+    }
+    Ok(())
+}
+
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -189,6 +203,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         );",
     )?;
     migrate_to_multi_user(conn)?;
+    migrate_add_tab_kind(conn)?;
     let user_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
     if user_count == 0 {
         conn.execute(
