@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.15 (2026-10-04)
+
+- Memory: idle private commit down ~66% and resident memory ~50% in release measurements (see docs/RAM-IMPLEMENTATION.md).
+- Directory listings keep a single owned copy with cached filter/sort indices; inactive tabs release their rows and reload when activated.
+- Icons view is virtualized (only visible rows are rendered); file-icon and tree-listing caches are now bounded LRUs.
+- Find streams results with cancellation, a bounded channel and a 10,000-result cap; it no longer follows symlinks/reparse points.
+- Native shell context-menu handlers load only when the Explorer submenu opens; virtual-file drops stream through a 64 KiB buffer.
+- GPU allocator uses the memory-usage hint.
+
 ## v0.1.14 (2026-09-03)
 
 - Bulk Rename: select two or more files, right-click, and choose "Bulk Rename..." — two modes: **Find & Replace** (replace specific characters with another character or blank) and **Edit Names** (scrollable list of input boxes to rename each file individually).
