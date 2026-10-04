@@ -31,25 +31,29 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let metadata = entry.metadata()?;
-        #[cfg(windows)]
-        let attrs = metadata.file_attributes();
-        #[cfg(not(windows))]
-        let attrs = 0u32;
-        entries.push(FsEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            path: entry.path(),
-            is_dir: metadata.is_dir(),
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
-            archive: attrs & FILE_ATTRIBUTE_ARCHIVE != 0,
-            readonly: attrs & FILE_ATTRIBUTE_READONLY != 0,
-            hidden: attrs & FILE_ATTRIBUTE_HIDDEN != 0,
-            system: attrs & FILE_ATTRIBUTE_SYSTEM != 0,
-        });
+        entries.push(read_entry(entry)?);
     }
     sort_entries(&mut entries, "name", true);
     Ok(entries)
+}
+
+pub fn read_entry(entry: fs::DirEntry) -> io::Result<FsEntry> {
+    let metadata = entry.metadata()?;
+    #[cfg(windows)]
+    let attrs = metadata.file_attributes();
+    #[cfg(not(windows))]
+    let attrs = 0u32;
+    Ok(FsEntry {
+        name: entry.file_name().to_string_lossy().into_owned(),
+        path: entry.path(),
+        is_dir: metadata.is_dir(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        archive: attrs & FILE_ATTRIBUTE_ARCHIVE != 0,
+        readonly: attrs & FILE_ATTRIBUTE_READONLY != 0,
+        hidden: attrs & FILE_ATTRIBUTE_HIDDEN != 0,
+        system: attrs & FILE_ATTRIBUTE_SYSTEM != 0,
+    })
 }
 
 /// Case-insensitive string comparison without allocating.
@@ -64,23 +68,25 @@ fn name_ci(a: &str, b: &str) -> std::cmp::Ordering {
 /// sort column. Files follow the user's chosen sort column.
 /// Recognized columns: "name", "modified", "size", "archive".
 pub fn sort_entries(entries: &mut [FsEntry], sort_col: &str, asc: bool) {
-    entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| {
-            if a.is_dir {
-                // Dirs always sorted alphabetically, always ascending.
-                name_ci(&a.name, &b.name)
-            } else {
-                // Files sorted by the requested column.
-                let ord = match sort_col {
-                    "modified" => a.modified.cmp(&b.modified),
-                    "size" => a.size.cmp(&b.size),
-                    "archive" => a.archive.cmp(&b.archive),
-                    _ => name_ci(&a.name, &b.name),
-                };
-                if asc { ord } else { ord.reverse() }
-            }
-        })
-    });
+    entries.sort_by(|a, b| compare_entries(a, b, sort_col, asc));
+}
+
+pub fn compare_entries(a: &FsEntry, b: &FsEntry, sort_col: &str, asc: bool) -> std::cmp::Ordering {
+    b.is_dir.cmp(&a.is_dir).then_with(|| {
+        if a.is_dir {
+            // Dirs always sorted alphabetically, always ascending.
+            name_ci(&a.name, &b.name)
+        } else {
+            // Files sorted by the requested column.
+            let ord = match sort_col {
+                "modified" => a.modified.cmp(&b.modified),
+                "size" => a.size.cmp(&b.size),
+                "archive" => a.archive.cmp(&b.archive),
+                _ => name_ci(&a.name, &b.name),
+            };
+            if asc { ord } else { ord.reverse() }
+        }
+    })
 }
 
 /// Lists only the immediate subdirectories of `dir`, sorted by name.

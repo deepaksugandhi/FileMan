@@ -8,8 +8,8 @@
 
 #[cfg(windows)]
 const OVERRIDE_KEYS: [&str; 2] = [
-    r"Software\Classes\Directory\shell\open",
-    r"Software\Classes\Folder\shell\open",
+    r"Software\Classes\Directory\shell\open\command",
+    r"Software\Classes\Folder\shell\open\command",
 ];
 
 /// Is this FileMan executable currently written into the per-user override?

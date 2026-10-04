@@ -68,19 +68,19 @@ pub struct Tab {
     pub filter: String,
     /// Cached directory listing, refreshed on a background thread. Not
     /// persisted — reloaded via `listing_dirty` on session restore.
-    pub listing: Vec<FsEntry>,
+    pub listing: std::sync::Arc<Vec<FsEntry>>,
     /// True when `listing` is stale (fresh tab, navigation, or an external
     /// mutation) and needs to be reloaded via a background listing job.
     pub listing_dirty: bool,
     /// Bumped every time `listing` is replaced with a fresh background-job
     /// result. Lets the UI cache the filtered+sorted view (which involves an
-    /// O(n log n) sort with per-comparison allocations) and only redo that
+    /// O(n log n) sort) and only redo that
     /// work when the listing, filter, or sort actually changed — not on
     /// every repaint (blinking cursor, hover, toast fade, ...).
     pub listing_version: u64,
-    /// The last computed (filter, sort_col, sort_asc, listing_version) view,
-    /// so unchanged frames can reuse it instead of re-filtering/re-sorting.
-    pub display_cache: Option<((u64, String, String, bool), Vec<FsEntry>)>,
+    /// Filtered/sorted indices into `listing`; filenames and paths are owned
+    /// once, and unchanged frames reuse the order without filtering/sorting.
+    pub display_cache: Option<((u64, String, String, bool), Vec<usize>)>,
     /// Set when the last background listing job for this tab's path failed
     /// (e.g. permission denied). Cleared on the next successful listing.
     pub listing_error: Option<String>,
@@ -108,7 +108,7 @@ impl Tab {
             selected: HashSet::new(),
             col_widths: DEFAULT_COL_WIDTHS,
             filter: String::new(),
-            listing: Vec::new(),
+            listing: Default::default(),
             listing_dirty: true,
             listing_error: None,
             listing_version: 0,
@@ -139,7 +139,7 @@ impl Tab {
     /// The filtered+sorted view for `filter`/`sort_col`/`sort_asc`, recomputed
     /// only when the cache key (those three plus `listing_version`) changed
     /// since the last call.
-    pub fn display_entries(&mut self, filter: &str, sort_col: &str, sort_asc: bool) -> &[FsEntry] {
+    pub fn display_entries(&mut self, filter: &str, sort_col: &str, sort_asc: bool) -> &[usize] {
         let key = (
             self.listing_version,
             filter.to_string(),
@@ -151,12 +151,31 @@ impl Tab {
             None => true,
         };
         if stale {
-            let mut entries = self.listing.clone();
-            crate::search::filter_entries(&mut entries, filter);
-            crate::fs_entry::sort_entries(&mut entries, sort_col, sort_asc);
+            let query = filter.to_lowercase();
+            let mut entries: Vec<usize> = (0..self.listing.len())
+                .filter(|&i| {
+                    query.is_empty() || self.listing[i].name.to_lowercase().contains(&query)
+                })
+                .collect();
+            entries.sort_by(|&a, &b| {
+                crate::fs_entry::compare_entries(
+                    &self.listing[a],
+                    &self.listing[b],
+                    sort_col,
+                    sort_asc,
+                )
+            });
             self.display_cache = Some((key, entries));
         }
         &self.display_cache.as_ref().unwrap().1
+    }
+
+    /// Keep navigation and selection state, but release directory payloads.
+    pub fn release_listing(&mut self) {
+        self.listing = Default::default();
+        self.display_cache = None;
+        self.listing_error = None;
+        self.listing_dirty = true;
     }
 
     /// The tab's display label: the custom name if one was set, otherwise
@@ -196,7 +215,7 @@ impl Tab {
         self.path = new_path;
         self.clear_selection();
         self.filter.clear();
-        self.listing_dirty = true;
+        self.release_listing();
     }
 
     pub fn go_back(&mut self) -> bool {
@@ -208,7 +227,7 @@ impl Tab {
             self.path = prev;
             self.clear_selection();
             self.filter.clear();
-            self.listing_dirty = true;
+            self.release_listing();
             true
         } else {
             false
@@ -224,7 +243,7 @@ impl Tab {
             self.path = next;
             self.clear_selection();
             self.filter.clear();
-            self.listing_dirty = true;
+            self.release_listing();
             true
         } else {
             false
@@ -265,6 +284,26 @@ impl Tab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_indices_filter_sort_and_release_without_copying_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("B.txt"), b"bb").unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::create_dir(dir.path().join("Folder")).unwrap();
+        let mut tab = Tab::new(dir.path().into());
+        tab.listing = std::sync::Arc::new(crate::fs_entry::list_dir(dir.path()).unwrap());
+        let original = tab.listing.as_ptr();
+        assert_eq!(tab.display_entries("", "size", false), &[0, 2, 1]);
+        assert_eq!(tab.display_entries("TXT", "name", true), &[1, 2]);
+        assert_eq!(tab.display_entries("folder", "name", true), &[0]);
+        assert!(tab.display_entries("absent", "name", true).is_empty());
+        assert_eq!(tab.listing.as_ptr(), original);
+        tab.select_only("B.txt");
+        tab.release_listing();
+        assert!(tab.listing.is_empty() && tab.display_cache.is_none() && tab.listing_dirty);
+        assert!(tab.selected.contains("B.txt"));
+    }
 
     #[test]
     fn navigate_to_updates_path_and_records_history() {

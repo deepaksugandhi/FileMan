@@ -310,10 +310,7 @@ mod imp {
         /// Returns the folder path if `pt` is over a folder entry, else
         /// `None`. Called from `Drop` after `hit_test` succeeds so the
         /// dropped item lands *inside* the hovered folder.
-        fn hit_test_folder(
-            &self,
-            pt: &windows::Win32::Foundation::POINTL,
-        ) -> Option<PathBuf> {
+        fn hit_test_folder(&self, pt: &windows::Win32::Foundation::POINTL) -> Option<PathBuf> {
             let mut p = POINT { x: pt.x, y: pt.y };
             unsafe {
                 let _ = ScreenToClient(self.hwnd, &mut p);
@@ -401,16 +398,31 @@ mod imp {
                     ReleaseStgMedium(&mut medium);
                     return Vec::new();
                 }
+                let medium_size = GlobalSize(hglobal);
+                let header_size = std::mem::offset_of!(FILEGROUPDESCRIPTORW, fgd);
+                if medium_size < header_size {
+                    let _ = GlobalUnlock(hglobal);
+                    ReleaseStgMedium(&mut medium);
+                    return Vec::new();
+                }
                 let count = (*ptr).cItems;
+                if count as usize
+                    > (medium_size - header_size) / std::mem::size_of::<FILEDESCRIPTORW>()
+                {
+                    let _ = GlobalUnlock(hglobal);
+                    ReleaseStgMedium(&mut medium);
+                    return Vec::new();
+                }
                 let fgd_ptr = std::ptr::addr_of!((*ptr).fgd) as *const FILEDESCRIPTORW;
                 let names: Vec<String> = (0..count)
                     .map(|i| {
                         // Packed struct: copy the fixed-size name buffer out
                         // to a local before indexing, since a reference into
                         // the packed field would be unaligned (UB).
-                        let name_ptr = std::ptr::addr_of!((*fgd_ptr.add(i as usize)).cFileName)
-                            as *const u16;
-                        let name: [u16; 260] = std::ptr::read_unaligned(name_ptr as *const [u16; 260]);
+                        let name_ptr =
+                            std::ptr::addr_of!((*fgd_ptr.add(i as usize)).cFileName) as *const u16;
+                        let name: [u16; 260] =
+                            std::ptr::read_unaligned(name_ptr as *const [u16; 260]);
                         let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
                         String::from_utf16_lossy(&name[..end])
                     })
@@ -433,19 +445,29 @@ mod imp {
 
                 let mut out = Vec::with_capacity(names.len());
                 for (i, name) in names.iter().enumerate() {
-                    let Some(bytes) = Self::read_file_contents(data_obj, cf_contents, i as i32)
-                    else {
-                        continue;
-                    };
                     let name = if name.trim().is_empty() {
                         format!("attachment-{i}")
                     } else {
                         name.clone()
                     };
-                    let path = temp_dir.join(name);
-                    if std::fs::write(&path, &bytes).is_ok() {
-                        out.push(path);
+                    // Virtual filenames are supplied by another process.
+                    if !safe_attachment_name(&name) {
+                        continue;
                     }
+                    let path = temp_dir.join(name);
+                    let Ok(mut file) = std::fs::File::create_new(&path) else {
+                        continue;
+                    };
+                    let ok = Self::write_file_contents(data_obj, cf_contents, i as i32, &mut file);
+                    drop(file);
+                    if ok {
+                        out.push(path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                if out.is_empty() {
+                    let _ = std::fs::remove_dir(&temp_dir);
                 }
                 out
             }
@@ -454,11 +476,13 @@ mod imp {
         /// Pulls item `index`'s bytes out of a `CFSTR_FILECONTENTS` medium,
         /// which senders hand over either as a plain memory block or an
         /// `IStream` — try both, in the order most senders (Outlook) use.
-        unsafe fn read_file_contents(
+        unsafe fn write_file_contents(
             data_obj: &IDataObject,
             cf_contents: u16,
             index: i32,
-        ) -> Option<Vec<u8>> {
+            output: &mut std::fs::File,
+        ) -> bool {
+            use std::io::Write;
             for tymed in [TYMED_ISTREAM, TYMED_HGLOBAL] {
                 let fmt = FORMATETC {
                     cfFormat: cf_contents,
@@ -470,49 +494,94 @@ mod imp {
                 let Ok(mut medium) = (unsafe { data_obj.GetData(&fmt) }) else {
                     continue;
                 };
-                let bytes = if tymed == TYMED_ISTREAM {
-                    unsafe { medium.u.pstm.as_ref() }.map(|s| unsafe { read_stream_to_end(s) })
+                let result = if tymed == TYMED_ISTREAM {
+                    match unsafe { medium.u.pstm.as_ref() } {
+                        Some(stream) => unsafe { copy_stream(stream, output) }.is_ok(),
+                        None => false,
+                    }
                 } else {
                     let hglobal = unsafe { medium.u.hGlobal };
                     let src = unsafe { GlobalLock(hglobal) };
                     if src.is_null() {
-                        None
+                        false
                     } else {
                         let size = unsafe { GlobalSize(hglobal) };
-                        let data =
-                            unsafe { std::slice::from_raw_parts(src as *const u8, size) }.to_vec();
+                        let result = output
+                            .write_all(unsafe {
+                                std::slice::from_raw_parts(src as *const u8, size)
+                            })
+                            .is_ok();
                         let _ = unsafe { GlobalUnlock(hglobal) };
-                        Some(data)
+                        result
                     }
                 };
                 unsafe { ReleaseStgMedium(&mut medium) };
-                if bytes.is_some() {
-                    return bytes;
-                }
+                return result;
             }
-            None
+            false
         }
     }
 
-    /// Reads an `IStream` fully into memory, 64KB at a time until it reports
-    /// zero bytes read (EOF) or errors.
-    unsafe fn read_stream_to_end(stream: &IStream) -> Vec<u8> {
-        let mut buf = Vec::new();
+    fn safe_attachment_name(name: &str) -> bool {
+        let mut components = std::path::Path::new(name).components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+            && !name.contains([':', '/', '\\'])
+    }
+
+    /// Copy with a fixed 64 KiB buffer; never accept a partial file on error.
+    unsafe fn copy_stream(
+        stream: &IStream,
+        output: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
         let mut chunk = [0u8; 65536];
         loop {
             let mut read = 0u32;
             let hr = unsafe {
-                stream.Read(chunk.as_mut_ptr() as *mut _, chunk.len() as u32, Some(&mut read))
+                stream.Read(
+                    chunk.as_mut_ptr() as *mut _,
+                    chunk.len() as u32,
+                    Some(&mut read),
+                )
             };
-            if hr.is_err() || read == 0 {
-                break;
+            hr.ok().map_err(std::io::Error::other)?;
+            if read == 0 {
+                return Ok(());
             }
-            buf.extend_from_slice(&chunk[..read as usize]);
-            if (read as usize) < chunk.len() {
-                break;
+            if read as usize > chunk.len() {
+                return Err(std::io::Error::other("Invalid stream read length"));
+            }
+            output.write_all(&chunk[..read as usize])?;
+        }
+    }
+
+    #[cfg(test)]
+    mod memory_tests {
+        use super::*;
+        #[test]
+        fn virtual_stream_copies_multiple_chunks_and_reports_write_failure() {
+            let bytes = vec![123; 150_001];
+            let stream =
+                unsafe { windows::Win32::UI::Shell::SHCreateMemStream(Some(&bytes)) }.unwrap();
+            let mut output = Vec::new();
+            unsafe { copy_stream(&stream, &mut output) }.unwrap();
+            assert_eq!(output, bytes);
+            let stream =
+                unsafe { windows::Win32::UI::Shell::SHCreateMemStream(Some(&bytes)) }.unwrap();
+            let mut too_small = [0u8; 16];
+            assert!(unsafe { copy_stream(&stream, &mut too_small.as_mut_slice()) }.is_err());
+            assert!(safe_attachment_name("invoice.pdf"));
+            for invalid in [
+                "../escape",
+                "C:\\escape",
+                "stream:ads",
+                "folder/file",
+                "..",
+                "",
+            ] {
+                assert!(!safe_attachment_name(invalid));
             }
         }
-        buf
     }
 
     #[allow(non_snake_case)]

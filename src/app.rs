@@ -347,7 +347,7 @@ pub struct FileManApp {
     /// `icon_cache::file_icon_cache_key` (extension, or full path for
     /// exe-like types). `None` values are failed lookups, cached so they
     /// aren't retried every frame.
-    file_icons: HashMap<String, Option<egui::TextureHandle>>,
+    file_icons: crate::icon_cache::FileIconCache,
     /// Set while the Settings "Shortcuts" tab is waiting for the next key
     /// event to bind to this action.
     capturing_shortcut_for: Option<Action>,
@@ -361,7 +361,8 @@ pub struct FileManApp {
     new_ext_override_exe: Option<PathBuf>,
     /// Background recursive-search job for the Find dialog. Streams matching
     /// entries one by one; a `Disconnected` receive means the walk finished.
-    find_job: Option<mpsc::Receiver<crate::fs_entry::FsEntry>>,
+    find_job: Option<crate::search::SearchJob>,
+    find_sort_key: Option<(usize, String, bool)>,
     /// Whether each pane's tab strip runs horizontally or is stacked vertically.
     tab_orientation: TabOrientation,
     /// Width of the vertical tab sidebar, user-adjustable via its drag handle.
@@ -411,7 +412,7 @@ pub struct FileManApp {
     /// node is open, so without this cache an expanded branch would re-hit
     /// the filesystem (`read_dir`) on every single repaint. Invalidated via
     /// `mark_dir_dirty`.
-    tree_subdirs_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    tree_subdirs_cache: crate::bounded_cache::BoundedCache<PathBuf, Vec<PathBuf>>,
     /// In-flight background `list_subdirs` calls, keyed by directory. A
     /// network folder's `read_dir` can block for seconds; listing subdirs on
     /// a background thread (like the main pane's listing job) keeps the tree
@@ -826,13 +827,14 @@ impl FileManApp {
             file_launch_filter: String::new(),
             new_file_launch_label: String::new(),
             new_file_launch_file: None,
-            file_icons: HashMap::new(),
+            file_icons: crate::icon_cache::FileIconCache::new(256, 8 * 1024 * 1024),
             capturing_shortcut_for: None,
             new_custom_action_label: String::new(),
             new_custom_action_exe: None,
             new_ext_override_ext: String::new(),
             new_ext_override_exe: None,
             find_job: None,
+            find_sort_key: None,
             tab_orientation,
             tab_strip_width,
             taskbar_badge_applied: false,
@@ -847,7 +849,7 @@ impl FileManApp {
             dnd_tab_rects: Vec::new(),
             dnd_folder_rects: Vec::new(),
             tab_reorder: None,
-            tree_subdirs_cache: HashMap::new(),
+            tree_subdirs_cache: crate::bounded_cache::BoundedCache::new(128, 8 * 1024 * 1024),
             tree_subdirs_jobs: HashMap::new(),
             dnd_shared: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::native_drag::DndSharedState::default(),
@@ -868,58 +870,43 @@ impl FileManApp {
     /// job is already in flight. Requests a repaint while a job is pending
     /// so results land without waiting for user input.
     fn poll_listing(&mut self, pane_idx: usize, ctx: &egui::Context) {
-        // First: try to pick up a completed job and apply its result to every
-        // tab whose path matches (there may be multiple open tabs showing the
-        // same directory, e.g. the source folder in a non-active tab after a
-        // move).
+        let pane = &mut self.panes[pane_idx];
+        for (index, tab) in pane.tabs.iter_mut().enumerate() {
+            if index != pane.active_tab && (!tab.listing.is_empty() || tab.display_cache.is_some() || !tab.listing_dirty) {
+                tab.release_listing();
+            }
+        }
+        let tab = pane.active_tab_mut();
         if let Some(job) = &self.listing_jobs[pane_idx] {
-            if let Ok(result) = job.rx.try_recv() {
-                for tab in &mut self.panes[pane_idx].tabs {
+            match job.rx.try_recv() {
+                Ok(result) => {
                     if tab.path == job.dir {
-                        match &result {
-                            Ok(entries) => {
-                                tab.listing = if self.show_hidden {
-                                    entries.clone()
-                                } else {
-                                    entries.iter().filter(|e| !e.hidden).cloned().collect()
-                                };
+                        match result {
+                            Ok(mut entries) => {
+                                if !self.show_hidden { entries.retain(|entry| !entry.hidden); }
+                                tab.listing = std::sync::Arc::new(entries);
+                                tab.display_cache = None;
                                 tab.listing_error = None;
                                 tab.listing_version += 1;
                             }
-                            Err(e) => tab.listing_error = Some(e.to_string()),
+                            Err(error) => tab.listing_error = Some(error.to_string()),
                         }
                     }
+                    self.listing_jobs[pane_idx] = None;
                 }
-                self.listing_jobs[pane_idx] = None;
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if tab.path == job.dir { tab.listing_error = Some("Directory worker stopped".into()); }
+                    self.listing_jobs[pane_idx] = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-
-        // Second: if no job is in flight, pick the first dirty tab (active
-        // preferred, but any dirty tab will do) and spawn a listing job for it.
-        if self.listing_jobs[pane_idx].is_none() {
-            // Prefer the active tab so the user sees an immediate refresh.
-            let active_idx = self.panes[pane_idx].active_tab;
-            let active_dirty = self.panes[pane_idx].tabs[active_idx].listing_dirty;
-            if active_dirty {
-                let dir = self.panes[pane_idx].tabs[active_idx].path.clone();
-                self.panes[pane_idx].tabs[active_idx].listing_dirty = false;
-                self.listing_jobs[pane_idx] = Some(spawn_listing_job(dir));
-            } else {
-                // Check non-active tabs: a move/copy may have dirtied a
-                // background tab (e.g. the source folder).
-                for tab in &mut self.panes[pane_idx].tabs {
-                    if tab.listing_dirty {
-                        let dir = tab.path.clone();
-                        tab.listing_dirty = false;
-                        self.listing_jobs[pane_idx] = Some(spawn_listing_job(dir));
-                        break;
-                    }
-                }
-            }
+        if self.listing_jobs[pane_idx].is_none() && tab.listing_dirty {
+            tab.listing_dirty = false;
+            self.listing_jobs[pane_idx] = Some(spawn_listing_job(tab.path.clone()));
         }
-
         if self.listing_jobs[pane_idx].is_some() {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
@@ -1302,9 +1289,9 @@ impl FileManApp {
     /// stream in through `find_job` and are polled every frame; the job ends
     /// when the channel disconnects (walk finished).
     fn start_find_search(&mut self, dir: PathBuf, query: String) {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || crate::search::recursive_search(dir, query, tx));
-        self.find_job = Some(rx);
+        self.find_job = None;
+        self.find_sort_key = None;
+        self.find_job = Some(crate::search::SearchJob::start(dir, query));
     }
 
     /// Navigates the active tab of `pane_idx`, refusing (with a status-bar
@@ -1388,10 +1375,11 @@ impl FileManApp {
             // Take the vec out of the cache, iterate, then put it back — avoids
             // cloning every child `Vec<PathBuf>` per frame.
             if let Some(subdirs) = self.tree_subdirs_cache.remove(dir) {
+                let bytes = Self::subdirs_bytes(&subdirs);
                 for subdir in &subdirs {
                     self.show_dir_node(ui, subdir, None, active_path, force_expand, false);
                 }
-                self.tree_subdirs_cache.insert(dir.to_path_buf(), subdirs);
+                self.tree_subdirs_cache.insert(dir.to_path_buf(), subdirs, bytes);
                 return;
             }
             // Not cached yet: poll (or start) a background `list_subdirs`
@@ -1405,7 +1393,7 @@ impl FileManApp {
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => resolved = Some(Vec::new()),
                 }
-            } else {
+            } else if self.tree_subdirs_jobs.len() < 4 {
                 let (tx, rx) = mpsc::channel();
                 let job_dir = dir.to_path_buf();
                 thread::spawn(move || {
@@ -1414,12 +1402,13 @@ impl FileManApp {
                 self.tree_subdirs_jobs.insert(dir.to_path_buf(), rx);
             }
             if let Some(subdirs) = resolved {
+                let bytes = Self::subdirs_bytes(&subdirs);
                 self.tree_subdirs_jobs.remove(dir);
                 for subdir in &subdirs {
                     self.show_dir_node(ui, subdir, None, active_path, force_expand, false);
                 }
                 self.tree_subdirs_cache
-                    .insert(dir.to_path_buf(), subdirs);
+                    .insert(dir.to_path_buf(), subdirs, bytes);
             } else {
                 ui.horizontal(|ui| {
                     ui.add_space(18.0);
@@ -1488,10 +1477,11 @@ impl FileManApp {
         let tab = self.panes[self.active_pane].active_tab_mut();
         let (filter, sort_col, sort_asc) =
             (tab.filter.clone(), tab.sort_col.clone(), tab.sort_asc);
+        let listing = tab.listing.clone();
         let names: Vec<String> = tab
             .display_entries(&filter, &sort_col, sort_asc)
             .iter()
-            .map(|e| e.name.clone())
+            .map(|&i| listing[i].name.clone())
             .collect();
         if names.is_empty() {
             return;
@@ -1569,8 +1559,12 @@ impl FileManApp {
     /// while the listing is still in flight. Shares the sidebar tree's
     /// cache/jobs, so an already-expanded branch resolves instantly and
     /// `mark_dir_dirty` invalidates both consumers at once.
+    fn subdirs_bytes(paths: &[PathBuf]) -> usize {
+        std::mem::size_of_val(paths) + paths.iter().map(|p| p.as_os_str().len()).sum::<usize>()
+    }
+
     fn poll_subdirs(
-        cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+        cache: &mut crate::bounded_cache::BoundedCache<PathBuf, Vec<PathBuf>>,
         jobs: &mut HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>>,
         dir: &Path,
     ) -> Option<Vec<PathBuf>> {
@@ -1584,7 +1578,7 @@ impl FileManApp {
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => resolved = Some(Vec::new()),
             }
-        } else {
+        } else if jobs.len() < 4 {
             let (tx, rx) = mpsc::channel();
             let job_dir = dir.to_path_buf();
             thread::spawn(move || {
@@ -1594,7 +1588,7 @@ impl FileManApp {
         }
         if let Some(subdirs) = resolved {
             jobs.remove(dir);
-            cache.insert(dir.to_path_buf(), subdirs.clone());
+            cache.insert(dir.to_path_buf(), subdirs.clone(), Self::subdirs_bytes(&subdirs));
             Some(subdirs)
         } else {
             None
@@ -1608,7 +1602,7 @@ impl FileManApp {
     fn crumb_separator_menu(
         ui: &mut egui::Ui,
         font_id: &egui::FontId,
-        subdirs_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+        subdirs_cache: &mut crate::bounded_cache::BoundedCache<PathBuf, Vec<PathBuf>>,
         subdirs_jobs: &mut HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>>,
         parent: &Path,
         current_child: Option<&Path>,
@@ -3761,44 +3755,50 @@ impl FileManApp {
                     Some(d) if d.pane_idx == pane_idx => Some(d.idx),
                     _ => None,
                 };
-                ui.horizontal(|ui| {
-                    let pane = &mut self.panes[pane_idx];
-                    for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-                        let mut label = tab.display_label();
-                        if tab.kind == crate::tab::TabKind::File {
-                            label = format!("\u{1F4C4} {label}");
-                        }
-                        let is_tab_active = tab_idx == pane.active_tab;
-                        let search_match = !query.is_empty()
-                            && (label.to_lowercase().contains(&query)
-                                || tab.path.to_string_lossy().to_lowercase().contains(&query));
-                        let ev = tab_strip_item(
-                            ui,
-                            &label,
-                            (pane_idx, tab_idx),
-                            is_tab_active,
-                            is_active,
-                            tab.locked,
-                            tab.custom_name.is_some(),
-                            &mut hover,
-                            drag_highlight == Some(tab_idx),
-                            None,
-                            &tab.path,
-                            search_match,
-                        );
-                        tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
-                        clicked = clicked.or(ev.clicked.then_some(tab_idx));
-                        context_menu = context_menu.or(ev.secondary_clicked.then_some(tab_idx));
-                        closed = closed.or(ev.close_clicked.then_some(tab_idx));
-                        menu_pos = menu_pos.or(ev.secondary_pos);
-                        if ev.drag_started {
-                            reorder_started = Some(tab_idx);
-                        }
-                    }
-                    if ui.button("+").clicked() {
-                        opened = true;
-                    }
-                });
+                egui::ScrollArea::horizontal()
+                    .id_salt(("tab_strip_scroll_h", pane_idx))
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let pane = &mut self.panes[pane_idx];
+                            for (tab_idx, tab) in pane.tabs.iter().enumerate() {
+                                let mut label = tab.display_label();
+                                if tab.kind == crate::tab::TabKind::File {
+                                    label = format!("\u{1F4C4} {label}");
+                                }
+                                let is_tab_active = tab_idx == pane.active_tab;
+                                let search_match = !query.is_empty()
+                                    && (label.to_lowercase().contains(&query)
+                                        || tab.path.to_string_lossy().to_lowercase().contains(&query));
+                                let ev = tab_strip_item(
+                                    ui,
+                                    &label,
+                                    (pane_idx, tab_idx),
+                                    is_tab_active,
+                                    is_active,
+                                    tab.locked,
+                                    tab.custom_name.is_some(),
+                                    &mut hover,
+                                    drag_highlight == Some(tab_idx),
+                                    None,
+                                    &tab.path,
+                                    search_match,
+                                );
+                                tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
+                                clicked = clicked.or(ev.clicked.then_some(tab_idx));
+                                context_menu = context_menu.or(ev.secondary_clicked.then_some(tab_idx));
+                                closed = closed.or(ev.close_clicked.then_some(tab_idx));
+                                menu_pos = menu_pos.or(ev.secondary_pos);
+                                if ev.drag_started {
+                                    reorder_started = Some(tab_idx);
+                                }
+                            }
+                            if ui.button("+").clicked() {
+                                opened = true;
+                            }
+                        });
+                    });
                 self.dnd_tab_rects.extend(tab_rects.clone());
                 self.update_tab_reorder(ui, pane_idx, &tab_rects, false, reorder_started);
                 TabStripResult {
@@ -3840,63 +3840,70 @@ impl FileManApp {
                     _ => None,
                 };
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip_rect), |ui| {
-                    let pane = &mut self.panes[pane_idx];
-                    let row_w = ui.available_width();
-                    // Single-line height by default; a row only grows to two
-                    // lines when its label actually needs wrapping.
-                    let single_h = ui.spacing().interact_size.y.max(22.0);
-                    let double_h = single_h.max(self.font_size * 2.0 + 10.0);
-                    let text_w = (row_w - 6.0 - 20.0).max(1.0);
-                    for (tab_idx, tab) in pane.tabs.iter().enumerate() {
-                        let mut label = tab.display_label();
-                        if tab.kind == crate::tab::TabKind::File {
-                            label = format!("\u{1F4C4} {label}");
-                        }
-                        let needs_two_lines = ui
-                            .painter()
-                            .layout_no_wrap(
-                                label.clone(),
-                                egui::FontId::proportional(self.font_size),
-                                egui::Color32::WHITE,
-                            )
-                            .size()
-                            .x
-                            > text_w;
-                        let row_h = if needs_two_lines { double_h } else { single_h };
-                        let is_tab_active = tab_idx == pane.active_tab;
-                        let search_match = !query.is_empty()
-                            && (label.to_lowercase().contains(&query)
-                                || tab.path.to_string_lossy().to_lowercase().contains(&query));
-                        let ev = tab_strip_item(
-                            ui,
-                            &label,
-                            (pane_idx, tab_idx),
-                            is_tab_active,
-                            is_active,
-                            tab.locked,
-                            tab.custom_name.is_some(),
-                            &mut hover,
-                            drag_highlight == Some(tab_idx),
-                            Some(egui::vec2(row_w, row_h)),
-                            &tab.path,
-                            search_match,
-                        );
-                        tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
-                        clicked = clicked.or(ev.clicked.then_some(tab_idx));
-                        context_menu = context_menu.or(ev.secondary_clicked.then_some(tab_idx));
-                        closed = closed.or(ev.close_clicked.then_some(tab_idx));
-                        menu_pos = menu_pos.or(ev.secondary_pos);
-                        if ev.drag_started {
-                            reorder_started = Some(tab_idx);
-                        }
-                    }
-                    ui.add_space(2.0);
-                    if ui
-                        .add_sized([row_w, single_h], egui::Button::new("+"))
-                        .clicked()
-                    {
-                        opened = true;
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt(("tab_strip_scroll_v", pane_idx))
+                        .auto_shrink([false, false])
+                        .max_height(avail.height())
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            let pane = &mut self.panes[pane_idx];
+                            let row_w = ui.available_width();
+                            // Single-line height by default; a row only grows to two
+                            // lines when its label actually needs wrapping.
+                            let single_h = ui.spacing().interact_size.y.max(22.0);
+                            let double_h = single_h.max(self.font_size * 2.0 + 10.0);
+                            let text_w = (row_w - 6.0 - 20.0).max(1.0);
+                            for (tab_idx, tab) in pane.tabs.iter().enumerate() {
+                                let mut label = tab.display_label();
+                                if tab.kind == crate::tab::TabKind::File {
+                                    label = format!("\u{1F4C4} {label}");
+                                }
+                                let needs_two_lines = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        label.clone(),
+                                        egui::FontId::proportional(self.font_size),
+                                        egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x
+                                    > text_w;
+                                let row_h = if needs_two_lines { double_h } else { single_h };
+                                let is_tab_active = tab_idx == pane.active_tab;
+                                let search_match = !query.is_empty()
+                                    && (label.to_lowercase().contains(&query)
+                                        || tab.path.to_string_lossy().to_lowercase().contains(&query));
+                                let ev = tab_strip_item(
+                                    ui,
+                                    &label,
+                                    (pane_idx, tab_idx),
+                                    is_tab_active,
+                                    is_active,
+                                    tab.locked,
+                                    tab.custom_name.is_some(),
+                                    &mut hover,
+                                    drag_highlight == Some(tab_idx),
+                                    Some(egui::vec2(row_w, row_h)),
+                                    &tab.path,
+                                    search_match,
+                                );
+                                tab_rects.push(((pane_idx, tab_idx), ev.rect, is_tab_active));
+                                clicked = clicked.or(ev.clicked.then_some(tab_idx));
+                                context_menu = context_menu.or(ev.secondary_clicked.then_some(tab_idx));
+                                closed = closed.or(ev.close_clicked.then_some(tab_idx));
+                                menu_pos = menu_pos.or(ev.secondary_pos);
+                                if ev.drag_started {
+                                    reorder_started = Some(tab_idx);
+                                }
+                            }
+                            ui.add_space(2.0);
+                            if ui
+                                .add_sized([row_w, single_h], egui::Button::new("+"))
+                                .clicked()
+                            {
+                                opened = true;
+                            }
+                        });
                 });
                 self.dnd_tab_rects.extend(tab_rects.clone());
                 self.update_tab_reorder(ui, pane_idx, &tab_rects, true, reorder_started);
@@ -4318,7 +4325,8 @@ impl FileManApp {
         };
         // Render from the cached listing without deep-cloning it every frame:
         // move the cached vec out, render against a borrow, put it back.
-        let mut entries: Vec<crate::fs_entry::FsEntry> = Vec::new();
+        let listing = pane.active_tab().listing.clone();
+        let mut entries: Vec<usize> = Vec::new();
         let listing_err = pane.active_tab().listing_error.clone();
         if listing_err.is_none() {
             pane.active_tab_mut()
@@ -4452,7 +4460,7 @@ impl FileManApp {
                                         .body(|body| {
                                             live_widths = Some(body.widths().to_vec());
                                             body.rows(row_height, entries.len(), |mut row| {
-                                                let entry = &entries[row.index()];
+                                                let entry = &listing[entries[row.index()]];
                                                 let row_idx = row.index();
                                                 let is_selected =
                                                     pane.active_tab().selected.contains(&entry.name);
@@ -4460,12 +4468,7 @@ impl FileManApp {
                                                 row.set_selected(is_selected);
 
                                                 let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
-                                                    let key = crate::icon_cache::file_icon_cache_key(&entry.path);
-                                                    if !file_icons.contains_key(&key) {
-                                                        let tex = crate::icon_cache::load_file_icon_texture(ctx, &entry.path);
-                                                        file_icons.insert(key.clone(), tex);
-                                                    }
-                                                    file_icons.get(&key).cloned().flatten()
+                                                    crate::icon_cache::cached_file_icon(file_icons, ctx, &entry.path)
                                                 };
                                                 row.col(|ui| {
                                                     // Folders keep their emoji glyph;
@@ -4624,16 +4627,11 @@ impl FileManApp {
                                 .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
                                 .show_rows(ui, row_height, entries.len(), |ui, range| {
                                     for idx in range {
-                                        let entry = &entries[idx];
+                                        let entry = &listing[entries[idx]];
                                         let is_selected =
                                             pane.active_tab().selected.contains(&entry.name);
                                         let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
-                                                    let key = crate::icon_cache::file_icon_cache_key(&entry.path);
-                                                    if !file_icons.contains_key(&key) {
-                                                        let tex = crate::icon_cache::load_file_icon_texture(ctx, &entry.path);
-                                                        file_icons.insert(key.clone(), tex);
-                                                    }
-                                                    file_icons.get(&key).cloned().flatten()
+                                                    crate::icon_cache::cached_file_icon(file_icons, ctx, &entry.path)
                                                 };
                                         let resp = ui
                                             .horizontal(|ui| {
@@ -4698,23 +4696,23 @@ impl FileManApp {
                                 });
                         }
                         ViewMode::Icons => {
+                            let columns = ((ui.available_width() - 20.0) / (76.0 + ui.spacing().item_spacing.x)).floor().max(1.0) as usize;
+                            let tile_height = (32.0 + ui.text_style_height(&egui::TextStyle::Button)
+                                + ui.spacing().item_spacing.y + 2.0 * ui.spacing().button_padding.y).max(72.0);
                             egui::ScrollArea::vertical()
                                 .id_salt(format!("file_icons_pane_{pane_idx}"))
                                 .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        for (idx, entry) in entries.iter().enumerate() {
+                                .show_rows(ui, tile_height, entries.len().div_ceil(columns), |ui, rows| {
+                                    for row in rows {
+                                    ui.horizontal(|ui| {
+                                        for idx in row * columns..((row + 1) * columns).min(entries.len()) {
+                                            let entry = &listing[entries[idx]];
                                             let is_selected =
                                                 pane.active_tab().selected.contains(&entry.name);
                                             let file_icon: Option<egui::TextureHandle> = if entry.is_dir { None } else {
-                                                    let key = crate::icon_cache::file_icon_cache_key(&entry.path);
-                                                    if !file_icons.contains_key(&key) {
-                                                        let tex = crate::icon_cache::load_file_icon_texture(ctx, &entry.path);
-                                                        file_icons.insert(key.clone(), tex);
-                                                    }
-                                                    file_icons.get(&key).cloned().flatten()
+                                                    crate::icon_cache::cached_file_icon(file_icons, ctx, &entry.path)
                                                 };
-                                            ui.allocate_ui(egui::vec2(76.0, 72.0), |ui| {
+                                            ui.allocate_ui(egui::vec2(76.0, tile_height), |ui| {
                                                 // Tile: associated app icon (or the
                                                 // generic glyph) above the filename.
                                                 // The union of both responses drives
@@ -4740,11 +4738,11 @@ impl FileManApp {
                                                                     .color(listing_text),
                                                             )
                                                         };
-                                                        let text_resp = ui.selectable_label(
+                                                        let text_resp = ui.add(egui::Button::selectable(
                                                             is_selected,
                                                             egui::RichText::new(entry.name.as_str())
                                                                 .color(listing_text),
-                                                        );
+                                                        ).truncate()).on_hover_text(&entry.name);
                                                         img_resp | text_resp
                                                     })
                                                     .inner;
@@ -4788,6 +4786,7 @@ impl FileManApp {
                                             });
                                         }
                                     });
+                                    }
                                 });
                         }
                     }
@@ -4818,12 +4817,12 @@ impl FileManApp {
                     if shift {
                         // Range selection: select all entries between last selected and current
                         if let Some(idx) = select_index {
-                            let anchor = self.last_selected_index.unwrap_or(idx);
+                            let anchor = self.last_selected_index.unwrap_or(idx).min(entries.len() - 1);
                             let start = anchor.min(idx);
                             let end = anchor.max(idx);
                             let range_names: Vec<String> = entries[start..=end]
                                 .iter()
-                                .map(|e| e.name.clone())
+                                .map(|&i| listing[i].name.clone())
                                 .collect();
                             pane.active_tab_mut().clear_selection();
                             pane.active_tab_mut().select_range(&range_names);
@@ -4861,7 +4860,7 @@ impl FileManApp {
                     if !selected.is_empty() {
                         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
                         let mut files: Vec<std::path::PathBuf> = Vec::new();
-                        for entry in &entries {
+                        for entry in entries.iter().map(|&i| &listing[i]) {
                             if selected.contains(&entry.name) {
                                 if entry.is_dir {
                                     dirs.push(entry.path.clone());
@@ -4895,22 +4894,22 @@ impl FileManApp {
                             .selected
                             .iter()
                             .next()
-                            .and_then(|n| entries.iter().position(|e| &e.name == n));
+                            .and_then(|n| entries.iter().position(|&i| &listing[i].name == n));
                         let next_idx = match cur {
                             Some(i) if arrow_down => (i + 1).min(entries.len() - 1),
                             Some(i) => i.saturating_sub(1),
                             None => 0,
                         };
                         if shift {
-                            let anchor = self.last_selected_index.unwrap_or(cur.unwrap_or(next_idx));
+                            let anchor = self.last_selected_index.unwrap_or(cur.unwrap_or(next_idx)).min(entries.len() - 1);
                             let (start, end) = (anchor.min(next_idx), anchor.max(next_idx));
                             let range_names: Vec<String> =
-                                entries[start..=end].iter().map(|e| e.name.clone()).collect();
+                                entries[start..=end].iter().map(|&i| listing[i].name.clone()).collect();
                             pane.active_tab_mut().clear_selection();
                             pane.active_tab_mut().select_range(&range_names);
                             self.last_selected_index = Some(anchor);
                         } else {
-                            pane.active_tab_mut().select_only(&entries[next_idx].name);
+                            pane.active_tab_mut().select_only(&listing[entries[next_idx]].name);
                             self.last_selected_index = Some(next_idx);
                         }
                         self.active_pane = pane_idx;
@@ -4924,7 +4923,7 @@ impl FileManApp {
                     } else if nav_target.is_none() && ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                         let selected = &pane.active_tab().selected;
                         if selected.len() == 1
-                            && let Some(entry) = entries.iter().find(|e| selected.contains(&e.name))
+                            && let Some(entry) = entries.iter().map(|&i| &listing[i]).find(|e| selected.contains(&e.name))
                             && entry.is_dir
                         {
                             nav_target = Some(entry.path.clone());
@@ -5089,16 +5088,28 @@ fn clipboard_event_combo(i: &egui::InputState) -> Option<crate::actions::KeyComb
 impl eframe::App for FileManApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !matches!(self.dialog, Some(Dialog::Find { .. })) {
+            self.find_job = None;
+        }
+        self.tree_subdirs_jobs.retain(|dir, rx| match rx.try_recv() {
+            Ok(result) => {
+                let paths = result.unwrap_or_default();
+                let bytes = Self::subdirs_bytes(&paths);
+                self.tree_subdirs_cache.insert(dir.clone(), paths, bytes);
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Empty) => true,
+        });
+        if !self.tree_subdirs_jobs.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // Taskbar/title-bar text: active folder name first, then the app
         // name, so the folder is what's legible in a crowded taskbar.
         // Windows shows this text directly, so update it in-place rather
         // than only formatting a display string.
         let active_dir = self.active_tab_dir();
-        let folder_name = active_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| active_dir.display().to_string());
-        let title = format!("{folder_name} - FileMan");
+        let title = format!("{} - FileMan", active_dir.display());
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
@@ -6161,6 +6172,7 @@ impl eframe::App for FileManApp {
                 {
                     let search_path_clone = search_path.clone();
                     let searching = self.find_job.is_some();
+                    let last_sort = &mut self.find_sort_key;
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         find_close = true;
                     }
@@ -6212,9 +6224,10 @@ impl eframe::App for FileManApp {
                             }
                         });
 
-                        // Apply the current sort before rendering (cheap even
-                        // for large result sets, and keeps headers in sync).
-                        {
+                        // Sort only after new results or a header change.
+                        let sort_key = (results.len(), sort_col.clone(), *sort_asc);
+                        if last_sort.as_ref() != Some(&sort_key) {
+                            *last_sort = Some(sort_key);
                             let col = sort_col.clone();
                             let asc = *sort_asc;
                             match col.as_str() {
@@ -6246,6 +6259,9 @@ impl eframe::App for FileManApp {
                             })
                             .collect();
 
+                        if results.len() >= crate::search::RESULT_LIMIT {
+                            ui.label("Stopped at 10,000 results. Narrow the query or search folder to find more.");
+                        }
                         let filters_active =
                             !nf.is_empty() || !ff.is_empty() || !*include_folders;
                         if query.is_empty() && results.is_empty() && !searching {
@@ -6449,7 +6465,7 @@ impl eframe::App for FileManApp {
                     let mut search_path = None;
                     if let Some(Dialog::Find { search_path: sp, results, .. }) = &mut self.dialog {
                         // A fresh search replaces the previous one's results.
-                        results.clear();
+                        *results = Vec::new();
                         search_path = Some(sp.clone());
                     }
                     if let Some(sp) = search_path {
@@ -6464,7 +6480,7 @@ impl eframe::App for FileManApp {
                 if let Some(rx) = &self.find_job {
                     let mut finished = false;
                     let mut hits: Vec<crate::fs_entry::FsEntry> = Vec::new();
-                    loop {
+                    for _ in 0..256 {
                         match rx.try_recv() {
                             Ok(entry) => hits.push(entry),
                             Err(mpsc::TryRecvError::Empty) => break,
@@ -6482,7 +6498,7 @@ impl eframe::App for FileManApp {
                     if finished {
                         self.find_job = None;
                     } else {
-                        ctx.request_repaint();
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
                     }
                 }
                 let is_help = matches!(&self.dialog, Some(Dialog::Help));
@@ -8101,11 +8117,18 @@ fn tab_strip_item(
             egui::StrokeKind::Inside,
         );
         if is_active_pane {
-            // Brand accent strip along the card's top edge.
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.max.x, rect.top() + 2.0)),
-                0.0,
-                egui::Color32::from_rgb(255, 165, 0),
+            // Brand accent border on all four sides so the active tab
+            // is unambiguous regardless of where it sits in the strip.
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius {
+                    nw: 6,
+                    ne: 6,
+                    sw: 0,
+                    se: 0,
+                },
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 165, 0)),
+                egui::StrokeKind::Inside,
             );
         }
         // The opaque card covers the label, so redraw it (left-aligned,
@@ -8516,30 +8539,15 @@ fn show_entry_context_menu(
         }
     }
 
-    // Windows Explorer shell context menu sub-menu. `query_items` is a
-    // blocking shell/COM call, so it's cached per-selection rather than
-    // re-run on every frame this menu stays open (see `shell_menu_cache`'s
-    // doc).
-    if shell_menu_cache
-        .as_ref()
-        .is_none_or(|(cached_paths, _)| cached_paths.as_slice() != selection_paths)
-    {
-        *shell_menu_cache = Some((
-            selection_paths.to_vec(),
-            crate::shell_menu::query_items(selection_paths),
-        ));
-    }
-    let shell_items = &shell_menu_cache.as_ref().unwrap().1;
-    if shell_items
-        .iter()
-        .any(|item| item.separator || !shell_menu_hidden.contains(&item.label))
-    {
-        ui.separator();
-        ui.menu_button("Windows Explorer", |ui| {
-            ui.set_min_width(180.0);
-            render_shell_items(ui, row_action, selection_paths, shell_items, shell_menu_hidden);
-        });
-    }
+    // Shell handlers are loaded only when this submenu is actually opened.
+    ui.separator();
+    ui.menu_button("Windows Explorer", |ui| {
+        if shell_menu_cache.as_ref().is_none_or(|(paths, _)| paths.as_slice() != selection_paths) {
+            *shell_menu_cache = Some((selection_paths.to_vec(), crate::shell_menu::query_items(selection_paths)));
+        }
+        ui.set_min_width(180.0);
+        render_shell_items(ui, row_action, selection_paths, &shell_menu_cache.as_ref().unwrap().1, shell_menu_hidden);
+    });
 }
 
 /// Recursively render shell menu items into an egui sub-menu, skipping any
@@ -8754,6 +8762,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn large_icons_view_is_virtualized_and_background_tabs_release_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let user = crate::user::default_user_id(&conn);
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = FileManApp::new(conn, user, None, 0, Some(dir.path().into()));
+        let entries: Vec<_> = (0..10_000).map(|i| crate::fs_entry::FsEntry {
+            name: format!("folder-{i:05}"), path: dir.path().join(format!("folder-{i:05}")),
+            is_dir: true, size: 0, modified: None, archive: false, readonly: false,
+            hidden: false, system: false,
+        }).collect();
+        let tab = app.panes[0].active_tab_mut();
+        tab.listing = std::sync::Arc::new(entries);
+        tab.listing_dirty = false;
+        tab.view_mode = ViewMode::Icons;
+        let inactive = tab.clone();
+        app.panes[0].tabs.push(inactive);
+        let ctx = egui::Context::default();
+        app.poll_listing(0, &ctx);
+        assert!(app.panes[0].tabs[1].listing.is_empty());
+        assert!(app.panes[0].tabs[1].listing_dirty);
+        assert!(app.listing_jobs[0].is_none(), "inactive tabs must not be scanned");
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| app.show_pane_content(ui, &ctx, 0));
+            output.textures_delta.clear();
+        }
+        assert!(!app.dnd_folder_rects.is_empty());
+        assert!(app.dnd_folder_rects.len() < 100, "only visible icons should create widgets");
+        assert_eq!(app.panes[0].active_tab().listing.len(), 10_000);
+        app.panes[0].set_active_tab(1);
+        app.poll_listing(0, &ctx);
+        assert!(app.panes[0].tabs[0].listing.is_empty());
+        assert!(app.listing_jobs[0].is_some(), "activation starts a fresh listing");
+    }
+
+    #[test]
     fn ensure_two_panes_pads_a_single_pane_up_to_two() {
         let panes = vec![Pane::new(PathBuf::from("D:\\one"))];
         let (panes, active_pane) = ensure_two_panes(panes, 0, ("name", true));
@@ -8856,7 +8904,7 @@ mod tests {
         std::fs::create_dir(temp.path().join("sub_a")).unwrap();
         std::fs::write(temp.path().join("file.txt"), b"x").unwrap();
 
-        let mut cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        let mut cache = crate::bounded_cache::BoundedCache::new(128, 8 * 1024 * 1024);
         let mut jobs: HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>> =
             HashMap::new();
         let dir = temp.path().to_path_buf();
@@ -8875,7 +8923,7 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["sub_a", "sub_b"], "only directories, sorted");
-        assert!(cache.contains_key(&dir), "resolved listing is cached");
+        assert!(cache.get(&dir).is_some(), "resolved listing is cached");
         assert!(jobs.is_empty(), "finished job is removed from the map");
 
         let cached = FileManApp::poll_subdirs(&mut cache, &mut jobs, &dir)

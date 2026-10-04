@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod archive;
+mod bounded_cache;
 mod config;
 mod db;
 mod fs_entry;
@@ -11,11 +12,11 @@ mod icon_cache;
 mod migrate;
 mod monitor;
 mod native_drag;
-mod shell_menu;
 mod pane;
 mod progress;
 mod search;
 mod session;
+mod shell_menu;
 mod tab;
 mod taskbar;
 mod tips;
@@ -90,10 +91,19 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+    // This file manager needs small graphics allocations, not large GPU pools.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        let original = setup.device_descriptor.clone();
+        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut descriptor = original(adapter);
+            descriptor.memory_hints = eframe::wgpu::MemoryHints::MemoryUsage;
+            descriptor
+        });
+    }
 
     // Font loading (embedded default + any saved system-font preference) is
     // applied reactively from FileManApp::ui on the first frame — see

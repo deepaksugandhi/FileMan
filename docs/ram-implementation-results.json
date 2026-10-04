@@ -1,0 +1,1331 @@
+﻿[
+    {
+        "Timestamp":  "2026-10-04T07:04:31.5384730+05:30",
+        "ProcessId":  19636,
+        "Executable":  "E:\\Projects\\FileMan\\target\\ram-reanalysis\\original\\fileman.exe",
+        "StartTime":  "2026-10-04T07:04:01.1719401+05:30",
+        "SampleSeconds":  5.03,
+        "WorkingSetMiB":  359,
+        "PrivateCommitMiB":  274.54,
+        "PeakWorkingSetMiB":  376.55,
+        "CpuOneCorePercent":  0,
+        "Threads":  31,
+        "Handles":  604,
+        "RegionPrivateCommittedMiB":  251.57,
+        "RegionMappedCommittedMiB":  79.56,
+        "RegionImageCommittedMiB":  329.82,
+        "Modules":  [
+                        {
+                            "Name":  "igc1464.dll",
+                            "ImageSizeMiB":  63.04
+                        },
+                        {
+                            "Name":  "igd12um64xel.dll",
+                            "ImageSizeMiB":  34.25
+                        },
+                        {
+                            "Name":  "media_bin_64.dll",
+                            "ImageSizeMiB":  29.18
+                        },
+                        {
+                            "Name":  "igxelpicd64.dll",
+                            "ImageSizeMiB":  19.85
+                        },
+                        {
+                            "Name":  "igddxvacommon64.dll",
+                            "ImageSizeMiB":  19.54
+                        },
+                        {
+                            "Name":  "igvk64.dll",
+                            "ImageSizeMiB":  19.46
+                        },
+                        {
+                            "Name":  "fileman.exe",
+                            "ImageSizeMiB":  18.43
+                        },
+                        {
+                            "Name":  "windows.storage.dll",
+                            "ImageSizeMiB":  9.1
+                        },
+                        {
+                            "Name":  "shell32.dll",
+                            "ImageSizeMiB":  8.61
+                        },
+                        {
+                            "Name":  "D3D10Warp.dll",
+                            "ImageSizeMiB":  7.1
+                        },
+                        {
+                            "Name":  "windowsudk.shellcommon.dll",
+                            "ImageSizeMiB":  5.6
+                        },
+                        {
+                            "Name":  "setupapi.dll",
+                            "ImageSizeMiB":  4.45
+                        },
+                        {
+                            "Name":  "uiautomationcore.dll",
+                            "ImageSizeMiB":  4.29
+                        },
+                        {
+                            "Name":  "igdgmm64.dll",
+                            "ImageSizeMiB":  4.25
+                        },
+                        {
+                            "Name":  "d3dcompiler_47.dll",
+                            "ImageSizeMiB":  3.9
+                        },
+                        {
+                            "Name":  "KERNELBASE.dll",
+                            "ImageSizeMiB":  3.82
+                        },
+                        {
+                            "Name":  "combase.dll",
+                            "ImageSizeMiB":  3.57
+                        },
+                        {
+                            "Name":  "CoreUIComponents.dll",
+                            "ImageSizeMiB":  3.42
+                        },
+                        {
+                            "Name":  "igd12dxva64.dll",
+                            "ImageSizeMiB":  3.13
+                        },
+                        {
+                            "Name":  "explorerframe.dll",
+                            "ImageSizeMiB":  2.75
+                        },
+                        {
+                            "Name":  "twinapi.appcore.dll",
+                            "ImageSizeMiB":  2.65
+                        },
+                        {
+                            "Name":  "Comctl32.dll",
+                            "ImageSizeMiB":  2.61
+                        },
+                        {
+                            "Name":  "dwrite.dll",
+                            "ImageSizeMiB":  2.47
+                        },
+                        {
+                            "Name":  "d3d11.dll",
+                            "ImageSizeMiB":  2.34
+                        },
+                        {
+                            "Name":  "dcomp.dll",
+                            "ImageSizeMiB":  2.33
+                        },
+                        {
+                            "Name":  "ntdll.dll",
+                            "ImageSizeMiB":  2.09
+                        },
+                        {
+                            "Name":  "D3D12Core.dll",
+                            "ImageSizeMiB":  2.01
+                        },
+                        {
+                            "Name":  "DUI70.dll",
+                            "ImageSizeMiB":  1.77
+                        },
+                        {
+                            "Name":  "WindowsCodecs.dll",
+                            "ImageSizeMiB":  1.7
+                        },
+                        {
+                            "Name":  "user32.dll",
+                            "ImageSizeMiB":  1.7
+                        },
+                        {
+                            "Name":  "ole32.dll",
+                            "ImageSizeMiB":  1.63
+                        },
+                        {
+                            "Name":  "vulkan-1.dll",
+                            "ImageSizeMiB":  1.52
+                        },
+                        {
+                            "Name":  "Windows.UI.Core.TextInput.dll",
+                            "ImageSizeMiB":  1.47
+                        },
+                        {
+                            "Name":  "CRYPT32.dll",
+                            "ImageSizeMiB":  1.41
+                        },
+                        {
+                            "Name":  "MSCTF.dll",
+                            "ImageSizeMiB":  1.38
+                        },
+                        {
+                            "Name":  "drvstore.dll",
+                            "ImageSizeMiB":  1.35
+                        },
+                        {
+                            "Name":  "AppXDeploymentClient.dll",
+                            "ImageSizeMiB":  1.29
+                        },
+                        {
+                            "Name":  "igdml64.dll",
+                            "ImageSizeMiB":  1.29
+                        },
+                        {
+                            "Name":  "igvkMedia64.dll",
+                            "ImageSizeMiB":  1.28
+                        },
+                        {
+                            "Name":  "textinputframework.dll",
+                            "ImageSizeMiB":  1.27
+                        },
+                        {
+                            "Name":  "wintypes.dll",
+                            "ImageSizeMiB":  1.25
+                        },
+                        {
+                            "Name":  "CoreMessaging.dll",
+                            "ImageSizeMiB":  1.2
+                        },
+                        {
+                            "Name":  "gdi32full.dll",
+                            "ImageSizeMiB":  1.11
+                        },
+                        {
+                            "Name":  "RPCRT4.dll",
+                            "ImageSizeMiB":  1.09
+                        },
+                        {
+                            "Name":  "ucrtbase.dll",
+                            "ImageSizeMiB":  1.07
+                        },
+                        {
+                            "Name":  "shcore.dll",
+                            "ImageSizeMiB":  1.02
+                        },
+                        {
+                            "Name":  "opengl32.dll",
+                            "ImageSizeMiB":  1
+                        },
+                        {
+                            "Name":  "dxgi.dll",
+                            "ImageSizeMiB":  0.96
+                        },
+                        {
+                            "Name":  "InputSwitch.dll",
+                            "ImageSizeMiB":  0.85
+                        },
+                        {
+                            "Name":  "oleaut32.dll",
+                            "ImageSizeMiB":  0.84
+                        },
+                        {
+                            "Name":  "KERNEL32.DLL",
+                            "ImageSizeMiB":  0.77
+                        },
+                        {
+                            "Name":  "TextShaping.dll",
+                            "ImageSizeMiB":  0.75
+                        },
+                        {
+                            "Name":  "uxtheme.dll",
+                            "ImageSizeMiB":  0.7
+                        },
+                        {
+                            "Name":  "advapi32.dll",
+                            "ImageSizeMiB":  0.69
+                        },
+                        {
+                            "Name":  "clbcatq.dll",
+                            "ImageSizeMiB":  0.69
+                        },
+                        {
+                            "Name":  "sechost.dll",
+                            "ImageSizeMiB":  0.66
+                        },
+                        {
+                            "Name":  "msvcrt.dll",
+                            "ImageSizeMiB":  0.65
+                        },
+                        {
+                            "Name":  "sxs.dll",
+                            "ImageSizeMiB":  0.64
+                        },
+                        {
+                            "Name":  "IntelControlLib.dll",
+                            "ImageSizeMiB":  0.61
+                        },
+                        {
+                            "Name":  "msvcp_win.dll",
+                            "ImageSizeMiB":  0.6
+                        },
+                        {
+                            "Name":  "DUser.dll",
+                            "ImageSizeMiB":  0.6
+                        },
+                        {
+                            "Name":  "WINTRUST.dll",
+                            "ImageSizeMiB":  0.48
+                        },
+                        {
+                            "Name":  "bcryptprimitives.dll",
+                            "ImageSizeMiB":  0.48
+                        },
+                        {
+                            "Name":  "shlwapi.dll",
+                            "ImageSizeMiB":  0.41
+                        },
+                        {
+                            "Name":  "Bcp47Langs.dll",
+                            "ImageSizeMiB":  0.38
+                        },
+                        {
+                            "Name":  "dataexchange.dll",
+                            "ImageSizeMiB":  0.37
+                        },
+                        {
+                            "Name":  "igdext64.dll",
+                            "ImageSizeMiB":  0.36
+                        },
+                        {
+                            "Name":  "MSUTB.dll",
+                            "ImageSizeMiB":  0.31
+                        },
+                        {
+                            "Name":  "CFGMGR32.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "powrprof.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "graphics-hook64.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "UIAnimation.dll",
+                            "ImageSizeMiB":  0.29
+                        },
+                        {
+                            "Name":  "directxdatabasehelper.dll",
+                            "ImageSizeMiB":  0.29
+                        },
+                        {
+                            "Name":  "MLANG.DLL",
+                            "ImageSizeMiB":  0.26
+                        },
+                        {
+                            "Name":  "dxcore.dll",
+                            "ImageSizeMiB":  0.21
+                        },
+                        {
+                            "Name":  "XmlLite.dll",
+                            "ImageSizeMiB":  0.21
+                        },
+                        {
+                            "Name":  "WINMM.dll",
+                            "ImageSizeMiB":  0.2
+                        },
+                        {
+                            "Name":  "imm32.dll",
+                            "ImageSizeMiB":  0.19
+                        },
+                        {
+                            "Name":  "D3DSCache.dll",
+                            "ImageSizeMiB":  0.18
+                        },
+                        {
+                            "Name":  "GLU32.dll",
+                            "ImageSizeMiB":  0.18
+                        },
+                        {
+                            "Name":  "VCRUNTIME140.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "DEVOBJ.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "dwmapi.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "p9np.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "igdinfo64.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "GDI32.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "USERENV.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "igd12umd64.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "bcrypt.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "d3d12.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "igc64.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "win32u.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "profapi.dll",
+                            "ImageSizeMiB":  0.14
+                        },
+                        {
+                            "Name":  "ntlanman.dll",
+                            "ImageSizeMiB":  0.13
+                        },
+                        {
+                            "Name":  "davclnt.dll",
+                            "ImageSizeMiB":  0.12
+                        },
+                        {
+                            "Name":  "mpr.dll",
+                            "ImageSizeMiB":  0.12
+                        },
+                        {
+                            "Name":  "msctfmonitor.dll",
+                            "ImageSizeMiB":  0.11
+                        },
+                        {
+                            "Name":  "CRYPTSP.dll",
+                            "ImageSizeMiB":  0.11
+                        },
+                        {
+                            "Name":  "windows.staterepositorycore.dll",
+                            "ImageSizeMiB":  0.1
+                        },
+                        {
+                            "Name":  "kernel.appcore.dll",
+                            "ImageSizeMiB":  0.09
+                        },
+                        {
+                            "Name":  "UMPDC.dll",
+                            "ImageSizeMiB":  0.07
+                        },
+                        {
+                            "Name":  "MSASN1.dll",
+                            "ImageSizeMiB":  0.07
+                        },
+                        {
+                            "Name":  "drprov.dll",
+                            "ImageSizeMiB":  0.05
+                        },
+                        {
+                            "Name":  "version.dll",
+                            "ImageSizeMiB":  0.04
+                        },
+                        {
+                            "Name":  "IconCodecService.dll",
+                            "ImageSizeMiB":  0.04
+                        }
+                    ],
+        "Case":  "implementation-control",
+        "BackendOverride":  "",
+        "WindowWidth":  1938,
+        "WindowHeight":  1060,
+        "AppWindowResponsive":  true
+    },
+    {
+        "Timestamp":  "2026-10-04T07:07:44.7653629+05:30",
+        "ProcessId":  43384,
+        "Executable":  "E:\\Projects\\FileMan\\target\\release\\fileman.exe",
+        "StartTime":  "2026-10-04T07:07:14.4526416+05:30",
+        "SampleSeconds":  5.02,
+        "WorkingSetMiB":  179.41,
+        "PrivateCommitMiB":  94.59,
+        "PeakWorkingSetMiB":  197.57,
+        "CpuOneCorePercent":  0,
+        "Threads":  33,
+        "Handles":  611,
+        "RegionPrivateCommittedMiB":  71.98,
+        "RegionMappedCommittedMiB":  79.56,
+        "RegionImageCommittedMiB":  329.89,
+        "Modules":  [
+                        {
+                            "Name":  "igc1464.dll",
+                            "ImageSizeMiB":  63.04
+                        },
+                        {
+                            "Name":  "igd12um64xel.dll",
+                            "ImageSizeMiB":  34.25
+                        },
+                        {
+                            "Name":  "media_bin_64.dll",
+                            "ImageSizeMiB":  29.18
+                        },
+                        {
+                            "Name":  "igxelpicd64.dll",
+                            "ImageSizeMiB":  19.85
+                        },
+                        {
+                            "Name":  "igddxvacommon64.dll",
+                            "ImageSizeMiB":  19.54
+                        },
+                        {
+                            "Name":  "igvk64.dll",
+                            "ImageSizeMiB":  19.46
+                        },
+                        {
+                            "Name":  "fileman.exe",
+                            "ImageSizeMiB":  18.5
+                        },
+                        {
+                            "Name":  "windows.storage.dll",
+                            "ImageSizeMiB":  9.1
+                        },
+                        {
+                            "Name":  "shell32.dll",
+                            "ImageSizeMiB":  8.61
+                        },
+                        {
+                            "Name":  "D3D10Warp.dll",
+                            "ImageSizeMiB":  7.1
+                        },
+                        {
+                            "Name":  "windowsudk.shellcommon.dll",
+                            "ImageSizeMiB":  5.6
+                        },
+                        {
+                            "Name":  "setupapi.dll",
+                            "ImageSizeMiB":  4.45
+                        },
+                        {
+                            "Name":  "uiautomationcore.dll",
+                            "ImageSizeMiB":  4.29
+                        },
+                        {
+                            "Name":  "igdgmm64.dll",
+                            "ImageSizeMiB":  4.25
+                        },
+                        {
+                            "Name":  "d3dcompiler_47.dll",
+                            "ImageSizeMiB":  3.9
+                        },
+                        {
+                            "Name":  "KERNELBASE.dll",
+                            "ImageSizeMiB":  3.82
+                        },
+                        {
+                            "Name":  "combase.dll",
+                            "ImageSizeMiB":  3.57
+                        },
+                        {
+                            "Name":  "CoreUIComponents.dll",
+                            "ImageSizeMiB":  3.42
+                        },
+                        {
+                            "Name":  "igd12dxva64.dll",
+                            "ImageSizeMiB":  3.13
+                        },
+                        {
+                            "Name":  "explorerframe.dll",
+                            "ImageSizeMiB":  2.75
+                        },
+                        {
+                            "Name":  "twinapi.appcore.dll",
+                            "ImageSizeMiB":  2.65
+                        },
+                        {
+                            "Name":  "Comctl32.dll",
+                            "ImageSizeMiB":  2.61
+                        },
+                        {
+                            "Name":  "dwrite.dll",
+                            "ImageSizeMiB":  2.47
+                        },
+                        {
+                            "Name":  "d3d11.dll",
+                            "ImageSizeMiB":  2.34
+                        },
+                        {
+                            "Name":  "dcomp.dll",
+                            "ImageSizeMiB":  2.33
+                        },
+                        {
+                            "Name":  "ntdll.dll",
+                            "ImageSizeMiB":  2.09
+                        },
+                        {
+                            "Name":  "D3D12Core.dll",
+                            "ImageSizeMiB":  2.01
+                        },
+                        {
+                            "Name":  "DUI70.dll",
+                            "ImageSizeMiB":  1.77
+                        },
+                        {
+                            "Name":  "user32.dll",
+                            "ImageSizeMiB":  1.7
+                        },
+                        {
+                            "Name":  "WindowsCodecs.dll",
+                            "ImageSizeMiB":  1.7
+                        },
+                        {
+                            "Name":  "ole32.dll",
+                            "ImageSizeMiB":  1.63
+                        },
+                        {
+                            "Name":  "vulkan-1.dll",
+                            "ImageSizeMiB":  1.52
+                        },
+                        {
+                            "Name":  "Windows.UI.Core.TextInput.dll",
+                            "ImageSizeMiB":  1.47
+                        },
+                        {
+                            "Name":  "CRYPT32.dll",
+                            "ImageSizeMiB":  1.41
+                        },
+                        {
+                            "Name":  "MSCTF.dll",
+                            "ImageSizeMiB":  1.38
+                        },
+                        {
+                            "Name":  "drvstore.dll",
+                            "ImageSizeMiB":  1.35
+                        },
+                        {
+                            "Name":  "AppXDeploymentClient.dll",
+                            "ImageSizeMiB":  1.29
+                        },
+                        {
+                            "Name":  "igdml64.dll",
+                            "ImageSizeMiB":  1.29
+                        },
+                        {
+                            "Name":  "igvkMedia64.dll",
+                            "ImageSizeMiB":  1.28
+                        },
+                        {
+                            "Name":  "textinputframework.dll",
+                            "ImageSizeMiB":  1.27
+                        },
+                        {
+                            "Name":  "wintypes.dll",
+                            "ImageSizeMiB":  1.25
+                        },
+                        {
+                            "Name":  "CoreMessaging.dll",
+                            "ImageSizeMiB":  1.2
+                        },
+                        {
+                            "Name":  "gdi32full.dll",
+                            "ImageSizeMiB":  1.11
+                        },
+                        {
+                            "Name":  "RPCRT4.dll",
+                            "ImageSizeMiB":  1.09
+                        },
+                        {
+                            "Name":  "ucrtbase.dll",
+                            "ImageSizeMiB":  1.07
+                        },
+                        {
+                            "Name":  "shcore.dll",
+                            "ImageSizeMiB":  1.02
+                        },
+                        {
+                            "Name":  "opengl32.dll",
+                            "ImageSizeMiB":  1
+                        },
+                        {
+                            "Name":  "dxgi.dll",
+                            "ImageSizeMiB":  0.96
+                        },
+                        {
+                            "Name":  "InputSwitch.dll",
+                            "ImageSizeMiB":  0.85
+                        },
+                        {
+                            "Name":  "oleaut32.dll",
+                            "ImageSizeMiB":  0.84
+                        },
+                        {
+                            "Name":  "KERNEL32.DLL",
+                            "ImageSizeMiB":  0.77
+                        },
+                        {
+                            "Name":  "TextShaping.dll",
+                            "ImageSizeMiB":  0.75
+                        },
+                        {
+                            "Name":  "uxtheme.dll",
+                            "ImageSizeMiB":  0.7
+                        },
+                        {
+                            "Name":  "advapi32.dll",
+                            "ImageSizeMiB":  0.69
+                        },
+                        {
+                            "Name":  "clbcatq.dll",
+                            "ImageSizeMiB":  0.69
+                        },
+                        {
+                            "Name":  "sechost.dll",
+                            "ImageSizeMiB":  0.66
+                        },
+                        {
+                            "Name":  "msvcrt.dll",
+                            "ImageSizeMiB":  0.65
+                        },
+                        {
+                            "Name":  "sxs.dll",
+                            "ImageSizeMiB":  0.64
+                        },
+                        {
+                            "Name":  "IntelControlLib.dll",
+                            "ImageSizeMiB":  0.61
+                        },
+                        {
+                            "Name":  "msvcp_win.dll",
+                            "ImageSizeMiB":  0.6
+                        },
+                        {
+                            "Name":  "DUser.dll",
+                            "ImageSizeMiB":  0.6
+                        },
+                        {
+                            "Name":  "WINTRUST.dll",
+                            "ImageSizeMiB":  0.48
+                        },
+                        {
+                            "Name":  "bcryptprimitives.dll",
+                            "ImageSizeMiB":  0.48
+                        },
+                        {
+                            "Name":  "shlwapi.dll",
+                            "ImageSizeMiB":  0.41
+                        },
+                        {
+                            "Name":  "Bcp47Langs.dll",
+                            "ImageSizeMiB":  0.38
+                        },
+                        {
+                            "Name":  "dataexchange.dll",
+                            "ImageSizeMiB":  0.37
+                        },
+                        {
+                            "Name":  "igdext64.dll",
+                            "ImageSizeMiB":  0.36
+                        },
+                        {
+                            "Name":  "MSUTB.dll",
+                            "ImageSizeMiB":  0.31
+                        },
+                        {
+                            "Name":  "CFGMGR32.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "powrprof.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "graphics-hook64.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "UIAnimation.dll",
+                            "ImageSizeMiB":  0.29
+                        },
+                        {
+                            "Name":  "directxdatabasehelper.dll",
+                            "ImageSizeMiB":  0.29
+                        },
+                        {
+                            "Name":  "MLANG.DLL",
+                            "ImageSizeMiB":  0.26
+                        },
+                        {
+                            "Name":  "dxcore.dll",
+                            "ImageSizeMiB":  0.21
+                        },
+                        {
+                            "Name":  "XmlLite.dll",
+                            "ImageSizeMiB":  0.21
+                        },
+                        {
+                            "Name":  "WINMM.dll",
+                            "ImageSizeMiB":  0.2
+                        },
+                        {
+                            "Name":  "imm32.dll",
+                            "ImageSizeMiB":  0.19
+                        },
+                        {
+                            "Name":  "D3DSCache.dll",
+                            "ImageSizeMiB":  0.18
+                        },
+                        {
+                            "Name":  "GLU32.dll",
+                            "ImageSizeMiB":  0.18
+                        },
+                        {
+                            "Name":  "DEVOBJ.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "VCRUNTIME140.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "dwmapi.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "p9np.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "GDI32.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "igdinfo64.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "USERENV.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "bcrypt.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "igd12umd64.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "d3d12.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "win32u.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "igc64.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "profapi.dll",
+                            "ImageSizeMiB":  0.14
+                        },
+                        {
+                            "Name":  "ntlanman.dll",
+                            "ImageSizeMiB":  0.13
+                        },
+                        {
+                            "Name":  "davclnt.dll",
+                            "ImageSizeMiB":  0.12
+                        },
+                        {
+                            "Name":  "mpr.dll",
+                            "ImageSizeMiB":  0.12
+                        },
+                        {
+                            "Name":  "msctfmonitor.dll",
+                            "ImageSizeMiB":  0.11
+                        },
+                        {
+                            "Name":  "CRYPTSP.dll",
+                            "ImageSizeMiB":  0.11
+                        },
+                        {
+                            "Name":  "windows.staterepositorycore.dll",
+                            "ImageSizeMiB":  0.1
+                        },
+                        {
+                            "Name":  "kernel.appcore.dll",
+                            "ImageSizeMiB":  0.09
+                        },
+                        {
+                            "Name":  "UMPDC.dll",
+                            "ImageSizeMiB":  0.07
+                        },
+                        {
+                            "Name":  "MSASN1.dll",
+                            "ImageSizeMiB":  0.07
+                        },
+                        {
+                            "Name":  "drprov.dll",
+                            "ImageSizeMiB":  0.05
+                        },
+                        {
+                            "Name":  "version.dll",
+                            "ImageSizeMiB":  0.04
+                        },
+                        {
+                            "Name":  "IconCodecService.dll",
+                            "ImageSizeMiB":  0.04
+                        }
+                    ],
+        "Case":  "implementation-final",
+        "BackendOverride":  "",
+        "WindowWidth":  1938,
+        "WindowHeight":  1060,
+        "AppWindowResponsive":  true
+    },
+    {
+        "Timestamp":  "2026-10-04T07:08:48.5069829+05:30",
+        "ProcessId":  19576,
+        "Executable":  "E:\\Projects\\FileMan\\target\\release\\fileman.exe",
+        "StartTime":  "2026-10-04T07:07:58.0369564+05:30",
+        "SampleSeconds":  5.03,
+        "WorkingSetMiB":  178.29,
+        "PrivateCommitMiB":  93.51,
+        "PeakWorkingSetMiB":  196.14,
+        "CpuOneCorePercent":  0.31,
+        "Threads":  30,
+        "Handles":  600,
+        "RegionPrivateCommittedMiB":  70.9,
+        "RegionMappedCommittedMiB":  79.56,
+        "RegionImageCommittedMiB":  329.89,
+        "Modules":  [
+                        {
+                            "Name":  "igc1464.dll",
+                            "ImageSizeMiB":  63.04
+                        },
+                        {
+                            "Name":  "igd12um64xel.dll",
+                            "ImageSizeMiB":  34.25
+                        },
+                        {
+                            "Name":  "media_bin_64.dll",
+                            "ImageSizeMiB":  29.18
+                        },
+                        {
+                            "Name":  "igxelpicd64.dll",
+                            "ImageSizeMiB":  19.85
+                        },
+                        {
+                            "Name":  "igddxvacommon64.dll",
+                            "ImageSizeMiB":  19.54
+                        },
+                        {
+                            "Name":  "igvk64.dll",
+                            "ImageSizeMiB":  19.46
+                        },
+                        {
+                            "Name":  "fileman.exe",
+                            "ImageSizeMiB":  18.5
+                        },
+                        {
+                            "Name":  "windows.storage.dll",
+                            "ImageSizeMiB":  9.1
+                        },
+                        {
+                            "Name":  "shell32.dll",
+                            "ImageSizeMiB":  8.61
+                        },
+                        {
+                            "Name":  "D3D10Warp.dll",
+                            "ImageSizeMiB":  7.1
+                        },
+                        {
+                            "Name":  "windowsudk.shellcommon.dll",
+                            "ImageSizeMiB":  5.6
+                        },
+                        {
+                            "Name":  "setupapi.dll",
+                            "ImageSizeMiB":  4.45
+                        },
+                        {
+                            "Name":  "uiautomationcore.dll",
+                            "ImageSizeMiB":  4.29
+                        },
+                        {
+                            "Name":  "igdgmm64.dll",
+                            "ImageSizeMiB":  4.25
+                        },
+                        {
+                            "Name":  "d3dcompiler_47.dll",
+                            "ImageSizeMiB":  3.9
+                        },
+                        {
+                            "Name":  "KERNELBASE.dll",
+                            "ImageSizeMiB":  3.82
+                        },
+                        {
+                            "Name":  "combase.dll",
+                            "ImageSizeMiB":  3.57
+                        },
+                        {
+                            "Name":  "CoreUIComponents.dll",
+                            "ImageSizeMiB":  3.42
+                        },
+                        {
+                            "Name":  "igd12dxva64.dll",
+                            "ImageSizeMiB":  3.13
+                        },
+                        {
+                            "Name":  "explorerframe.dll",
+                            "ImageSizeMiB":  2.75
+                        },
+                        {
+                            "Name":  "twinapi.appcore.dll",
+                            "ImageSizeMiB":  2.65
+                        },
+                        {
+                            "Name":  "Comctl32.dll",
+                            "ImageSizeMiB":  2.61
+                        },
+                        {
+                            "Name":  "dwrite.dll",
+                            "ImageSizeMiB":  2.47
+                        },
+                        {
+                            "Name":  "d3d11.dll",
+                            "ImageSizeMiB":  2.34
+                        },
+                        {
+                            "Name":  "dcomp.dll",
+                            "ImageSizeMiB":  2.33
+                        },
+                        {
+                            "Name":  "ntdll.dll",
+                            "ImageSizeMiB":  2.09
+                        },
+                        {
+                            "Name":  "D3D12Core.dll",
+                            "ImageSizeMiB":  2.01
+                        },
+                        {
+                            "Name":  "DUI70.dll",
+                            "ImageSizeMiB":  1.77
+                        },
+                        {
+                            "Name":  "user32.dll",
+                            "ImageSizeMiB":  1.7
+                        },
+                        {
+                            "Name":  "WindowsCodecs.dll",
+                            "ImageSizeMiB":  1.7
+                        },
+                        {
+                            "Name":  "ole32.dll",
+                            "ImageSizeMiB":  1.63
+                        },
+                        {
+                            "Name":  "vulkan-1.dll",
+                            "ImageSizeMiB":  1.52
+                        },
+                        {
+                            "Name":  "Windows.UI.Core.TextInput.dll",
+                            "ImageSizeMiB":  1.47
+                        },
+                        {
+                            "Name":  "CRYPT32.dll",
+                            "ImageSizeMiB":  1.41
+                        },
+                        {
+                            "Name":  "MSCTF.dll",
+                            "ImageSizeMiB":  1.38
+                        },
+                        {
+                            "Name":  "drvstore.dll",
+                            "ImageSizeMiB":  1.35
+                        },
+                        {
+                            "Name":  "AppXDeploymentClient.dll",
+                            "ImageSizeMiB":  1.29
+                        },
+                        {
+                            "Name":  "igdml64.dll",
+                            "ImageSizeMiB":  1.29
+                        },
+                        {
+                            "Name":  "igvkMedia64.dll",
+                            "ImageSizeMiB":  1.28
+                        },
+                        {
+                            "Name":  "textinputframework.dll",
+                            "ImageSizeMiB":  1.27
+                        },
+                        {
+                            "Name":  "wintypes.dll",
+                            "ImageSizeMiB":  1.25
+                        },
+                        {
+                            "Name":  "CoreMessaging.dll",
+                            "ImageSizeMiB":  1.2
+                        },
+                        {
+                            "Name":  "gdi32full.dll",
+                            "ImageSizeMiB":  1.11
+                        },
+                        {
+                            "Name":  "RPCRT4.dll",
+                            "ImageSizeMiB":  1.09
+                        },
+                        {
+                            "Name":  "ucrtbase.dll",
+                            "ImageSizeMiB":  1.07
+                        },
+                        {
+                            "Name":  "shcore.dll",
+                            "ImageSizeMiB":  1.02
+                        },
+                        {
+                            "Name":  "opengl32.dll",
+                            "ImageSizeMiB":  1
+                        },
+                        {
+                            "Name":  "dxgi.dll",
+                            "ImageSizeMiB":  0.96
+                        },
+                        {
+                            "Name":  "InputSwitch.dll",
+                            "ImageSizeMiB":  0.85
+                        },
+                        {
+                            "Name":  "oleaut32.dll",
+                            "ImageSizeMiB":  0.84
+                        },
+                        {
+                            "Name":  "KERNEL32.DLL",
+                            "ImageSizeMiB":  0.77
+                        },
+                        {
+                            "Name":  "TextShaping.dll",
+                            "ImageSizeMiB":  0.75
+                        },
+                        {
+                            "Name":  "uxtheme.dll",
+                            "ImageSizeMiB":  0.7
+                        },
+                        {
+                            "Name":  "advapi32.dll",
+                            "ImageSizeMiB":  0.69
+                        },
+                        {
+                            "Name":  "clbcatq.dll",
+                            "ImageSizeMiB":  0.69
+                        },
+                        {
+                            "Name":  "sechost.dll",
+                            "ImageSizeMiB":  0.66
+                        },
+                        {
+                            "Name":  "msvcrt.dll",
+                            "ImageSizeMiB":  0.65
+                        },
+                        {
+                            "Name":  "sxs.dll",
+                            "ImageSizeMiB":  0.64
+                        },
+                        {
+                            "Name":  "IntelControlLib.dll",
+                            "ImageSizeMiB":  0.61
+                        },
+                        {
+                            "Name":  "msvcp_win.dll",
+                            "ImageSizeMiB":  0.6
+                        },
+                        {
+                            "Name":  "DUser.dll",
+                            "ImageSizeMiB":  0.6
+                        },
+                        {
+                            "Name":  "WINTRUST.dll",
+                            "ImageSizeMiB":  0.48
+                        },
+                        {
+                            "Name":  "bcryptprimitives.dll",
+                            "ImageSizeMiB":  0.48
+                        },
+                        {
+                            "Name":  "shlwapi.dll",
+                            "ImageSizeMiB":  0.41
+                        },
+                        {
+                            "Name":  "Bcp47Langs.dll",
+                            "ImageSizeMiB":  0.38
+                        },
+                        {
+                            "Name":  "dataexchange.dll",
+                            "ImageSizeMiB":  0.37
+                        },
+                        {
+                            "Name":  "igdext64.dll",
+                            "ImageSizeMiB":  0.36
+                        },
+                        {
+                            "Name":  "MSUTB.dll",
+                            "ImageSizeMiB":  0.31
+                        },
+                        {
+                            "Name":  "CFGMGR32.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "powrprof.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "graphics-hook64.dll",
+                            "ImageSizeMiB":  0.3
+                        },
+                        {
+                            "Name":  "UIAnimation.dll",
+                            "ImageSizeMiB":  0.29
+                        },
+                        {
+                            "Name":  "directxdatabasehelper.dll",
+                            "ImageSizeMiB":  0.29
+                        },
+                        {
+                            "Name":  "MLANG.DLL",
+                            "ImageSizeMiB":  0.26
+                        },
+                        {
+                            "Name":  "dxcore.dll",
+                            "ImageSizeMiB":  0.21
+                        },
+                        {
+                            "Name":  "XmlLite.dll",
+                            "ImageSizeMiB":  0.21
+                        },
+                        {
+                            "Name":  "WINMM.dll",
+                            "ImageSizeMiB":  0.2
+                        },
+                        {
+                            "Name":  "imm32.dll",
+                            "ImageSizeMiB":  0.19
+                        },
+                        {
+                            "Name":  "D3DSCache.dll",
+                            "ImageSizeMiB":  0.18
+                        },
+                        {
+                            "Name":  "GLU32.dll",
+                            "ImageSizeMiB":  0.18
+                        },
+                        {
+                            "Name":  "DEVOBJ.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "VCRUNTIME140.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "dwmapi.dll",
+                            "ImageSizeMiB":  0.17
+                        },
+                        {
+                            "Name":  "p9np.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "igdinfo64.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "GDI32.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "USERENV.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "igd12umd64.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "bcrypt.dll",
+                            "ImageSizeMiB":  0.16
+                        },
+                        {
+                            "Name":  "win32u.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "igc64.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "d3d12.dll",
+                            "ImageSizeMiB":  0.15
+                        },
+                        {
+                            "Name":  "profapi.dll",
+                            "ImageSizeMiB":  0.14
+                        },
+                        {
+                            "Name":  "ntlanman.dll",
+                            "ImageSizeMiB":  0.13
+                        },
+                        {
+                            "Name":  "davclnt.dll",
+                            "ImageSizeMiB":  0.12
+                        },
+                        {
+                            "Name":  "mpr.dll",
+                            "ImageSizeMiB":  0.12
+                        },
+                        {
+                            "Name":  "msctfmonitor.dll",
+                            "ImageSizeMiB":  0.11
+                        },
+                        {
+                            "Name":  "CRYPTSP.dll",
+                            "ImageSizeMiB":  0.11
+                        },
+                        {
+                            "Name":  "windows.staterepositorycore.dll",
+                            "ImageSizeMiB":  0.1
+                        },
+                        {
+                            "Name":  "kernel.appcore.dll",
+                            "ImageSizeMiB":  0.09
+                        },
+                        {
+                            "Name":  "UMPDC.dll",
+                            "ImageSizeMiB":  0.07
+                        },
+                        {
+                            "Name":  "MSASN1.dll",
+                            "ImageSizeMiB":  0.07
+                        },
+                        {
+                            "Name":  "drprov.dll",
+                            "ImageSizeMiB":  0.05
+                        },
+                        {
+                            "Name":  "version.dll",
+                            "ImageSizeMiB":  0.04
+                        },
+                        {
+                            "Name":  "IconCodecService.dll",
+                            "ImageSizeMiB":  0.04
+                        }
+                    ],
+        "Case":  "implementation-repeat",
+        "BackendOverride":  "",
+        "WindowWidth":  1938,
+        "WindowHeight":  1060,
+        "AppWindowResponsive":  true
+    }
+]

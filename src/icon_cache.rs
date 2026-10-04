@@ -10,6 +10,26 @@ use std::path::Path;
 
 use eframe::egui;
 
+pub type FileIconCache = crate::bounded_cache::BoundedCache<String, Option<egui::TextureHandle>>;
+
+pub fn cached_file_icon(
+    cache: &mut FileIconCache,
+    ctx: &egui::Context,
+    path: &Path,
+) -> Option<egui::TextureHandle> {
+    let key = file_icon_cache_key(path);
+    if let Some(texture) = cache.get(&key) {
+        return texture.clone();
+    }
+    let texture = load_file_icon_texture(ctx, path);
+    let bytes = key.len()
+        + texture
+            .as_ref()
+            .map_or(0, |t| t.size()[0] * t.size()[1] * 4);
+    cache.insert(key, texture.clone(), bytes);
+    texture
+}
+
 /// Extracts the exe's icon and caches it as an egui texture.
 #[cfg(windows)]
 pub fn load_icon_texture(ctx: &egui::Context, exe_path: &str) -> Option<egui::TextureHandle> {
