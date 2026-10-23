@@ -310,6 +310,9 @@ pub struct FileManApp {
     /// (like `split_ratio`) rather than via `egui::Panel`'s own resize
     /// handling, which was found not to persist the released width.
     tree_width: f32,
+    /// Whether the shared folder tree is visible. Kept separate from its
+    /// width so collapsing it does not forget the user's preferred size.
+    show_folder_tree: bool,
     /// Device name (e.g. `\\.\DISPLAY1`) of the monitor the window was last
     /// observed on, refreshed whenever the window's position changes.
     last_monitor_name: Option<String>,
@@ -743,6 +746,9 @@ impl FileManApp {
         let favourites = crate::db::get_favourites(&conn, current_user_id);
         let split_ratio = crate::db::get_split_ratio(&conn, current_user_id).unwrap_or(0.5);
         let tree_width = crate::db::get_tree_width(&conn, current_user_id).unwrap_or(200.0);
+        let show_folder_tree = crate::config::get(&conn, current_user_id, "show_folder_tree")
+            .map(|raw| raw != "false")
+            .unwrap_or(true);
         let users = crate::user::list_users(&conn);
         let _ = crate::actions::init_tables(&conn);
         let shortcut_map = crate::actions::load_shortcut_map(&conn, current_user_id);
@@ -812,6 +818,7 @@ impl FileManApp {
             background_op_dirs: Vec::new(),
             split_ratio,
             tree_width,
+            show_folder_tree,
             last_monitor_name: None,
             shortcut_map,
             toolbar_actions,
@@ -1136,6 +1143,9 @@ impl FileManApp {
         self.active_pane = active_pane;
         self.split_ratio = crate::db::get_split_ratio(&self.conn, user_id).unwrap_or(0.5);
         self.tree_width = crate::db::get_tree_width(&self.conn, user_id).unwrap_or(200.0);
+        self.show_folder_tree = crate::config::get(&self.conn, user_id, "show_folder_tree")
+            .map(|raw| raw != "false")
+            .unwrap_or(true);
         self.theme_pref = crate::config::get(&self.conn, user_id, "theme")
             .map(|raw| parse_theme_pref(&raw))
             .unwrap_or_default();
@@ -4078,6 +4088,21 @@ impl FileManApp {
                             .data(|d| d.get_temp::<(PathBuf, usize)>(shift_id))
                             .filter(|(p, _)| *p == current_path)
                             .map_or(0, |(_, s)| s);
+                        let max_shift = crumbs_all.len().saturating_sub(1);
+                        if ui
+                            .add_enabled(shift < max_shift, egui::Button::new("◀"))
+                            .on_hover_text("Show folders hidden on the left")
+                            .clicked()
+                        {
+                            shift += 1;
+                        }
+                        if ui
+                            .add_enabled(shift > 0, egui::Button::new("▶"))
+                            .on_hover_text("Return toward the current folder")
+                            .clicked()
+                        {
+                            shift = shift.saturating_sub(1);
+                        }
                         if ui.rect_contains_pointer(ui.max_rect()) {
                             let dy: f32 = ui.input(|i| {
                                 i.raw
@@ -4095,7 +4120,7 @@ impl FileManApp {
                                 shift = shift.saturating_sub(1);
                             }
                         }
-                        shift = shift.min(crumbs_all.len() - 1);
+                        shift = shift.min(max_shift);
                         ui.data_mut(|d| d.insert_temp(shift_id, (current_path.clone(), shift)));
                         let shifted = shift > 0;
                         let crumbs = &crumbs_all[..crumbs_all.len() - shift];
@@ -4353,6 +4378,34 @@ impl FileManApp {
                 }
             }
         });
+
+        let (item_count, selected_count, selected_bytes) = {
+            let tab = pane.active_tab();
+            let selected_bytes = tab
+                .listing
+                .iter()
+                .filter(|entry| !entry.is_dir && tab.selected.contains(&entry.name))
+                .map(|entry| entry.size)
+                .sum::<u64>();
+            (tab.listing.len(), tab.selected.len(), selected_bytes)
+        };
+        egui::Panel::bottom(egui::Id::new(("pane_status", pane_idx)))
+            .exact_size(22.0)
+            .show(ui, |ui| {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(format!("{item_count} items"));
+                    if selected_count > 0 {
+                        ui.separator();
+                        let size = if selected_bytes > 0 {
+                            format!(" · {}", format_file_size(selected_bytes))
+                        } else {
+                            String::new()
+                        };
+                        ui.label(format!("{selected_count} selected{size}"));
+                    }
+                });
+            });
 
         // Filtering + sorting involves an O(n log n) sort with
         // per-comparison lowercasing allocations — cache it on the tab and
@@ -5543,6 +5596,7 @@ impl eframe::App for FileManApp {
         let tree_max_w = (tree_total_rect.width() - tree_divider_w - 200.0).max(tree_min_w);
         self.tree_width = self.tree_width.clamp(tree_min_w, tree_max_w);
 
+        if self.show_folder_tree {
         egui::Panel::left("folder_tree")
             .resizable(false)
             .exact_size(self.tree_width)
@@ -5693,6 +5747,8 @@ impl eframe::App for FileManApp {
             }
         }
 
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 // The favourite button's label/hover flips on whether the
@@ -5704,6 +5760,22 @@ impl eframe::App for FileManApp {
 
                 let toolbar_actions = self.toolbar_actions.clone();
                 let mut clicked: Option<ActionRef> = None;
+
+                if ui
+                    .selectable_label(self.show_folder_tree, "Folders")
+                    .on_hover_text("Show or hide the folder tree")
+                    .clicked()
+                {
+                    self.show_folder_tree = !self.show_folder_tree;
+                    let _ = crate::config::set(
+                        &self.conn,
+                        crate::config::Scope::User(self.current_user_id),
+                        "show_folder_tree",
+                        if self.show_folder_tree { "true" } else { "false" },
+                    );
+                    self.dirty = true;
+                }
+                ui.separator();
 
                 // 🕒 Recent button — always the first toolbar button.
                 let recent_btn = toolbar_button(
@@ -5782,6 +5854,7 @@ impl eframe::App for FileManApp {
                     }
                 }
 
+                let mut previous_group: Option<u8> = None;
                 for action_ref in &toolbar_actions {
                     match action_ref {
                         // Custom actions get their own second row below the
@@ -5789,6 +5862,18 @@ impl eframe::App for FileManApp {
                         // saved layouts.
                         ActionRef::Custom(_) => {}
                         ActionRef::Builtin(action) => {
+                            let group = match action {
+                                Action::GoBack | Action::GoForward | Action::GoUp | Action::Refresh => 0,
+                                Action::Copy | Action::Cut | Action::Paste | Action::Rename
+                                    | Action::CopyFilename | Action::CopyFolderPath => 1,
+                                Action::Delete => 2,
+                                Action::NewFolder | Action::NewFile | Action::NewTab | Action::CloseTab => 3,
+                                _ => 4,
+                            };
+                            if previous_group.is_some_and(|prev| prev != group) {
+                                ui.separator();
+                            }
+                            previous_group = Some(group);
                             let (label, hover, enabled) = match action {
                                 Action::Copy => ("📋 Copy", "Copy selection (Ctrl+C)", true),
                                 Action::Cut => ("Cut", "Cut selection (Ctrl+X)", true),
@@ -7528,7 +7613,17 @@ impl eframe::App for FileManApp {
                     let is_active = pane_idx == self.active_pane;
                     let pane_rect = pane_rects[pane_idx];
                     ui.scope_builder(egui::UiBuilder::new().max_rect(pane_rect), |ui| {
-                        ui.group(|ui| {
+                        let stroke = if is_active {
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 120, 212))
+                        } else {
+                            ui.visuals().widgets.noninteractive.bg_stroke
+                        };
+                        egui::Frame::new()
+                            .fill(ui.visuals().panel_fill)
+                            .stroke(stroke)
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::same(4))
+                            .show(ui, |ui| {
                             self.show_pane_body(ui, &ctx, pane_idx, is_active);
                         });
                     });
@@ -8173,7 +8268,7 @@ fn tab_strip_item(
                     sw: 0,
                     se: 0,
                 },
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 165, 0)),
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 120, 212)),
                 egui::StrokeKind::Inside,
             );
         }
