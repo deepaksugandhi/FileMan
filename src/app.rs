@@ -4390,7 +4390,10 @@ impl FileManApp {
             (tab.listing.len(), tab.selected.len(), selected_bytes)
         };
         egui::Panel::bottom(egui::Id::new(("pane_status", pane_idx)))
-            .exact_size(22.0)
+            // The separator and text row both consume vertical space. A
+            // 22-point panel clipped the lower half of the text at the
+            // default Windows font size.
+            .exact_size(ui.spacing().interact_size.y + 8.0)
             .show(ui, |ui| {
                 ui.separator();
                 ui.horizontal(|ui| {
