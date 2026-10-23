@@ -5397,6 +5397,16 @@ impl eframe::App for FileManApp {
             }
         }
 
+        // Escape closes Settings unless the Shortcuts page is actively
+        // capturing a replacement binding; in that case Escape cancels the
+        // capture below and leaves Settings open.
+        if self.show_settings
+            && self.capturing_shortcut_for.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.show_settings = false;
+        }
+
         // While the Settings "Shortcuts" tab is waiting for a rebind, the
         // next key event is captured here instead of dispatching normally.
         if let Some(action) = self.capturing_shortcut_for {
