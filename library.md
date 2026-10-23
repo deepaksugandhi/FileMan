@@ -1,0 +1,8 @@
+# FileMan Knowledge Library
+
+WikiLinks in this file resolve to documents under `.clairvoyance/`.
+
+## When to read what
+
+- IF changing FileMan architecture, directory listings, caching, search, icons, tabs, or other runtime behavior → read [[memory/lessons]]
+
