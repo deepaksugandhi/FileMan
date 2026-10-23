@@ -8,7 +8,6 @@ use crate::tab::ViewMode;
 use crate::tree;
 use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;
-use egui_phosphor::regular as icons;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -584,7 +583,6 @@ fn apply_fonts(ctx: &egui::Context, family: &str, status: &mut String) {
         egui::FontFamily::Name(APP_BOLD_FAMILY.into()),
         vec![bold_font],
     );
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 }
 
@@ -4140,7 +4138,11 @@ impl FileManApp {
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button(icons::FOLDER_OPEN).on_hover_text("Type a path").clicked() {
+                    if ui
+                        .button("Path")
+                        .on_hover_text("Type a path")
+                        .clicked()
+                    {
                         pane.address_edit_mode = true;
                     }
                     if pane.address_edit_mode {
@@ -4407,7 +4409,11 @@ impl FileManApp {
         }
 
         ui.horizontal(|ui| {
-            if ui.button(icons::ARROW_LEFT).on_hover_text("Back").clicked() {
+            if ui
+                .button("Back")
+                .on_hover_text("Back")
+                .clicked()
+            {
                 if pane.active_tab().locked {
                     self.status = "Tab is pinned — unpin it to navigate".to_string();
                 } else if pane.active_tab_mut().go_back() {
@@ -4416,7 +4422,11 @@ impl FileManApp {
                     self.dirty = true;
                 }
             }
-            if ui.button(icons::ARROW_RIGHT).on_hover_text("Forward").clicked() {
+            if ui
+                .button("Forward")
+                .on_hover_text("Forward")
+                .clicked()
+            {
                 if pane.active_tab().locked {
                     self.status = "Tab is pinned — unpin it to navigate".to_string();
                 } else if pane.active_tab_mut().go_forward() {
@@ -4425,7 +4435,11 @@ impl FileManApp {
                     self.dirty = true;
                 }
             }
-            if ui.button(icons::ARROW_UP).on_hover_text("Up").clicked() {
+            if ui
+                .button("Up")
+                .on_hover_text("Up")
+                .clicked()
+            {
                 if let Some(parent) = current_path.parent() {
                     let parent_path = parent.to_path_buf();
                     if pane.active_tab_mut().try_navigate(parent_path.clone()) {
