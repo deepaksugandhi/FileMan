@@ -1010,6 +1010,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4299551488dddaa8f757727e1eb4ffdaf277ffe6e30b413403468f5ecf4634"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1079,6 +1088,15 @@ dependencies = [
  "log",
  "profiling",
  "winit",
+]
+
+[[package]]
+name = "egui_ltreeview"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7aff0f79eec78ea0b2084940afd4d31bec4e78e3bdd221387d41ed38ac700130"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
@@ -1271,7 +1289,9 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "egui-phosphor",
  "egui_extras",
+ "egui_ltreeview",
  "flate2",
  "raw-window-handle",
  "rfd",

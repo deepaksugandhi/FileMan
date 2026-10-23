@@ -8,6 +8,7 @@ use crate::tab::ViewMode;
 use crate::tree;
 use eframe::egui;
 use egui::scroll_area::ScrollBarVisibility;
+use egui_phosphor::regular as icons;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -316,6 +317,9 @@ pub struct FileManApp {
     /// Whether the shared folder tree is visible. Kept separate from its
     /// width so collapsing it does not forget the user's preferred size.
     show_folder_tree: bool,
+    /// Opt-in prototype using `egui_ltreeview`; the established custom tree
+    /// remains available as the default fallback.
+    use_ltreeview: bool,
     /// Device name (e.g. `\\.\DISPLAY1`) of the monitor the window was last
     /// observed on, refreshed whenever the window's position changes.
     last_monitor_name: Option<String>,
@@ -580,6 +584,7 @@ fn apply_fonts(ctx: &egui::Context, family: &str, status: &mut String) {
         egui::FontFamily::Name(APP_BOLD_FAMILY.into()),
         vec![bold_font],
     );
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 }
 
@@ -752,6 +757,9 @@ impl FileManApp {
         let show_folder_tree = crate::config::get(&conn, current_user_id, "show_folder_tree")
             .map(|raw| raw != "false")
             .unwrap_or(true);
+        let use_ltreeview = crate::config::get(&conn, current_user_id, "use_ltreeview")
+            .map(|raw| raw == "true")
+            .unwrap_or(false);
         let users = crate::user::list_users(&conn);
         let _ = crate::actions::init_tables(&conn);
         let shortcut_map = crate::actions::load_shortcut_map(&conn, current_user_id);
@@ -823,6 +831,7 @@ impl FileManApp {
             split_ratio,
             tree_width,
             show_folder_tree,
+            use_ltreeview,
             last_monitor_name: None,
             shortcut_map,
             toolbar_actions,
@@ -1152,6 +1161,9 @@ impl FileManApp {
         self.show_folder_tree = crate::config::get(&self.conn, user_id, "show_folder_tree")
             .map(|raw| raw != "false")
             .unwrap_or(true);
+        self.use_ltreeview = crate::config::get(&self.conn, user_id, "use_ltreeview")
+            .map(|raw| raw == "true")
+            .unwrap_or(false);
         self.theme_pref = crate::config::get(&self.conn, user_id, "theme")
             .map(|raw| parse_theme_pref(&raw))
             .unwrap_or_default();
@@ -1330,6 +1342,89 @@ impl FileManApp {
     /// after navigation to reveal the active path in the tree). `label`
     /// overrides the header text (system folders show a friendly name
     /// instead of the path's last segment).
+    fn add_ltree_branch(
+        builder: &mut egui_ltreeview::TreeViewBuilder<'_, PathBuf>,
+        cache: &mut crate::bounded_cache::BoundedCache<PathBuf, Vec<PathBuf>>,
+        missing: &mut Vec<PathBuf>,
+        dir: &Path,
+        label: Option<&str>,
+    ) {
+        let text = label.map(str::to_owned).unwrap_or_else(|| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string())
+        });
+        let open = builder.dir(dir.to_path_buf(), text);
+        if open {
+            if let Some(children) = cache.remove(dir) {
+                let bytes = Self::subdirs_bytes(&children);
+                for child in &children {
+                    Self::add_ltree_branch(builder, cache, missing, child, None);
+                }
+                cache.insert(dir.to_path_buf(), children, bytes);
+            } else {
+                missing.push(dir.to_path_buf());
+            }
+        }
+        builder.close_dir();
+    }
+
+    fn show_ltree_folder_tree(&mut self, ui: &mut egui::Ui, active_path: &Path) {
+        let tree_id = egui::Id::new("experimental_folder_tree");
+        let mut state = egui_ltreeview::TreeViewState::<PathBuf>::load(ui, tree_id)
+            .unwrap_or_default();
+        state.set_one_selected(active_path.to_path_buf());
+        for ancestor in active_path.ancestors() {
+            state.set_openness(ancestor.to_path_buf(), true);
+        }
+
+        let system_folders = self.system_folders.clone();
+        let drives = self.drives.clone();
+        let network_roots = self.network_servers.clone();
+        let cache = &mut self.tree_subdirs_cache;
+        let mut missing = Vec::new();
+        let (_, actions) = egui_ltreeview::TreeView::new(tree_id)
+            .allow_multi_selection(false)
+            .allow_drag_and_drop(false)
+            .min_height(ui.available_height())
+            .show_state(ui, &mut state, |builder| {
+                for (label, path) in &system_folders {
+                    Self::add_ltree_branch(builder, cache, &mut missing, path, Some(label));
+                }
+                for drive in &drives {
+                    Self::add_ltree_branch(builder, cache, &mut missing, drive, None);
+                }
+                for root in &network_roots {
+                    Self::add_ltree_branch(builder, cache, &mut missing, root, None);
+                }
+            });
+        state.store(ui, tree_id);
+
+        for dir in missing {
+            if self.tree_subdirs_jobs.contains_key(&dir) || self.tree_subdirs_jobs.len() >= 4 {
+                continue;
+            }
+            let (tx, rx) = mpsc::channel();
+            let job_dir = dir.clone();
+            thread::spawn(move || {
+                let _ = tx.send(crate::fs_entry::list_subdirs(&job_dir));
+            });
+            self.tree_subdirs_jobs.insert(dir, rx);
+        }
+        for action in actions {
+            let target = match action {
+                egui_ltreeview::Action::SetSelected(paths) => paths.into_iter().next(),
+                egui_ltreeview::Action::Activate(activate) => activate.selected.into_iter().next(),
+                _ => None,
+            };
+            if let Some(path) = target
+                && self.try_navigate_active(self.active_pane, path)
+            {
+                self.dirty = true;
+            }
+        }
+    }
+
     fn show_dir_node(
         &mut self,
         ui: &mut egui::Ui,
@@ -3194,6 +3289,23 @@ impl FileManApp {
                 }
             }
         });
+
+        ui.add_space(14.0);
+        settings_group_label(ui, "Folder Tree");
+        if ui
+            .checkbox(&mut self.use_ltreeview, "Use experimental tree widget")
+            .on_hover_text("Try egui_ltreeview; turn this off to return to FileMan's original tree")
+            .changed()
+        {
+            let _ = crate::config::set(
+                &self.conn,
+                crate::config::Scope::User(self.current_user_id),
+                "use_ltreeview",
+                if self.use_ltreeview { "true" } else { "false" },
+            );
+            self.prev_active_path = None;
+            self.tree_reveal_target = None;
+        }
     }
 
     /// Settings page: system integration toggles.
@@ -4028,7 +4140,7 @@ impl FileManApp {
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("📁").on_hover_text("Type a path").clicked() {
+                    if ui.button(icons::FOLDER_OPEN).on_hover_text("Type a path").clicked() {
                         pane.address_edit_mode = true;
                     }
                     if pane.address_edit_mode {
@@ -4295,7 +4407,7 @@ impl FileManApp {
         }
 
         ui.horizontal(|ui| {
-            if ui.button("⬅").on_hover_text("Back").clicked() {
+            if ui.button(icons::ARROW_LEFT).on_hover_text("Back").clicked() {
                 if pane.active_tab().locked {
                     self.status = "Tab is pinned — unpin it to navigate".to_string();
                 } else if pane.active_tab_mut().go_back() {
@@ -4304,7 +4416,7 @@ impl FileManApp {
                     self.dirty = true;
                 }
             }
-            if ui.button("➡").on_hover_text("Forward").clicked() {
+            if ui.button(icons::ARROW_RIGHT).on_hover_text("Forward").clicked() {
                 if pane.active_tab().locked {
                     self.status = "Tab is pinned — unpin it to navigate".to_string();
                 } else if pane.active_tab_mut().go_forward() {
@@ -4313,7 +4425,7 @@ impl FileManApp {
                     self.dirty = true;
                 }
             }
-            if ui.button("⬆").on_hover_text("Up").clicked() {
+            if ui.button(icons::ARROW_UP).on_hover_text("Up").clicked() {
                 if let Some(parent) = current_path.parent() {
                     let parent_path = parent.to_path_buf();
                     if pane.active_tab_mut().try_navigate(parent_path.clone()) {
@@ -4391,7 +4503,6 @@ impl FileManApp {
                 }
             }
         });
-
         let (item_count, selected_count, selected_bytes) = {
             let tab = pane.active_tab();
             let selected_bytes = tab
@@ -5628,13 +5739,19 @@ impl eframe::App for FileManApp {
             .exact_size(self.tree_width)
             .show(ui, |ui| {
                 ui.heading("Folders");
-
+                let active_path = self.panes[self.active_pane].active_tab().path.clone();
+                if self.use_ltreeview {
+                    egui::ScrollArea::both()
+                        .id_salt("experimental_folder_tree_scroll")
+                        .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                        .auto_shrink(false)
+                        .show(ui, |ui| self.show_ltree_folder_tree(ui, &active_path));
+                } else {
                 egui::ScrollArea::both()
                     .id_salt("folder_tree_scroll")
                     .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        let active_path = self.panes[self.active_pane].active_tab().path.clone();
                         // Detect navigation: force-expand tree when active path changes
                         let path_changed = self.prev_active_path.as_ref() != Some(&active_path);
                         if path_changed {
@@ -5756,6 +5873,7 @@ impl eframe::App for FileManApp {
                         self.tree_scroll_frames = self.tree_scroll_frames.saturating_sub(1);
                         self.tree_collapse_frames = self.tree_collapse_frames.saturating_sub(1);
                     });
+                }
             });
 
         {
