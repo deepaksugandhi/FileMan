@@ -12,6 +12,19 @@ const OVERRIDE_KEYS: [&str; 2] = [
     r"Software\Classes\Folder\shell\open\command",
 ];
 
+/// Parents of the verb tables. Their default value names the verb a
+/// double-click runs; other file managers (e.g. Directory Opus sets
+/// `Folder\shell` to its own verb) hijack it, so `open` must be forced.
+#[cfg(windows)]
+const VERB_KEYS: [&str; 2] = [
+    r"Software\Classes\Directory\shell",
+    r"Software\Classes\Folder\shell",
+];
+
+/// Value under a verb key holding the default verb it had before we took over.
+#[cfg(windows)]
+const PREV_VERB: &str = "FileMan.PrevDefaultVerb";
+
 /// Is this FileMan executable currently written into the per-user override?
 #[cfg(windows)]
 pub fn is_default() -> bool {
@@ -20,12 +33,20 @@ pub fn is_default() -> bool {
         Err(_) => return false,
     };
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    OVERRIDE_KEYS.iter().any(|key| {
+    let cmd_ok = OVERRIDE_KEYS.iter().any(|key| {
         hkcu.open_subkey(key)
             .and_then(|k| k.get_value::<String, _>(""))
             .map(|cmd| cmd.to_lowercase().contains(&exe))
             .unwrap_or(false)
-    })
+    });
+    // The command only matters if "open" is also the default verb.
+    cmd_ok
+        && VERB_KEYS.iter().all(|key| {
+            hkcu.open_subkey(key)
+                .and_then(|k| k.get_value::<String, _>(""))
+                .map(|v| v == "open")
+                .unwrap_or(false)
+        })
 }
 
 /// Points the per-user folder-open verbs at this executable. `%V` is the
@@ -40,6 +61,15 @@ pub fn set_default() -> std::io::Result<()> {
     for key in OVERRIDE_KEYS {
         let (key, _) = hkcu.create_subkey(key)?;
         key.set_value("", &cmd)?;
+    }
+    for key in VERB_KEYS {
+        let (key, _) = hkcu.create_subkey(key)?;
+        let prev: String = key.get_value("").unwrap_or_default();
+        // Keep the first-seen original across repeated set_default calls.
+        if prev != "open" && key.get_value::<String, _>(PREV_VERB).is_err() {
+            key.set_value(PREV_VERB, &prev)?;
+        }
+        key.set_value("", &"open")?;
     }
     Ok(())
 }
@@ -57,6 +87,22 @@ pub fn clear_default() -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+    }
+    for key in VERB_KEYS {
+        let Ok(k) = hkcu.open_subkey_with_flags(key, winreg::enums::KEY_ALL_ACCESS) else {
+            continue;
+        };
+        match k.get_value::<String, _>(PREV_VERB) {
+            // Put back what another file manager had set (or remove ours).
+            Ok(prev) if !prev.is_empty() => k.set_value("", &prev)?,
+            Ok(_) => {
+                let _ = k.delete_value("");
+            }
+            Err(_) => {
+                let _ = k.delete_value("");
+            }
+        }
+        let _ = k.delete_value(PREV_VERB);
     }
     Ok(())
 }

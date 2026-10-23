@@ -4010,23 +4010,33 @@ impl FileManApp {
                     }
                     if pane.address_edit_mode {
                         let address_id = egui::Id::new(("address_bar", pane_idx));
-                        let address_resp = ui.add(
-                            egui::TextEdit::singleline(&mut pane.address_bar)
-                                .id(address_id)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("Type a path and press Enter...")
-                                .frame(
-                                    egui::Frame::new()
-                                        .fill(egui::Color32::TRANSPARENT)
-                                        .stroke(egui::Stroke::NONE),
-                                ),
-                        );
+                        let mut address_out = egui::TextEdit::singleline(&mut pane.address_bar)
+                            .id(address_id)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Type a path and press Enter...")
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                            )
+                            .show(ui);
+                        let address_resp = address_out.response;
                         // Seed keyboard focus once, then stop asking: egui
                         // evaluates `lost_focus` against the LIVE focus
                         // state, so re-requesting every frame would cancel
                         // the very Enter-surrenders-focus transition the
                         // commit below relies on.
                         if focused_address_pane != Some(pane_idx) {
+                            // Select the existing path so typing replaces it.
+                            // Stored state is picked up by the next frame's
+                            // TextEdit, which is when focus actually lands.
+                            address_out.state.cursor.set_char_range(Some(
+                                egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(pane.address_bar.chars().count()),
+                                ),
+                            ));
+                            egui::TextEdit::store_state(ui.ctx(), address_id, address_out.state);
                             address_resp.request_focus();
                         }
                         // Track which pane's address bar has focus
@@ -4059,7 +4069,36 @@ impl FileManApp {
                             pane.address_edit_mode = false;
                         }
                     } else {
-                        let crumbs = Self::path_breadcrumbs(&current_path);
+                        let crumbs_all = Self::path_breadcrumbs(&current_path);
+                        // Mouse wheel over the bar scrolls the trail: wheel up
+                        // hides trailing crumbs so hidden ancestors come into
+                        // view. Reset whenever the path changes.
+                        let shift_id = egui::Id::new(("crumb_shift", pane_idx));
+                        let mut shift = ui
+                            .data(|d| d.get_temp::<(PathBuf, usize)>(shift_id))
+                            .filter(|(p, _)| *p == current_path)
+                            .map_or(0, |(_, s)| s);
+                        if ui.rect_contains_pointer(ui.max_rect()) {
+                            let dy: f32 = ui.input(|i| {
+                                i.raw
+                                    .events
+                                    .iter()
+                                    .map(|e| match e {
+                                        egui::Event::MouseWheel { delta, .. } => delta.y + delta.x,
+                                        _ => 0.0,
+                                    })
+                                    .sum()
+                            });
+                            if dy > 0.0 {
+                                shift += 1;
+                            } else if dy < 0.0 {
+                                shift = shift.saturating_sub(1);
+                            }
+                        }
+                        shift = shift.min(crumbs_all.len() - 1);
+                        ui.data_mut(|d| d.insert_temp(shift_id, (current_path.clone(), shift)));
+                        let shifted = shift > 0;
+                        let crumbs = &crumbs_all[..crumbs_all.len() - shift];
                         // Fit as many trailing crumbs (closest to the current
                         // folder) as the available width allows, so a long
                         // path truncates its earliest ancestors behind an
@@ -4115,7 +4154,7 @@ impl FileManApp {
                         }
                         let mut copy_clicked = false;
                         for (i, (label, full_path)) in crumbs.iter().enumerate().skip(first_shown) {
-                            if i == last_idx {
+                            if i == last_idx && !shifted {
                                 // Current folder: not a navigation button
                                 // (that would just "navigate" to the
                                 // already-current path) — instead it shares
@@ -4156,7 +4195,7 @@ impl FileManApp {
                             } else if ui.button(label).clicked() {
                                 nav_target = Some(full_path.clone());
                             }
-                            if i != last_idx
+                            if (i != last_idx || shifted)
                                 && let Some(target) = Self::crumb_separator_menu(
                                     ui,
                                     &font_id,
@@ -6443,8 +6482,15 @@ impl eframe::App for FileManApp {
                 if let Some(action) = find_row_action {
                     match action {
                         FindRowAction::Open(path) => {
-                            self.record_recent(&path, false);
-                            self.open_path(&path);
+                            if path.is_dir() {
+                                // Folders open as a tab here, not in
+                                // whatever the OS default browser is.
+                                self.open_tab_with_default_sort(self.active_pane, path);
+                                self.dirty = true;
+                            } else {
+                                self.record_recent(&path, false);
+                                self.open_path(&path);
+                            }
                         }
                         FindRowAction::Reveal(parent) => {
                             if self.try_navigate_active(self.active_pane, parent) {
