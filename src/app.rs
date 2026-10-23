@@ -240,6 +240,9 @@ pub struct FileManApp {
     last_selected_index: Option<usize>,
     /// Previous active path for detecting navigation changes (tree auto-expand).
     prev_active_path: Option<PathBuf>,
+    /// Path the folder tree is still expanding toward. This remains set
+    /// across frames while lazy background directory scans resolve.
+    tree_reveal_target: Option<PathBuf>,
     font_family: String,
     /// The font_family that was last handed to `ctx.set_fonts`, so we only
     /// rebuild the font atlas when the setting actually changes.
@@ -793,6 +796,7 @@ impl FileManApp {
             font_size,
             last_selected_index: None,
             prev_active_path: None,
+            tree_reveal_target: None,
             font_family,
             fonts_applied_family: None,
             fonts_pending_apply: false,
@@ -1141,6 +1145,8 @@ impl FileManApp {
         };
         self.panes = panes;
         self.active_pane = active_pane;
+        self.prev_active_path = None;
+        self.tree_reveal_target = None;
         self.split_ratio = crate::db::get_split_ratio(&self.conn, user_id).unwrap_or(0.5);
         self.tree_width = crate::db::get_tree_width(&self.conn, user_id).unwrap_or(200.0);
         self.show_folder_tree = crate::config::get(&self.conn, user_id, "show_folder_tree")
@@ -1348,6 +1354,10 @@ impl FileManApp {
         let active_l = PathBuf::from(active_path.to_string_lossy().to_lowercase());
         let is_active = dir_l == active_l;
         let is_ancestor = active_l.starts_with(&dir_l);
+        let reveal_active = is_active
+            && self.tree_reveal_target.as_ref().is_some_and(|target| {
+                target.to_string_lossy().eq_ignore_ascii_case(&active_path.to_string_lossy())
+            });
         // The active folder gets a genuinely bold weight (bundled Segoe UI
         // Bold — `RichText::strong()` only changes color, which read faint),
         // an explicit high-contrast text color, and an accent chip behind it.
@@ -1430,10 +1440,13 @@ impl FileManApp {
         if is_active {
             // Keep centering the active folder while the post-navigation
             // scroll window is open (see `tree_scroll_frames`).
-            if self.tree_scroll_frames > 0 {
+            if reveal_active || self.tree_scroll_frames > 0 {
                 response
                     .header_response
                     .scroll_to_me(Some(egui::Align::Center));
+            }
+            if reveal_active {
+                self.tree_reveal_target = None;
             }
             // Row-wide selection tint behind the accent chip.
             let rect = response.header_response.rect;
@@ -5613,15 +5626,21 @@ impl eframe::App for FileManApp {
                     .show(ui, |ui| {
                         let active_path = self.panes[self.active_pane].active_tab().path.clone();
                         // Detect navigation: force-expand tree when active path changes
-                        let force_expand = self.prev_active_path.as_ref() != Some(&active_path);
-                        if force_expand {
+                        let path_changed = self.prev_active_path.as_ref() != Some(&active_path);
+                        if path_changed {
                             self.prev_active_path = Some(active_path.clone());
+                            self.tree_reveal_target = Some(active_path.clone());
                             // Keep centering for several passes while the newly
                             // expanded branches settle their layout.
                             self.tree_scroll_frames = 8;
                             // Same window for collapsing branches off the active path.
                             self.tree_collapse_frames = 8;
                         }
+                        // Keep forcing every ancestor open until the lazily
+                        // loaded tree has actually rendered the target node.
+                        // A one-frame signal expires before background scans
+                        // complete, leaving deeper parents collapsed.
+                        let force_expand = self.tree_reveal_target.is_some();
 
                         // Favourites section
                         if !self.favourites.is_empty() {
