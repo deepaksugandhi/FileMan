@@ -1346,18 +1346,26 @@ impl FileManApp {
         missing: &mut Vec<PathBuf>,
         dir: &Path,
         label: Option<&str>,
+        active_path: &Path,
     ) {
         let text = label.map(str::to_owned).unwrap_or_else(|| {
             dir.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| dir.display().to_string())
         });
+        let dir_l = PathBuf::from(dir.to_string_lossy().to_lowercase());
+        let active_l = PathBuf::from(active_path.to_string_lossy().to_lowercase());
+        let text = if active_l.starts_with(&dir_l) {
+            egui::RichText::new(text).color(egui::Color32::from_rgb(220, 45, 45))
+        } else {
+            egui::RichText::new(text)
+        };
         let open = builder.dir(dir.to_path_buf(), text);
         if open {
             if let Some(children) = cache.remove(dir) {
                 let bytes = Self::subdirs_bytes(&children);
                 for child in &children {
-                    Self::add_ltree_branch(builder, cache, missing, child, None);
+                    Self::add_ltree_branch(builder, cache, missing, child, None, active_path);
                 }
                 cache.insert(dir.to_path_buf(), children, bytes);
             } else {
@@ -1387,13 +1395,34 @@ impl FileManApp {
             .min_height(ui.available_height())
             .show_state(ui, &mut state, |builder| {
                 for (label, path) in &system_folders {
-                    Self::add_ltree_branch(builder, cache, &mut missing, path, Some(label));
+                    Self::add_ltree_branch(
+                        builder,
+                        cache,
+                        &mut missing,
+                        path,
+                        Some(label),
+                        active_path,
+                    );
                 }
                 for drive in &drives {
-                    Self::add_ltree_branch(builder, cache, &mut missing, drive, None);
+                    Self::add_ltree_branch(
+                        builder,
+                        cache,
+                        &mut missing,
+                        drive,
+                        None,
+                        active_path,
+                    );
                 }
                 for root in &network_roots {
-                    Self::add_ltree_branch(builder, cache, &mut missing, root, None);
+                    Self::add_ltree_branch(
+                        builder,
+                        cache,
+                        &mut missing,
+                        root,
+                        None,
+                        active_path,
+                    );
                 }
             });
         state.store(ui, tree_id);
@@ -1431,7 +1460,7 @@ impl FileManApp {
         active_path: &Path,
         force_expand: bool,
         show_eject: bool,
-    ) {
+    ) -> Option<egui::Pos2> {
         let label = label
             .map(|l| l.to_string())
             .unwrap_or_else(|| {
@@ -1471,6 +1500,8 @@ impl FileManApp {
                 ));
             }
             text
+        } else if is_ancestor {
+            egui::RichText::new(label).color(egui::Color32::from_rgb(220, 45, 45))
         } else {
             egui::RichText::new(label)
         };
@@ -1484,13 +1515,18 @@ impl FileManApp {
             // persists through CollapsingState, so this sticks afterwards.
             header = header.open(Some(false));
         }
+        let mut active_child_anchor = None;
         let response = header.show(ui, |ui| {
             // Take the vec out of the cache, iterate, then put it back — avoids
             // cloning every child `Vec<PathBuf>` per frame.
             if let Some(subdirs) = self.tree_subdirs_cache.remove(dir) {
                 let bytes = Self::subdirs_bytes(&subdirs);
                 for subdir in &subdirs {
-                    self.show_dir_node(ui, subdir, None, active_path, force_expand, false);
+                    if let Some(anchor) =
+                        self.show_dir_node(ui, subdir, None, active_path, force_expand, false)
+                    {
+                        active_child_anchor = Some(anchor);
+                    }
                 }
                 self.tree_subdirs_cache.insert(dir.to_path_buf(), subdirs, bytes);
                 return;
@@ -1518,7 +1554,11 @@ impl FileManApp {
                 let bytes = Self::subdirs_bytes(&subdirs);
                 self.tree_subdirs_jobs.remove(dir);
                 for subdir in &subdirs {
-                    self.show_dir_node(ui, subdir, None, active_path, force_expand, false);
+                    if let Some(anchor) =
+                        self.show_dir_node(ui, subdir, None, active_path, force_expand, false)
+                    {
+                        active_child_anchor = Some(anchor);
+                    }
                 }
                 self.tree_subdirs_cache
                     .insert(dir.to_path_buf(), subdirs, bytes);
@@ -1549,6 +1589,20 @@ impl FileManApp {
                 ui.visuals().selection.bg_fill.gamma_multiply(0.45),
             );
         }
+        let path_anchor = if is_ancestor {
+            let rect = response.header_response.rect;
+            let anchor = egui::pos2(rect.left() + 3.0, rect.center().y);
+            let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 45, 45));
+            ui.painter().circle_filled(anchor, 2.5, stroke.color);
+            if let Some(child) = active_child_anchor {
+                let elbow = egui::pos2(child.x, anchor.y);
+                ui.painter().line_segment([anchor, elbow], stroke);
+                ui.painter().line_segment([elbow, child], stroke);
+            }
+            Some(anchor)
+        } else {
+            None
+        };
         if show_eject {
             let eject_path = dir.to_path_buf();
             styled_context_menu(&response.header_response, |ui| {
@@ -1577,6 +1631,7 @@ impl FileManApp {
                 self.dirty = true;
             }
         }
+        path_anchor
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
