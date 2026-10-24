@@ -5969,7 +5969,10 @@ impl eframe::App for FileManApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // Keep every configured action reachable at narrower window
+            // widths. The toolbar can contain user-added actions, so a
+            // single non-wrapping row eventually pushes buttons off-screen.
+            ui.horizontal_wrapped(|ui| {
                 // The favourite button's label/hover flips on whether the
                 // current folder is already favourited. Every other action
                 // renders the same regardless of state.
