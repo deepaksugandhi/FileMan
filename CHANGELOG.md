@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.16 (2026-10-24)
+
+- Folder tree stays synced with the active pane and highlights the active folder's ancestry; optional tree widget.
+- Trial Phosphor icons; ambiguous navigation glyphs replaced with text labels.
+- Fixed pane status text clipping, improved path navigation/folder handling; Escape now closes Settings.
+
 ## v0.1.15 (2026-10-04)
 
 - Memory: idle private commit down ~66% and resident memory ~50% in release measurements (see docs/RAM-IMPLEMENTATION.md).
