@@ -3,7 +3,7 @@
 Findings from a read-through of the render path (`src/app.rs` `impl eframe::App::ui`)
 and its helpers, plus a mechanical implementation plan.
 
-Status: **not started**. Baseline version: v0.1.10 (commit `af3775f`).
+Status: **tasks 1-11 done** (v0.1.11+); follow-ups in `DevDox/Favnyr_Comparison_Analysis.md`. Baseline version: v0.1.10 (commit `af3775f`).
 
 ---
 

@@ -27,6 +27,7 @@ const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 
+#[cfg(test)]
 pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -35,6 +36,49 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<FsEntry>> {
     }
     sort_entries(&mut entries, "name", true);
     Ok(entries)
+}
+
+/// Messages from a streaming directory listing worker.
+pub enum ListMsg {
+    /// More entries, in directory order (unsorted; the view sorts).
+    Batch(Vec<FsEntry>),
+    /// The scan finished; `Err` only if the directory itself couldn't be read.
+    Done(io::Result<()>),
+}
+
+/// Reads `dir` and hands entries to `emit` in batches (first batch after
+/// `FIRST_BATCH` entries, then every `BATCH_EVERY` or `BATCH_MAX`) so huge or
+/// slow (network) folders paint progressively. An entry whose metadata can't
+/// be read is skipped rather than failing the whole listing. Stops early if
+/// `emit` returns false (receiver gone).
+pub fn list_dir_streaming(dir: &Path, mut emit: impl FnMut(Vec<FsEntry>) -> bool) -> io::Result<()> {
+    const FIRST_BATCH: usize = 256;
+    const BATCH_MAX: usize = 4096;
+    const BATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut batch = Vec::with_capacity(FIRST_BATCH);
+    let mut first = true;
+    let mut last_flush = std::time::Instant::now();
+    for entry in fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(item) = read_entry(entry) else { continue };
+        batch.push(item);
+        let due = if first {
+            batch.len() >= FIRST_BATCH
+        } else {
+            batch.len() >= BATCH_MAX || (batch.len() >= 64 && last_flush.elapsed() >= BATCH_EVERY)
+        };
+        if due {
+            first = false;
+            last_flush = std::time::Instant::now();
+            if !emit(std::mem::take(&mut batch)) {
+                return Ok(());
+            }
+        }
+    }
+    if !batch.is_empty() {
+        emit(batch);
+    }
+    Ok(())
 }
 
 pub fn read_entry(entry: fs::DirEntry) -> io::Result<FsEntry> {
@@ -134,6 +178,22 @@ mod tests {
         assert_eq!(entries[1].name, "a.txt");
         assert!(!entries[1].is_dir);
         assert_eq!(entries[2].name, "b.txt");
+    }
+
+    #[test]
+    fn streaming_delivers_every_entry_in_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..700 {
+            std::fs::write(dir.path().join(format!("f{n}.txt")), b"x").unwrap();
+        }
+        let mut batches = Vec::new();
+        list_dir_streaming(dir.path(), |b| {
+            batches.push(b.len());
+            true
+        })
+        .unwrap();
+        assert_eq!(batches.iter().sum::<usize>(), 700);
+        assert!(batches.len() >= 2, "first batch flushes before the scan ends");
     }
 
     #[test]

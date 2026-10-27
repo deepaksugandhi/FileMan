@@ -10,25 +10,87 @@ use std::path::Path;
 
 use eframe::egui;
 
-pub type FileIconCache = crate::bounded_cache::BoundedCache<String, Option<egui::TextureHandle>>;
+/// Raw BGRA pixels and size of a shell icon, produced off the UI thread.
+type RawIcon = Option<(Vec<u8>, [usize; 2])>;
+
+/// Shell-icon cache for file listings. Misses are resolved on a background
+/// worker (`SHGetFileInfoW` can take tens of ms — per file for exe/lnk/ico,
+/// and far longer on network paths), so scrolling never blocks on the shell.
+/// Until an icon arrives the caller sees `None` and draws its text fallback.
+pub struct FileIconCache {
+    cache: crate::bounded_cache::BoundedCache<String, Option<egui::TextureHandle>>,
+    pending: std::collections::HashSet<String>,
+    req_tx: std::sync::mpsc::Sender<(String, std::path::PathBuf, egui::Context)>,
+    done_rx: std::sync::mpsc::Receiver<(String, RawIcon)>,
+}
+
+/// Cap on in-flight requests so a fast scroll through a huge folder doesn't
+/// queue work for rows that are already off screen.
+const MAX_PENDING_ICONS: usize = 64;
+
+impl FileIconCache {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        let (req_tx, req_rx) =
+            std::sync::mpsc::channel::<(String, std::path::PathBuf, egui::Context)>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            init_worker_com();
+            while let Ok((key, path, ctx)) = req_rx.recv() {
+                let raw = file_icon_rgba(&path);
+                if done_tx.send((key, raw)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+        FileIconCache {
+            cache: crate::bounded_cache::BoundedCache::new(max_entries, max_bytes),
+            pending: Default::default(),
+            req_tx,
+            done_rx,
+        }
+    }
+
+    fn drain(&mut self, ctx: &egui::Context) {
+        while let Ok((key, raw)) = self.done_rx.try_recv() {
+            self.pending.remove(&key);
+            let texture = raw.map(|(rgba, size)| finish_texture(ctx, "file_icon", rgba, size));
+            let bytes = key.len()
+                + texture
+                    .as_ref()
+                    .map_or(0, |t| t.size()[0] * t.size()[1] * 4);
+            self.cache.insert(key, texture, bytes);
+        }
+    }
+}
 
 pub fn cached_file_icon(
     cache: &mut FileIconCache,
     ctx: &egui::Context,
     path: &Path,
 ) -> Option<egui::TextureHandle> {
+    cache.drain(ctx);
     let key = file_icon_cache_key(path);
-    if let Some(texture) = cache.get(&key) {
+    if let Some(texture) = cache.cache.get(&key) {
         return texture.clone();
     }
-    let texture = load_file_icon_texture(ctx, path);
-    let bytes = key.len()
-        + texture
-            .as_ref()
-            .map_or(0, |t| t.size()[0] * t.size()[1] * 4);
-    cache.insert(key, texture.clone(), bytes);
-    texture
+    if cache.pending.len() < MAX_PENDING_ICONS && !cache.pending.contains(&key) {
+        cache.pending.insert(key.clone());
+        let _ = cache.req_tx.send((key, path.to_path_buf(), ctx.clone()));
+    }
+    None
 }
+
+#[cfg(windows)]
+fn init_worker_com() {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+}
+
+#[cfg(not(windows))]
+fn init_worker_com() {}
 
 /// Extracts the exe's icon and caches it as an egui texture.
 #[cfg(windows)]
@@ -62,12 +124,9 @@ pub fn file_icon_cache_key(path: &Path) -> String {
 }
 
 /// Extracts the shell-associated icon for a file path (what Explorer shows
-/// for that file type) as an egui texture.
+/// for that file type) as raw BGRA pixels. Safe to call off the UI thread.
 #[cfg(windows)]
-pub fn load_file_icon_texture(
-    ctx: &egui::Context,
-    path: &std::path::Path,
-) -> Option<egui::TextureHandle> {
+fn file_icon_rgba(path: &std::path::Path) -> RawIcon {
     use std::os::windows::ffi::OsStrExt;
 
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
@@ -97,15 +156,11 @@ pub fn load_file_icon_texture(
     unsafe {
         let _ = DestroyIcon(sfi.hIcon);
     }
-    let (rgba, size) = decoded?;
-    Some(finish_texture(ctx, "file_icon", rgba, size))
+    decoded
 }
 
 #[cfg(not(windows))]
-pub fn load_file_icon_texture(
-    _ctx: &egui::Context,
-    _path: &std::path::Path,
-) -> Option<egui::TextureHandle> {
+fn file_icon_rgba(_path: &std::path::Path) -> RawIcon {
     None
 }
 

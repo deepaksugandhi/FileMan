@@ -5,11 +5,12 @@ edition = "2024"
 
 [dependencies]
 chrono = "0.4.45"
-eframe = "0.36.1"
+eframe = { version = "0.36.1", features = ["glow"] }
 egui = "0.36.1"
 egui_extras = { version = "0.36.1", features = ["image"] }
 egui_ltreeview = "0.9"
 flate2 = "1.1"
+notify = "8"
 raw-window-handle = "0.6"
 rfd = "0.15"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -31,3 +32,4 @@ winresource = "0.1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true

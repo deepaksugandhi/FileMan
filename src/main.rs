@@ -6,6 +6,7 @@ mod archive;
 mod bounded_cache;
 mod config;
 mod db;
+mod dirwatch;
 mod fs_entry;
 mod fs_ops;
 mod icon_cache;
@@ -13,6 +14,7 @@ mod migrate;
 mod monitor;
 mod native_drag;
 mod pane;
+mod perf;
 mod progress;
 mod search;
 mod session;
@@ -34,6 +36,7 @@ fn db_path() -> std::path::PathBuf {
 }
 
 fn main() -> eframe::Result<()> {
+    perf::mark_start();
     // Must happen before the window is created so Windows doesn't group this
     // instance's taskbar button with other running instances (see taskbar.rs).
     let instance_slot = taskbar::claim_instance_slot_and_set_identity();
@@ -91,8 +94,20 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // `renderer` setting (Settings > Appearance, restart required) or the
+    // FILEMAN_RENDERER env var: "glow" = OpenGL (lighter, faster start),
+    // anything else = wgpu.
+    let want_glow = std::env::var("FILEMAN_RENDERER")
+        .ok()
+        .or_else(|| config::get(&conn, user_id, "renderer"))
+        .is_some_and(|r| r.eq_ignore_ascii_case("glow"));
     let mut options = eframe::NativeOptions {
         viewport,
+        renderer: if want_glow {
+            eframe::Renderer::Glow
+        } else {
+            eframe::Renderer::Wgpu
+        },
         ..Default::default()
     };
     // This file manager needs small graphics allocations, not large GPU pools.

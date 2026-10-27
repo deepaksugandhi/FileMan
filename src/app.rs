@@ -15,6 +15,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+mod help;
+mod menus;
+mod nav_icons;
+#[cfg(test)]
+mod tests;
+
+use help::*;
+use menus::*;
+use nav_icons::*;
+
+
 /// Height of the launcher/file-launch search boxes on the toolbar's second
 /// row, matched to `toolbar_button`'s icon+text button height so the boxes
 /// don't sit shorter (and thus off-center) than the buttons beside them.
@@ -206,6 +217,10 @@ struct BulkRenameEntry {
 }
 
 pub struct FileManApp {
+    perf: crate::perf::Perf,
+    /// Live folder watcher; created lazily (needs the egui context).
+    dirwatch: Option<crate::dirwatch::DirWatch>,
+    dirwatch_tried: bool,
     conn: Connection,
     current_user_id: i64,
     /// Cached list of user profiles, refreshed on switch/create.
@@ -493,18 +508,31 @@ fn current_monitor_name(frame: &eframe::Frame) -> Option<String> {
 }
 
 /// A directory listing running on a background thread, polled each frame.
+/// Entries stream in as batches (`fs_entry::list_dir_streaming`).
 struct ListingJob {
     dir: PathBuf,
-    rx: mpsc::Receiver<std::io::Result<Vec<crate::fs_entry::FsEntry>>>,
+    rx: mpsc::Receiver<crate::fs_entry::ListMsg>,
+    /// Entries received so far when not publishing progressively.
+    partial: Vec<crate::fs_entry::FsEntry>,
+    /// Nothing was on screen when the job started (fresh navigation), so
+    /// batches are shown as they arrive. A refresh of a visible listing is
+    /// swapped in whole at the end instead, to avoid flicker.
+    progressive: bool,
 }
 
-fn spawn_listing_job(dir: PathBuf) -> ListingJob {
+fn spawn_listing_job(dir: PathBuf, progressive: bool, ctx: egui::Context) -> ListingJob {
     let (tx, rx) = mpsc::channel();
     let job_dir = dir.clone();
     thread::spawn(move || {
-        let _ = tx.send(crate::fs_entry::list_dir(&job_dir));
+        let done = crate::fs_entry::list_dir_streaming(&job_dir, |batch| {
+            let ok = tx.send(crate::fs_entry::ListMsg::Batch(batch)).is_ok();
+            ctx.request_repaint();
+            ok
+        });
+        let _ = tx.send(crate::fs_entry::ListMsg::Done(done));
+        ctx.request_repaint();
     });
-    ListingJob { dir, rx }
+    ListingJob { dir, rx, partial: Vec::new(), progressive }
 }
 
 /// Maps a Settings font-family choice to its file on disk under the Windows
@@ -782,6 +810,9 @@ impl FileManApp {
         }
         let recent_items = crate::db::get_recent_items(&conn, current_user_id, 50);
         FileManApp {
+            perf: crate::perf::Perf::new(),
+            dirwatch: None,
+            dirwatch_tried: false,
             conn,
             current_user_id,
             users,
@@ -895,36 +926,59 @@ impl FileManApp {
             }
         }
         let tab = pane.active_tab_mut();
-        if let Some(job) = &self.listing_jobs[pane_idx] {
-            match job.rx.try_recv() {
-                Ok(result) => {
-                    if tab.path == job.dir {
-                        match result {
-                            Ok(mut entries) => {
-                                if !self.show_hidden { entries.retain(|entry| !entry.hidden); }
-                                tab.listing = std::sync::Arc::new(entries);
-                                tab.display_cache = None;
-                                tab.listing_error = None;
-                                tab.listing_version += 1;
-                            }
-                            Err(error) => tab.listing_error = Some(error.to_string()),
+        if let Some(job) = &mut self.listing_jobs[pane_idx] {
+            let mut finished: Option<std::io::Result<()>> = None;
+            let mut published = false;
+            loop {
+                match job.rx.try_recv() {
+                    Ok(crate::fs_entry::ListMsg::Batch(mut batch)) => {
+                        if !self.show_hidden { batch.retain(|entry| !entry.hidden); }
+                        if tab.path != job.dir { continue; }
+                        if job.progressive {
+                            std::sync::Arc::make_mut(&mut tab.listing).extend(batch);
+                            published = true;
+                        } else {
+                            job.partial.extend(batch);
                         }
                     }
-                    self.listing_jobs[pane_idx] = None;
+                    Ok(crate::fs_entry::ListMsg::Done(result)) => {
+                        finished = Some(result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = Some(Err(std::io::Error::other("Directory worker stopped")));
+                        break;
+                    }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if tab.path == job.dir { tab.listing_error = Some("Directory worker stopped".into()); }
-                    self.listing_jobs[pane_idx] = None;
+            }
+            if tab.path == job.dir {
+                match &finished {
+                    Some(Ok(())) => {
+                        if !job.progressive {
+                            tab.listing = std::sync::Arc::new(std::mem::take(&mut job.partial));
+                        }
+                        tab.listing_error = None;
+                        published = true;
+                    }
+                    Some(Err(error)) => tab.listing_error = Some(error.to_string()),
+                    None => {}
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                if published {
+                    tab.display_cache = None;
+                    tab.listing_version += 1;
+                }
+            }
+            if finished.is_some() {
+                self.listing_jobs[pane_idx] = None;
             }
         }
         if self.listing_jobs[pane_idx].is_none() && tab.listing_dirty {
             tab.listing_dirty = false;
-            self.listing_jobs[pane_idx] = Some(spawn_listing_job(tab.path.clone()));
+            self.listing_jobs[pane_idx] = Some(spawn_listing_job(tab.path.clone(), tab.listing.is_empty(), ctx.clone()));
         }
         if self.listing_jobs[pane_idx].is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 
@@ -2663,6 +2717,24 @@ impl FileManApp {
                 crate::config::Scope::User(self.current_user_id),
                 "tab_orientation",
                 orientation.as_str(),
+            );
+        }
+
+        ui.add_space(14.0);
+        settings_group_label(ui, "Renderer (restart required)");
+        let mut renderer = crate::config::get(&self.conn, self.current_user_id, "renderer")
+            .unwrap_or_else(|| "wgpu".to_string());
+        let before = renderer.clone();
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut renderer, "wgpu".to_string(), "wgpu (default)");
+            ui.radio_value(&mut renderer, "glow".to_string(), "OpenGL (lighter)");
+        });
+        if renderer != before {
+            let _ = crate::config::set(
+                &self.conn,
+                crate::config::Scope::User(self.current_user_id),
+                "renderer",
+                &renderer,
             );
         }
 
@@ -5375,6 +5447,21 @@ fn clipboard_event_combo(i: &egui::InputState) -> Option<crate::actions::KeyComb
 //    exist here; the equivalent is `ctx.input(|i| i.viewport_rect())`.
 impl eframe::App for FileManApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.perf.begin(ui.ctx());
+        self.ui_body(ui, frame);
+        self.perf.end(ui.ctx());
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if self.dirty {
+            self.persist();
+            self.dirty = false;
+        }
+    }
+}
+
+impl FileManApp {
+    fn ui_body(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !matches!(self.dialog, Some(Dialog::Find { .. })) {
             self.find_job = None;
@@ -5778,10 +5865,8 @@ impl eframe::App for FileManApp {
         // Another app may have changed these folders while we were in the
         // background, so re-list both panes the moment the window regains
         // focus. Only on the false->true edge, not for every focused frame.
-        // ponytail: refresh-on-focus rather than a filesystem watcher — no
-        // extra threads or handles, and it covers the case that actually
-        // matters (edit a file elsewhere, alt-tab back). Add
-        // ReadDirectoryChangesW only if live updates while focused are needed.
+        // The watcher below covers changes while focused; this stays as a
+        // backstop for folders it can't watch (offline shares, permissions).
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if focused && !self.was_focused {
             for pane in &mut self.panes {
@@ -5789,6 +5874,24 @@ impl eframe::App for FileManApp {
             }
         }
         self.was_focused = focused;
+
+        // Live updates while focused: watch the folder each pane shows and
+        // re-list (debounced) when something inside it changes.
+        if !self.dirwatch_tried {
+            self.dirwatch_tried = true;
+            self.dirwatch = crate::dirwatch::DirWatch::new(&ctx);
+        }
+        if let Some(watch) = &mut self.dirwatch {
+            let shown: Vec<PathBuf> = self
+                .panes
+                .iter()
+                .map(|p| p.active_tab().path.clone())
+                .collect();
+            watch.sync(&shown);
+            for dir in watch.poll(&ctx) {
+                self.mark_dir_dirty(&dir);
+            }
+        }
 
         self.poll_drive_scan(&ctx);
 
@@ -6487,7 +6590,7 @@ impl eframe::App for FileManApp {
                             bar_fill,
                         );
                     }
-                    ctx.request_repaint();
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
                 }
             }
             for dir in &newly_finished_dirs {
@@ -7952,13 +8055,6 @@ impl eframe::App for FileManApp {
             self.dirty = false;
         }
     }
-
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        if self.dirty {
-            self.persist();
-            self.dirty = false;
-        }
-    }
 }
 
 /// Large title + one-line description that opens a settings page, followed
@@ -7975,177 +8071,6 @@ fn settings_header(ui: &mut egui::Ui, title: &str, desc: &str) {
 /// Small bold group caption inside a settings page.
 fn settings_group_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).strong());
-}
-
-/// Draws a settings-nav icon with plain epaint shapes so it never depends on
-/// emoji/font coverage. All coordinates are fractions of the icon rect.
-fn paint_nav_icon(
-    painter: &egui::Painter,
-    r: egui::Rect,
-    page: SettingsPage,
-    color: egui::Color32,
-) {
-    let stroke = egui::Stroke::new(1.4, color);
-    let c = r.center();
-    let rad = r.width() * 0.42;
-    let p = |fx: f32, fy: f32| egui::pos2(r.left() + r.width() * fx, r.top() + r.height() * fy);
-    match page {
-        SettingsPage::Appearance => {
-            // Half-filled circle: light/dark theme toggle.
-            painter.circle_stroke(c, rad, stroke);
-            // Right half as a filled fan (no circle_sector helper here).
-            let fill_r = rad - 1.2;
-            let steps = 20;
-            let mut pts = vec![c];
-            for k in 0..=steps {
-                let a =
-                    -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * (k as f32 / steps as f32);
-                pts.push(c + fill_r * egui::vec2(a.cos(), a.sin()));
-            }
-            painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-        }
-        SettingsPage::Shortcuts => {
-            // Keyboard: outlined body, space bar, two keys.
-            painter.rect_stroke(
-                r.shrink2(egui::vec2(0.5, 3.5)),
-                3.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(p(0.22, 0.62), egui::vec2(r.width() * 0.56, 2.4)),
-                1.0,
-                color,
-            );
-            painter.circle_filled(p(0.33, 0.38), 1.4, color);
-            painter.circle_filled(p(0.52, 0.38), 1.4, color);
-            painter.circle_filled(p(0.71, 0.38), 1.4, color);
-        }
-        SettingsPage::Toolbar => {
-            // Three descending bars.
-            for (i, w) in [0.86f32, 0.62, 0.40].into_iter().enumerate() {
-                let y = r.top() + 3.0 + i as f32 * 4.6;
-                painter.rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(r.left() + 2.0, y),
-                        egui::vec2((r.width() - 4.0) * w, 2.6),
-                    ),
-                    1.2,
-                    color,
-                );
-            }
-        }
-        SettingsPage::CustomActions => {
-            // Lightning bolt zigzag.
-            let pts = [
-                p(0.66, 0.02),
-                p(0.30, 0.55),
-                p(0.54, 0.55),
-                p(0.36, 0.98),
-                p(0.74, 0.42),
-                p(0.50, 0.42),
-                p(0.72, 0.02),
-            ];
-            painter.add(egui::Shape::line(pts.to_vec(), stroke));
-        }
-        SettingsPage::AppLauncher => {
-            // Rocket / launch icon: triangle body + two fins + circle exhaust.
-            // Body (upward triangle).
-            painter.add(egui::Shape::convex_polygon(
-                vec![p(0.50, 0.04), p(0.30, 0.70), p(0.70, 0.70)],
-                color,
-                egui::Stroke::NONE,
-            ));
-            // Left fin.
-            painter.add(egui::Shape::line(
-                vec![p(0.30, 0.70), p(0.16, 0.92), p(0.38, 0.78)],
-                stroke,
-            ));
-            // Right fin.
-            painter.add(egui::Shape::line(
-                vec![p(0.70, 0.70), p(0.84, 0.92), p(0.62, 0.78)],
-                stroke,
-            ));
-            // Exhaust circle.
-            painter.circle_filled(p(0.50, 0.88), r.width() * 0.10, color);
-        }
-        SettingsPage::FileLauncher => {
-            // Document with a small arrow: file + launch.
-            // Document body (folded-corner rectangle).
-            painter.add(egui::Shape::line(
-                vec![
-                    p(0.20, 0.06),
-                    p(0.58, 0.06),
-                    p(0.76, 0.24),
-                    p(0.76, 0.94),
-                    p(0.20, 0.94),
-                    p(0.20, 0.06),
-                ],
-                stroke,
-            ));
-            painter.line_segment([p(0.58, 0.06), p(0.58, 0.24)], stroke);
-            painter.line_segment([p(0.58, 0.24), p(0.76, 0.24)], stroke);
-            // Small right-pointing triangle (launch) in the lower-left.
-            painter.add(egui::Shape::convex_polygon(
-                vec![p(0.24, 0.50), p(0.24, 0.82), p(0.48, 0.66)],
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-        SettingsPage::FileTypes => {
-            // Small file/document with a folded corner.
-            painter.add(egui::Shape::line(
-                vec![
-                    p(0.22, 0.06),
-                    p(0.60, 0.06),
-                    p(0.78, 0.24),
-                    p(0.78, 0.94),
-                    p(0.22, 0.94),
-                    p(0.22, 0.06),
-                ],
-                stroke,
-            ));
-            painter.line_segment([p(0.60, 0.06), p(0.60, 0.24)], stroke);
-            painter.line_segment([p(0.60, 0.24), p(0.78, 0.24)], stroke);
-        }
-        SettingsPage::ViewMode => {
-            // Three horizontal lines (list layout icon).
-            for (i, w) in [1.0f32, 0.75, 0.5].into_iter().enumerate() {
-                let y = r.top() + 3.0 + i as f32 * 4.6;
-                painter.rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(r.left() + 2.0, y),
-                        egui::vec2((r.width() - 4.0) * w, 2.6),
-                    ),
-                    1.2,
-                    color,
-                );
-            }
-        }
-        SettingsPage::Advanced => {
-            // Gear: ring + teeth stubs + hub.
-            painter.circle_stroke(c, rad - 2.2, stroke);
-            for k in 0..8u32 {
-                let a = k as f32 * std::f32::consts::TAU / 8.0;
-                let dx = a.cos();
-                let dy = a.sin();
-                painter.line_segment(
-                    [
-                        c + rad * 0.62 * egui::vec2(dx, dy),
-                        c + (rad - 0.6) * egui::vec2(dx, dy),
-                    ],
-                    stroke,
-                );
-            }
-            painter.circle_filled(c, 2.2, color);
-        }
-        SettingsPage::About => {
-            // Info glyph: ring, dot, stem.
-            painter.circle_stroke(c, rad, stroke);
-            painter.circle_filled(p(0.5, 0.28), 1.5, color);
-            painter.line_segment([p(0.5, 0.46), p(0.5, 0.76)], stroke);
-        }
-    }
 }
 
 /// Clickable column header that shows a sort-direction arrow when its
@@ -8663,724 +8588,5 @@ fn tab_strip_item(
             None
         },
         rect: tab_resp.rect,
-    }
-}
-
-/// Background fill for right-click context menus, deliberately distinct from
-/// the page background (`panel_fill`, which egui otherwise matches exactly)
-/// so the floating menu reads as its own surface in both themes.
-fn context_menu_fill(theme: egui::Theme) -> egui::Color32 {
-    match theme {
-        // Page: gray(27) — a blue-tinted dark slate stands out clearly.
-        egui::Theme::Dark => egui::Color32::from_rgb(34, 43, 60),
-        // Page: gray(248) — a blue-tinted light gray stands out clearly.
-        egui::Theme::Light => egui::Color32::from_rgb(226, 235, 250),
-    }
-}
-
-/// A toolbar command button with an accent-blue "ribbon" treatment so the
-/// Color variant for toolbar buttons, so different action categories are
-/// visually distinct at a glance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ButtonStyle {
-    /// Default blue ribbon — builtin toolbar actions and launcher apps.
-    Blue,
-    /// Green/teal tint — custom "open with" actions.
-    Green,
-}
-
-/// Styled toolbar command button with a ribbon-like 3D bevel effect so
-/// action rows read as commands rather than page content. Keeps the 3D
-/// bevel/hover-lift/press-in states via a scoped widget-style override.
-fn toolbar_button(
-    ui: &mut egui::Ui,
-    label: String,
-    icon: Option<&egui::TextureHandle>,
-    style: ButtonStyle,
-) -> egui::Response {
-    let dark = ui.visuals().dark_mode;
-    let (face, hover_face, active_face, border, hover_border) = if dark {
-        match style {
-            ButtonStyle::Blue => (
-                egui::Color32::from_rgb(45, 64, 84),
-                egui::Color32::from_rgb(58, 82, 106),
-                egui::Color32::from_rgb(30, 44, 58),
-                egui::Color32::from_rgb(17, 25, 34),
-                egui::Color32::from_rgb(104, 148, 190),
-            ),
-            ButtonStyle::Green => (
-                egui::Color32::from_rgb(30, 72, 60),
-                egui::Color32::from_rgb(42, 96, 80),
-                egui::Color32::from_rgb(20, 52, 42),
-                egui::Color32::from_rgb(14, 38, 30),
-                egui::Color32::from_rgb(80, 180, 148),
-            ),
-        }
-    } else {
-        match style {
-            ButtonStyle::Blue => (
-                egui::Color32::from_rgb(232, 241, 250),
-                egui::Color32::WHITE,
-                egui::Color32::from_rgb(184, 212, 240),
-                egui::Color32::from_rgb(163, 197, 229),
-                egui::Color32::from_rgb(110, 165, 220),
-            ),
-            ButtonStyle::Green => (
-                egui::Color32::from_rgb(220, 243, 235),
-                egui::Color32::WHITE,
-                egui::Color32::from_rgb(170, 220, 200),
-                egui::Color32::from_rgb(140, 195, 175),
-                egui::Color32::from_rgb(80, 160, 130),
-            ),
-        }
-    };
-    ui.scope(|ui| {
-        let v = &mut ui.style_mut().visuals;
-        v.widgets.inactive.bg_fill = face;
-        v.widgets.inactive.weak_bg_fill = face;
-        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
-        v.widgets.hovered.bg_fill = hover_face;
-        v.widgets.hovered.weak_bg_fill = hover_face;
-        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, hover_border);
-        v.widgets.hovered.expansion = 1.0;
-        v.widgets.active.bg_fill = active_face;
-        v.widgets.active.weak_bg_fill = active_face;
-        v.widgets.active.bg_stroke =
-            egui::Stroke::new(1.0, if dark { border } else { hover_border });
-        let btn = match icon {
-            Some(tex) => egui::Button::image_and_text(
-                egui::Image::new(egui::load::SizedTexture::new(
-                    tex.id(),
-                    egui::vec2(16.0, 16.0),
-                )),
-                label,
-            ),
-            None => egui::Button::new(label),
-        };
-        ui.add(btn)
-    })
-    .inner
-}
-
-/// Border stroke for right-click context menus, slightly stronger than the
-/// default window stroke so the tinted surface keeps a crisp edge.
-fn context_menu_stroke(theme: egui::Theme) -> egui::Stroke {
-    match theme {
-        egui::Theme::Dark => egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 88, 115)),
-        egui::Theme::Light => egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 170, 205)),
-    }
-}
-
-/// Paths a right-click on `entry` should act on: the full multi-selection
-/// when `entry` is already selected and more than one item is selected
-/// (Explorer's own behavior), otherwise just `entry` itself.
-fn context_menu_paths(
-    tab: &crate::tab::Tab,
-    entry: &crate::fs_entry::FsEntry,
-    is_selected: bool,
-) -> Vec<PathBuf> {
-    if is_selected && tab.selected.len() > 1 {
-        tab.selected.iter().map(|n| tab.path.join(n)).collect()
-    } else {
-        vec![entry.path.clone()]
-    }
-}
-
-/// Same as `Response::context_menu`, but paints the popup with the distinct
-/// per-theme fill from `context_menu_fill` (egui's popup frame reads
-/// `visuals.window_fill`, which defaults to the page background color).
-fn styled_context_menu<R>(
-    resp: &egui::Response,
-    add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> Option<egui::InnerResponse<R>> {
-    let theme = resp.ctx.theme();
-    let fill = context_menu_fill(theme);
-    let stroke = context_menu_stroke(theme);
-    egui::Popup::context_menu(resp)
-        .style(move |style: &mut egui::Style| {
-            egui::containers::menu::menu_style(style);
-            style.visuals.window_fill = fill;
-            style.visuals.window_stroke = stroke;
-        })
-        .show(add_contents)
-}
-
-/// Shared right-click context menu content for a file entry, used by every
-/// view mode. Uses egui's built-in `Response::context_menu`, which persists
-/// its own open/close state across frames (unlike a hand-rolled `Area`).
-fn show_entry_context_menu(
-    ui: &mut egui::Ui,
-    row_action: &mut Option<RowAction>,
-    entry_path: &std::path::Path,
-    is_dir: bool,
-    // Every path the "Windows Explorer" shell submenu should act on: just
-    // `entry_path` for a right-click on an unselected/lone item, or the
-    // full multi-selection when the click landed on a selected row —
-    // otherwise a shell command like "Combine files in Foxit PDF" only
-    // ever sees the single row that was clicked.
-    selection_paths: &[std::path::PathBuf],
-    shell_menu_hidden: &std::collections::HashSet<String>,
-    shell_menu_cache: &mut Option<(Vec<std::path::PathBuf>, Vec<crate::shell_menu::ShellMenuItem>)>,
-) {
-    ui.set_min_width(140.0);
-    if ui.button("Copy").clicked() {
-        *row_action = Some(RowAction::Copy);
-        ui.close();
-    }
-    if ui.button("Cut").clicked() {
-        *row_action = Some(RowAction::Cut);
-        ui.close();
-    }
-    if ui.button("Paste").clicked() {
-        *row_action = Some(RowAction::Paste);
-        ui.close();
-    }
-    ui.separator();
-    if ui.button("Rename").clicked() {
-        *row_action = Some(RowAction::Rename);
-        ui.close();
-    }
-    if selection_paths.len() > 1 {
-        if ui.button("Bulk Rename...").clicked() {
-            *row_action = Some(RowAction::BulkRename);
-            ui.close();
-        }
-    }
-    if ui.button("Delete").clicked() {
-        *row_action = Some(RowAction::Delete);
-        ui.close();
-    }
-    if !is_dir {
-        if ui.button("\u{1F4CC} Pin as Tab").clicked() {
-            *row_action = Some(RowAction::PinAsTab);
-            ui.close();
-        }
-    }
-    ui.separator();
-    if ui.button("New Folder").clicked() {
-        *row_action = Some(RowAction::NewFolder);
-        ui.close();
-    }
-    if ui.button("New File").clicked() {
-        *row_action = Some(RowAction::NewFile);
-        ui.close();
-    }
-    if archive::is_archive(entry_path) {
-        ui.separator();
-        if ui.button("Extract Here").clicked() {
-            *row_action = Some(RowAction::ExtractHere);
-            ui.close();
-        }
-        if ui.button("Extract to...").clicked() {
-            *row_action = Some(RowAction::ExtractTo);
-            ui.close();
-        }
-    }
-    ui.separator();
-    if ui.button("Copy Filename").clicked() {
-        *row_action = Some(RowAction::CopyName);
-        ui.close();
-    }
-    if ui.button("Copy Folder Path").clicked() {
-        *row_action = Some(RowAction::CopyFolderPath);
-        ui.close();
-    }
-    ui.separator();
-    if ui.button("Open With...").clicked() {
-        *row_action = Some(RowAction::OpenWith(entry_path.to_path_buf()));
-        ui.close();
-    }
-    ui.separator();
-    if ui.button("Properties").clicked() {
-        *row_action = Some(RowAction::Properties(entry_path.to_path_buf()));
-        ui.close();
-    }
-    if is_dir {
-        if ui.button("★ Add to Favourites").clicked() {
-            *row_action = Some(RowAction::FavouriteFolder(entry_path.to_path_buf()));
-            ui.close();
-        }
-    }
-
-    // Shell handlers are loaded only when this submenu is actually opened.
-    ui.separator();
-    ui.menu_button("Windows Explorer", |ui| {
-        if shell_menu_cache.as_ref().is_none_or(|(paths, _)| paths.as_slice() != selection_paths) {
-            *shell_menu_cache = Some((selection_paths.to_vec(), crate::shell_menu::query_items(selection_paths)));
-        }
-        ui.set_min_width(180.0);
-        render_shell_items(ui, row_action, selection_paths, &shell_menu_cache.as_ref().unwrap().1, shell_menu_hidden);
-    });
-}
-
-/// Recursively render shell menu items into an egui sub-menu, skipping any
-/// item whose label is in `shell_menu_hidden` (configured under Settings).
-fn render_shell_items(
-    ui: &mut egui::Ui,
-    row_action: &mut Option<RowAction>,
-    selection_paths: &[std::path::PathBuf],
-    items: &[crate::shell_menu::ShellMenuItem],
-    shell_menu_hidden: &std::collections::HashSet<String>,
-) {
-    for item in items {
-        if item.separator {
-            ui.separator();
-            continue;
-        }
-        if shell_menu_hidden.contains(&item.label) {
-            continue;
-        }
-        if item.disabled {
-            ui.add_enabled(false, egui::Button::new(&item.label));
-            continue;
-        }
-        if !item.sub_items.is_empty() {
-            let label = item.label.clone();
-            let sub_items = item.sub_items.clone();
-            let paths = selection_paths.to_vec();
-            let ra = std::rc::Rc::new(std::cell::RefCell::new(None::<RowAction>));
-            let ra_clone = ra.clone();
-            ui.menu_button(&label, |ui| {
-                render_shell_items(ui, &mut *ra_clone.borrow_mut(), &paths, &sub_items, shell_menu_hidden);
-            });
-            if let Some(action) = ra.borrow_mut().take() {
-                *row_action = Some(action);
-                ui.close();
-            }
-        } else if ui.button(&item.label).clicked() {
-            *row_action = Some(RowAction::ShellCommand {
-                id: item.id,
-                paths: selection_paths.to_vec(),
-            });
-            ui.close();
-        }
-    }
-}
-
-/// Parses the newline-separated `shell_menu_hidden` setting into a lookup
-/// set, trimming blank lines.
-fn parse_shell_menu_hidden(raw: &str) -> std::collections::HashSet<String> {
-    raw.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn help_heading(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new(text).strong().heading());
-    ui.add_space(2.0);
-}
-
-fn help_content(ui: &mut egui::Ui) {
-    let w = |ui: &mut egui::Ui, text: &str| {
-        ui.label(egui::RichText::new(text).weak());
-    };
-
-    help_heading(ui, "Getting Started");
-    w(
-        ui,
-        "FileMan is a dual-pane file manager. The left panel shows a folder tree with your Favourites at the top. The center area has two independent file browsers, each with tabs, an address bar, a filter, and navigation buttons.",
-    );
-    ui.add_space(4.0);
-    w(
-        ui,
-        "Switch users via the dropdown in the top-right corner. Each user has independent settings, favourites, toolbar layout, and shortcuts.",
-    );
-
-    help_heading(ui, "Navigation");
-    w(
-        ui,
-        "Address Bar — type a path and press Enter to navigate directly.",
-    );
-    w(ui, "Back (Alt+Left) — return to the previous folder.");
-    w(ui, "Forward (Alt+Right) — go forward after going back.");
-    w(ui, "Up (Backspace) — go to the parent folder.");
-    w(
-        ui,
-        "Tabs — each pane supports multiple tabs. Open a new tab with + Tab, or close one with the x on hover. Pinned tabs resist accidental navigation.",
-    );
-    w(
-        ui,
-        "🕒 Recent — the first toolbar button. Shows recently opened files and folders; click one to jump straight there, or Clear Recent to wipe the list.",
-    );
-
-    help_heading(ui, "View Modes");
-    w(ui, "Switch between layouts via Settings > View:");
-    w(
-        ui,
-        "  Details — columns for name, date, type, size. Click headers to sort.",
-    );
-    w(ui, "  List — compact single-column list.");
-    w(ui, "  Icons — large icon grid for image-heavy folders.");
-    w(
-        ui,
-        "The filter box (next to the Up button) narrows visible files by name. Click the red x to clear.",
-    );
-
-    help_heading(ui, "File Operations");
-    w(
-        ui,
-        "Toolbar buttons provide quick access to Copy (Ctrl+C), Cut (Ctrl+X), Paste (Ctrl+V), Delete (Del), Rename (F2), New Folder, New File, Find (Ctrl+F), and Refresh (F5).",
-    );
-    w(
-        ui,
-        "Right-click any file or folder for the context menu with additional options: Extract, Copy Filename, Copy Folder Path, Open With, Open in Windows Explorer, and Add to Favourites.",
-    );
-    w(
-        ui,
-        "The \"Windows Explorer\" submenu covers your whole selection, not just the row you clicked — right-click any selected file with several others selected and pick, say, \"Combine files in Foxit PDF\" to combine all of them at once.",
-    );
-    w(
-        ui,
-        "Creating a single new folder selects it automatically — press Enter to open it right away. Enter also opens whatever single file or folder is currently selected.",
-    );
-    w(
-        ui,
-        "Files dragged in from a mail client (e.g. an Outlook attachment) are accepted the same as files dragged from Explorer.",
-    );
-
-    help_heading(ui, "Favourites");
-    w(
-        ui,
-        "Right-click a folder and select Add to Favourites to pin it to the Folder Tree. Right-click a favourite to remove it.",
-    );
-
-    help_heading(ui, "Custom Actions");
-    w(
-        ui,
-        "Custom actions let you open files with any application. Go to Settings > Custom Actions to add one. Each action shows as a 🔍 icon button on the second toolbar row.",
-    );
-
-    help_heading(ui, "App Launcher & File Launcher");
-    w(
-        ui,
-        "App Launcher (Settings > App Launcher) lets you configure apps as ⚡ quick-launch buttons. File Launcher (Settings > File Launcher) does the same for specific files, opened with 📄 via their default app.",
-    );
-    w(
-        ui,
-        "Both show a search box on the toolbar's second row — type to filter, then click a result in the dropdown to launch it.",
-    );
-
-    help_heading(ui, "Settings");
-    w(
-        ui,
-        "Appearance — theme (Light/Dark), font family, font size, tab layout (horizontal/vertical).",
-    );
-    w(
-        ui,
-        "Keyboard Shortcuts — click Rebind next to any action, then press the new key combination.",
-    );
-    w(
-        ui,
-        "Toolbar — reorder or toggle which buttons appear on the main row.",
-    );
-    w(
-        ui,
-        "View — choose the default listing layout (Details, List, or Icons).",
-    );
-    w(
-        ui,
-        "Advanced — set FileMan as the default folder explorer, or export/import all settings via JSON.",
-    );
-
-    help_heading(ui, "Keyboard Shortcuts");
-    w(ui, "Ctrl+C Copy | Ctrl+X Cut | Ctrl+V Paste | Ctrl+F Find");
-    w(
-        ui,
-        "F2 Rename | F3 Copy Filename | F4 Copy Folder Path | F5 Refresh",
-    );
-    w(
-        ui,
-        "Backspace Go Up | Delete Delete | Alt+Left Back | Alt+Right Forward",
-    );
-    w(
-        ui,
-        "Enter Confirm dialog / Open selected file or folder | Escape Cancel / Close dialog",
-    );
-
-    help_heading(ui, "Tips");
-    w(
-        ui,
-        "- Pinned tabs won't navigate away when you double-click a folder.",
-    );
-    w(
-        ui,
-        "- The filter is per-tab, so each pane filters independently.",
-    );
-    w(ui, "- Drag the pane divider to resize left/right panes.");
-    w(
-        ui,
-        "- Press Esc to close any dialog including this Help window.",
-    );
-    w(
-        ui,
-        "- Use Export/Import in Advanced settings to transfer your setup to another machine.",
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn large_icons_view_is_virtualized_and_background_tabs_release_data() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::init_db(&conn).unwrap();
-        let user = crate::user::default_user_id(&conn);
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = FileManApp::new(conn, user, None, 0, Some(dir.path().into()));
-        let entries: Vec<_> = (0..10_000).map(|i| crate::fs_entry::FsEntry {
-            name: format!("folder-{i:05}"), path: dir.path().join(format!("folder-{i:05}")),
-            is_dir: true, size: 0, modified: None, archive: false, readonly: false,
-            hidden: false, system: false,
-        }).collect();
-        let tab = app.panes[0].active_tab_mut();
-        tab.listing = std::sync::Arc::new(entries);
-        tab.listing_dirty = false;
-        tab.view_mode = ViewMode::Icons;
-        let inactive = tab.clone();
-        app.panes[0].tabs.push(inactive);
-        let ctx = egui::Context::default();
-        app.poll_listing(0, &ctx);
-        assert!(app.panes[0].tabs[1].listing.is_empty());
-        assert!(app.panes[0].tabs[1].listing_dirty);
-        assert!(app.listing_jobs[0].is_none(), "inactive tabs must not be scanned");
-        for _ in 0..2 {
-            let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
-                ..Default::default()
-            };
-            let mut output = ctx.run_ui(raw, |ui| app.show_pane_content(ui, &ctx, 0));
-            output.textures_delta.clear();
-        }
-        assert!(!app.dnd_folder_rects.is_empty());
-        assert!(app.dnd_folder_rects.len() < 100, "only visible icons should create widgets");
-        assert_eq!(app.panes[0].active_tab().listing.len(), 10_000);
-        app.panes[0].set_active_tab(1);
-        app.poll_listing(0, &ctx);
-        assert!(app.panes[0].tabs[0].listing.is_empty());
-        assert!(app.listing_jobs[0].is_some(), "activation starts a fresh listing");
-    }
-
-    #[test]
-    fn ensure_two_panes_pads_a_single_pane_up_to_two() {
-        let panes = vec![Pane::new(PathBuf::from("D:\\one"))];
-        let (panes, active_pane) = ensure_two_panes(panes, 0, ("name", true));
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].tabs[0].path, PathBuf::from("D:\\one"));
-        assert_eq!(panes[1].tabs[0].path, PathBuf::from("C:\\"));
-        assert_eq!(active_pane, 0);
-    }
-
-    #[test]
-    fn ensure_two_panes_creates_two_fresh_panes_from_empty() {
-        let (panes, active_pane) = ensure_two_panes(Vec::new(), 0, ("name", true));
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].tabs[0].path, PathBuf::from("C:\\"));
-        assert_eq!(panes[1].tabs[0].path, PathBuf::from("C:\\"));
-        assert_eq!(active_pane, 0);
-    }
-
-    #[test]
-    fn ensure_two_panes_leaves_a_valid_two_pane_vector_unchanged() {
-        let panes = vec![
-            Pane::new(PathBuf::from("D:\\left")),
-            Pane::new(PathBuf::from("E:\\right")),
-        ];
-        let (panes, active_pane) = ensure_two_panes(panes, 1, ("name", true));
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].tabs[0].path, PathBuf::from("D:\\left"));
-        assert_eq!(panes[1].tabs[0].path, PathBuf::from("E:\\right"));
-        assert_eq!(active_pane, 1);
-    }
-
-    #[test]
-    fn ensure_two_panes_truncates_more_than_two_panes() {
-        let panes = vec![
-            Pane::new(PathBuf::from("D:\\one")),
-            Pane::new(PathBuf::from("E:\\two")),
-            Pane::new(PathBuf::from("F:\\three")),
-        ];
-        let (panes, _) = ensure_two_panes(panes, 0, ("name", true));
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].tabs[0].path, PathBuf::from("D:\\one"));
-        assert_eq!(panes[1].tabs[0].path, PathBuf::from("E:\\two"));
-    }
-
-    #[test]
-    fn ensure_two_panes_clamps_out_of_range_active_pane() {
-        let panes = vec![Pane::new(PathBuf::from("C:\\"))];
-        let (panes, active_pane) = ensure_two_panes(panes, 99, ("name", true));
-        assert_eq!(panes.len(), 2);
-        assert_eq!(active_pane, 1);
-    }
-
-    #[test]
-    fn ensure_two_panes_seeds_only_fresh_panes_with_default_sort() {
-        // A restored session pane keeps its own saved sorting; only the
-        // freshly padded pane picks up the universal default.
-        let mut restored = Pane::new(PathBuf::from("D:\\kept"));
-        restored.tabs[0].sort_col = "modified".to_string();
-        restored.tabs[0].sort_asc = false;
-        let (panes, _) = ensure_two_panes(vec![restored], 0, ("size", false));
-        assert_eq!(panes[0].tabs[0].sort_col, "modified");
-        assert!(!panes[0].tabs[0].sort_asc);
-        assert_eq!(panes[1].tabs[0].sort_col, "size");
-        assert!(!panes[1].tabs[0].sort_asc);
-
-        let (fresh, _) = ensure_two_panes(Vec::new(), 0, ("archive", true));
-        assert_eq!(fresh[0].tabs[0].sort_col, "archive");
-        assert!(fresh[0].tabs[0].sort_asc);
-        assert_eq!(fresh[1].tabs[0].sort_col, "archive");
-        assert!(fresh[1].tabs[0].sort_asc);
-    }
-
-    #[test]
-    fn next_sort_flips_direction_on_same_column() {
-        assert_eq!(next_sort("size", true, "size"), ("size".to_string(), false));
-        assert_eq!(next_sort("size", false, "size"), ("size".to_string(), true));
-    }
-
-    #[test]
-    fn next_sort_switches_column_ascending() {
-        assert_eq!(
-            next_sort("name", false, "modified"),
-            ("modified".to_string(), true)
-        );
-    }
-
-    #[test]
-    fn parse_sort_col_accepts_known_columns_and_rejects_junk() {
-        for col in ["name", "modified", "size", "archive"] {
-            assert_eq!(parse_sort_col(col), Some(col));
-        }
-        assert_eq!(parse_sort_col("bogus"), None);
-        assert_eq!(parse_sort_col(""), None);
-    }
-
-    #[test]
-    fn poll_subdirs_resolves_background_listing_then_caches() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("sub_b")).unwrap();
-        std::fs::create_dir(temp.path().join("sub_a")).unwrap();
-        std::fs::write(temp.path().join("file.txt"), b"x").unwrap();
-
-        let mut cache = crate::bounded_cache::BoundedCache::new(128, 8 * 1024 * 1024);
-        let mut jobs: HashMap<PathBuf, mpsc::Receiver<std::io::Result<Vec<PathBuf>>>> =
-            HashMap::new();
-        let dir = temp.path().to_path_buf();
-
-        let mut resolved = None;
-        for _ in 0..1000 {
-            if let Some(subdirs) = FileManApp::poll_subdirs(&mut cache, &mut jobs, &dir) {
-                resolved = Some(subdirs);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let subdirs = resolved.expect("background listing must resolve");
-        let names: Vec<String> = subdirs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["sub_a", "sub_b"], "only directories, sorted");
-        assert!(cache.get(&dir).is_some(), "resolved listing is cached");
-        assert!(jobs.is_empty(), "finished job is removed from the map");
-
-        let cached = FileManApp::poll_subdirs(&mut cache, &mut jobs, &dir)
-            .expect("cached listing resolves instantly");
-        assert_eq!(cached.len(), 2);
-        assert!(jobs.is_empty(), "cache hit must not spawn a job");
-    }
-
-    /// Headless reproduction of the address-bar flow: edit mode on, the
-    /// TextEdit acquires focus via the app's per-frame request_focus, the
-    /// user pastes a path, presses Enter — navigation must run and the bar
-    /// must drop back to breadcrumb mode. Uses the real egui::Context so
-    /// egui 0.36's own focus handling is exercised, not assumed.
-    #[test]
-    fn address_bar_enter_navigates_and_returns_to_breadcrumbs() {
-        let ctx = egui::Context::default();
-        let temp = std::env::temp_dir().join("fileman_addr_test");
-        std::fs::create_dir_all(&temp).unwrap();
-        let target = temp.display().to_string();
-
-        let mut address_bar = String::new();
-        let mut edit_mode = true;
-        let mut navigated_to: Option<String> = None;
-        let mut ever_focused = false;
-
-        for frame in 0..6 {
-            let mut raw = egui::RawInput::default();
-            if frame == 4 {
-                // The user pressed Enter (physical key event, like winit).
-                raw.events.push(egui::Event::Key {
-                    key: egui::Key::Enter,
-                    physical_key: Some(egui::Key::Enter),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                });
-            }
-            let mut full = ctx.run_ui(raw, |ui| {
-                // --- exact show_pane_content address-bar fragment ---
-                if edit_mode {
-                    let address_id = egui::Id::new(("address_bar", 0usize));
-                    let address_resp = ui.add(
-                        egui::TextEdit::singleline(&mut address_bar)
-                            .id(address_id)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Type a path and press Enter...")
-                            .frame(
-                                egui::Frame::new()
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE),
-                            ),
-                    );
-                    // pane_idx == self.active_pane in this scenario. The
-                    // app seeds focus only until it sticks (mirrors
-                    // `focused_address_pane != Some(pane_idx)`); re-asking
-                    // every frame would cancel egui's live lost_focus
-                    // signal on the Enter frame.
-                    if !ever_focused {
-                        address_resp.request_focus();
-                    }
-                    if address_resp.has_focus() {
-                        ever_focused = true;
-                        // The app writes the pasted path here once focused
-                        // (clipboard paste lands in the field).
-                        if address_bar.is_empty() {
-                            // Simulate Explorer's "Copy as path", which
-                            // wraps the path in double quotes.
-                            address_bar = format!("\"{target}\"");
-                        }
-                    }
-                    if address_resp.lost_focus() {
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let typed = address_bar.trim().trim_matches('"').trim();
-                            let t = std::path::PathBuf::from(typed);
-                            navigated_to = Some(t.display().to_string());
-                        }
-                        edit_mode = false;
-                    }
-                }
-            });
-            // egui asserts at drop if produced font textures were never
-            // consumed by a renderer; headless tests have none.
-            full.textures_delta.clear();
-            if navigated_to.is_some() {
-                break;
-            }
-        }
-
-        assert!(ever_focused, "TextEdit must acquire keyboard focus");
-        assert_eq!(
-            navigated_to.as_deref(),
-            Some(target.as_str()),
-            "Enter must navigate"
-        );
-        assert!(!edit_mode, "bar must return to breadcrumbs after Enter");
     }
 }

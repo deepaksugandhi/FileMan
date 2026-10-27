@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Directory listings stream in batches, so big or network folders paint progressively; an unreadable entry no longer aborts the whole listing.
+- File icons are resolved on a background thread (no more shell calls on the UI thread while scrolling).
+- Live folder updates via a debounced `notify` watcher (focus-regain refresh kept as a backstop).
+- Optional OpenGL renderer (Settings > Appearance, restart required; or `FILEMAN_RENDERER=glow`).
+- Frame-time overlay and log: `FILEMAN_PERF=1` or Ctrl+Shift+F12 (`%APPDATA%\FileMan\perf.log`).
+- Fewer wakeups: listing worker wakes the UI itself; op-progress repaints capped at ~30 fps. Release binary stripped.
+- `app.rs` split: help, menus, nav icons and tests moved into `src/app/`.
+
 ## v0.1.16 (2026-10-24)
 
 - Folder tree stays synced with the active pane and highlights the active folder's ancestry; optional tree widget.
