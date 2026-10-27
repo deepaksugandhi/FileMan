@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.17 (2026-10-27)
 
 - Directory listings stream in batches, so big or network folders paint progressively; an unreadable entry no longer aborts the whole listing.
 - File icons are resolved on a background thread (no more shell calls on the UI thread while scrolling).
