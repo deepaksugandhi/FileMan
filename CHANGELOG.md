@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.18 (2026-10-30)
+
+- Update check on every start against GitHub releases: download & install, skip this version, or later.
+- Installed version always visible in the pane status bar; manual "Check for updates" in Settings > About.
+
 ## v0.1.17 (2026-10-27)
 
 - Directory listings stream in batches, so big or network folders paint progressively; an unreadable entry no longer aborts the whole listing.

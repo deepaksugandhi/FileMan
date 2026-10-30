@@ -276,6 +276,15 @@ pub struct FileManApp {
     tree_collapse_frames: u32,
     /// Last value of `status` seen, so a change can trigger a toast.
     last_status: String,
+    /// In-flight update check: (was it user-initiated, result).
+    update_rx: Option<mpsc::Receiver<(bool, Result<Option<crate::update::Release>, String>)>>,
+    /// In-flight installer download; Ok means the installer was launched.
+    install_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    /// Newer release awaiting the user's decision (drives the dialog).
+    update_found: Option<crate::update::Release>,
+    update_started: bool,
+    /// Result line shown in Settings > About after a manual check.
+    update_msg: String,
     /// Active toast message and when it appeared (auto-hides after ~3s).
     toast: Option<(String, std::time::Instant)>,
     /// Where to anchor the tab context menu (the right-click point).
@@ -840,6 +849,11 @@ impl FileManApp {
             tree_scroll_frames: 0,
             tree_collapse_frames: 0,
             last_status: String::new(),
+            update_rx: None,
+            install_rx: None,
+            update_found: None,
+            update_started: false,
+            update_msg: String::new(),
             toast: None,
             tab_menu_pos: None,
             settings_page: SettingsPage::default(),
@@ -3531,6 +3545,19 @@ impl FileManApp {
                 .weak(),
         );
 
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let busy = self.update_rx.is_some() || self.install_rx.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Check for updates"))
+                .clicked()
+            {
+                self.update_msg = "Checking…".into();
+                self.start_update_check(true, ui.ctx());
+            }
+            ui.label(egui::RichText::new(&self.update_msg).weak());
+        });
+
         ui.add_space(16.0);
         settings_group_label(ui, "Website");
         ui.hyperlink_to("www.speed4ca.com", "https://www.speed4ca.com");
@@ -3543,6 +3570,108 @@ impl FileManApp {
                 .small(),
         );
         ui.hyperlink_to("speed4ca@gmail.com", "mailto:speed4ca@gmail.com");
+    }
+
+    fn start_update_check(&mut self, manual: bool, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send((manual, crate::update::check()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Collects finished update jobs and shows the "update available" dialog.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if !self.update_started {
+            self.update_started = true;
+            self.start_update_check(false, ctx);
+        }
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok((manual, res)) => {
+                    self.update_rx = None;
+                    match res {
+                        Ok(Some(rel)) => {
+                            let skipped = crate::config::get(&self.conn, 0, "skipped_update");
+                            if manual || skipped.as_deref() != Some(rel.version.as_str()) {
+                                self.update_msg = format!("Version {} is available", rel.version);
+                                self.update_found = Some(rel);
+                            }
+                        }
+                        Ok(None) => self.update_msg = "You're on the latest version".into(),
+                        // Silent on startup: offline shouldn't nag.
+                        Err(e) if manual => self.update_msg = e,
+                        Err(_) => {}
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.update_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.install_rx {
+            match rx.try_recv() {
+                Ok(Ok(())) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Ok(Err(e)) => {
+                    self.install_rx = None;
+                    self.status = e;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.install_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let Some(rel) = self.update_found.clone() else {
+            return;
+        };
+        let installing = self.install_rx.is_some();
+        egui::Window::new("Update available")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "FileMan {} is available (you have {}).",
+                    rel.version,
+                    env!("CARGO_PKG_VERSION")
+                ));
+                if !rel.notes.is_empty() {
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&rel.notes).weak().small());
+                    });
+                }
+                ui.add_space(6.0);
+                if installing {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Downloading installer…");
+                    });
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Download & install").clicked() {
+                        let (tx, rx) = mpsc::channel();
+                        self.install_rx = Some(rx);
+                        let (url, ctx) = (rel.url.clone(), ctx.clone());
+                        thread::spawn(move || {
+                            let _ = tx.send(crate::update::download_and_launch(&url));
+                            ctx.request_repaint();
+                        });
+                    }
+                    if ui.button("Skip this version").clicked() {
+                        let _ = crate::config::set(
+                            &self.conn,
+                            crate::config::Scope::Global,
+                            "skipped_update",
+                            &rel.version,
+                        );
+                        self.update_found = None;
+                    }
+                    if ui.button("Later").clicked() {
+                        self.update_found = None;
+                    }
+                });
+            });
     }
 
     /// Re-reads every setting from the database after an import so the UI
@@ -4672,6 +4801,15 @@ impl FileManApp {
                         };
                         ui.label(format!("{selected_count} selected{size}"));
                     }
+                    if pane_idx == 0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                    .weak()
+                                    .small(),
+                            );
+                        });
+                    }
                 });
             });
 
@@ -5463,6 +5601,7 @@ impl eframe::App for FileManApp {
 impl FileManApp {
     fn ui_body(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_updates(&ctx);
         if !matches!(self.dialog, Some(Dialog::Find { .. })) {
             self.find_job = None;
         }

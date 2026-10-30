@@ -22,6 +22,7 @@ mod shell_menu;
 mod tab;
 mod taskbar;
 mod tips;
+mod update;
 mod tree;
 mod user;
 mod win_default;
